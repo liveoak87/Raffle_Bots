@@ -137,6 +137,34 @@ export async function isUserInChat(
   }
 }
 
+/**
+ * Send a message privately to the user via DM.
+ * Falls back to a temporary group message that auto-deletes after 8 seconds.
+ */
+export async function replyPrivately(
+  ctx: Context,
+  text: string,
+  opts?: { parse_mode?: string; reply_markup?: unknown }
+): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  try {
+    await ctx.api.sendMessage(userId, text, opts as Record<string, unknown>);
+  } catch {
+    // DM failed — send temporary message in group
+    try {
+      const msg = await ctx.reply(text, opts as Record<string, unknown>);
+      const chatId = ctx.chat!.id;
+      setTimeout(async () => {
+        try {
+          await ctx.api.deleteMessage(chatId, msg.message_id);
+        } catch {}
+      }, 8000);
+    } catch {}
+  }
+}
+
 export function parseEndTime(input: string): Date | null {
   const now = new Date();
 

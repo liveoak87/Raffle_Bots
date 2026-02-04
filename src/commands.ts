@@ -11,6 +11,7 @@ import {
   isGroupAdmin,
   isUserInChat,
   parseEndTime,
+  replyPrivately,
 } from "./helpers";
 import { startWizard, handleStartDeepLink } from "./wizard";
 
@@ -44,7 +45,7 @@ export async function handleStart(ctx: Context): Promise<void> {
 
 // /help
 export async function handleHelp(ctx: Context): Promise<void> {
-  await ctx.reply(
+  await replyPrivately(ctx,
     `🎟 <b>Raffle Bot Help</b>\n\n` +
       `<b>Creating a Raffle:</b>\n` +
       `/newraffle - Show creation help\n\n` +
@@ -74,8 +75,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `/rafflehistory - View recent raffle history\n` +
       `/myentries - See your active entries\n\n` +
       `<b>Note:</b> Only group admins can create raffles and draw winners.`,
-    { parse_mode: "HTML" }
-  );
+    { parse_mode: "HTML" });
 }
 
 // /newraffle - Create a raffle
@@ -88,7 +88,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const isAdmin = await isGroupAdmin(ctx, userId);
   if (!isAdmin) {
-    await ctx.reply("Only group admins can create raffles.");
+    await replyPrivately(ctx, "Only group admins can create raffles.");
     return;
   }
 
@@ -105,7 +105,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
 
   const title = parts[0];
   if (!title) {
-    await ctx.reply("Title is required.");
+    await replyPrivately(ctx, "Title is required.");
     return;
   }
 
@@ -137,7 +137,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
       if (parsed) {
         endsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
       } else {
-        await ctx.reply(
+        await replyPrivately(ctx,
           `Could not parse end time "${endsMatch[1]}". Use formats like: 30m, 2h, 1d`
         );
         return;
@@ -148,7 +148,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
       if (prizesList.length === 0) {
-        await ctx.reply("Please provide at least one prize.");
+        await replyPrivately(ctx, "Please provide at least one prize.");
         return;
       }
     } else if (requireMatch) {
@@ -176,12 +176,11 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   // Need either a single prize or a prizes list
   const finalPrize = singlePrize || (prizesList ? prizesList[0] : "");
   if (!finalPrize) {
-    await ctx.reply(
+    await replyPrivately(ctx,
       "Please provide a prize.\n" +
         "Example: <code>/newraffle Title | Prize</code>\n" +
         "Or: <code>/newraffle Title | prizes: $100, $50, $25</code>",
-      { parse_mode: "HTML" }
-    );
+      { parse_mode: "HTML" });
     return;
   }
 
@@ -229,9 +228,8 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
   const raffles = db.getOpenRafflesForChat(ctx.chat.id);
 
   if (raffles.length === 0) {
-    await ctx.reply(
-      "No open raffles in this chat. Use /newraffle to create one!"
-    );
+    await replyPrivately(ctx,
+      "No open raffles in this chat. Use /newraffle to create one!");
     return;
   }
 
@@ -256,7 +254,7 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
     msg += `\n`;
   }
 
-  await ctx.reply(msg, { parse_mode: "HTML" });
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // /draw - Draw winners
@@ -269,7 +267,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const isAdmin = await isGroupAdmin(ctx, userId);
   if (!isAdmin) {
-    await ctx.reply("Only group admins can draw raffle winners.");
+    await replyPrivately(ctx, "Only group admins can draw raffle winners.");
     return;
   }
 
@@ -281,14 +279,14 @@ export async function handleDraw(ctx: Context): Promise<void> {
   if (args) {
     const raffleId = parseInt(args, 10);
     if (isNaN(raffleId)) {
-      await ctx.reply("Please provide a valid raffle ID. Usage: /draw 1");
+      await replyPrivately(ctx, "Please provide a valid raffle ID. Usage: /draw 1");
       return;
     }
     raffle = db.getRaffleById(raffleId);
   } else {
     const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
     if (openRaffles.length === 0) {
-      await ctx.reply("No open raffles to draw from.");
+      await replyPrivately(ctx, "No open raffles to draw from.");
       return;
     }
     if (openRaffles.length === 1) {
@@ -298,33 +296,32 @@ export async function handleDraw(ctx: Context): Promise<void> {
       for (const r of openRaffles) {
         msg += `/draw ${r.id} - ${escapeHtml(r.title)}\n`;
       }
-      await ctx.reply(msg, { parse_mode: "HTML" });
+      await replyPrivately(ctx, msg, { parse_mode: "HTML" });
       return;
     }
   }
 
   if (!raffle) {
-    await ctx.reply("Raffle not found.");
+    await replyPrivately(ctx, "Raffle not found.");
     return;
   }
 
   if (raffle.chat_id !== ctx.chat.id) {
-    await ctx.reply("That raffle doesn't belong to this chat.");
+    await replyPrivately(ctx, "That raffle doesn't belong to this chat.");
     return;
   }
 
   if (raffle.status === "drawn") {
-    await ctx.reply("This raffle has already been drawn.");
+    await replyPrivately(ctx, "This raffle has already been drawn.");
     return;
   }
 
   const entryCount = db.getEntryCount(raffle.id);
   if (entryCount === 0) {
     db.markRaffleDrawn(raffle.id);
-    await ctx.reply(
+    await replyPrivately(ctx,
       `🎟 <b>${escapeHtml(raffle.title)}</b>\n\nNo entries were received. Raffle closed with no winners.`,
-      { parse_mode: "HTML" }
-    );
+      { parse_mode: "HTML" });
     await updateRafflePost(ctx, raffle.id);
     return;
   }
@@ -348,7 +345,7 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const isAdmin = await isGroupAdmin(ctx, userId);
   if (!isAdmin) {
-    await ctx.reply("Only group admins can cancel raffles.");
+    await replyPrivately(ctx, "Only group admins can cancel raffles.");
     return;
   }
 
@@ -358,40 +355,39 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   if (!args) {
     const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
     if (openRaffles.length === 0) {
-      await ctx.reply("No open raffles to cancel.");
+      await replyPrivately(ctx, "No open raffles to cancel.");
       return;
     }
     let msg = `Which raffle do you want to cancel?\n\n`;
     for (const r of openRaffles) {
       msg += `/cancelraffle ${r.id} - ${escapeHtml(r.title)}\n`;
     }
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
     return;
   }
 
   const raffleId = parseInt(args, 10);
   if (isNaN(raffleId)) {
-    await ctx.reply("Please provide a valid raffle ID.");
+    await replyPrivately(ctx, "Please provide a valid raffle ID.");
     return;
   }
 
   const raffle = db.getRaffleById(raffleId);
   if (!raffle || raffle.chat_id !== ctx.chat.id) {
-    await ctx.reply("Raffle not found in this chat.");
+    await replyPrivately(ctx, "Raffle not found in this chat.");
     return;
   }
 
   if (raffle.status === "drawn") {
-    await ctx.reply("Cannot cancel a raffle that has already been drawn.");
+    await replyPrivately(ctx, "Cannot cancel a raffle that has already been drawn.");
     return;
   }
 
   db.closeRaffle(raffleId);
 
-  await ctx.reply(
+  await replyPrivately(ctx,
     `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
-    { parse_mode: "HTML" }
-  );
+    { parse_mode: "HTML" });
 
   await updateRafflePost(ctx, raffleId);
 }
@@ -409,7 +405,7 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
   const entered = openRaffles.filter((r) => db.hasUserEntered(r.id, userId));
 
   if (entered.length === 0) {
-    await ctx.reply("You haven't entered any active raffles in this chat.");
+    await replyPrivately(ctx, "You haven't entered any active raffles in this chat.");
     return;
   }
 
@@ -424,7 +420,7 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
     }
   }
 
-  await ctx.reply(msg, { parse_mode: "HTML" });
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // /rafflehistory - Show recent raffles
@@ -437,7 +433,7 @@ export async function handleRaffleHistory(ctx: Context): Promise<void> {
   const raffles = db.getRecentRafflesForChat(ctx.chat.id, 10);
 
   if (raffles.length === 0) {
-    await ctx.reply("No raffle history in this chat.");
+    await replyPrivately(ctx, "No raffle history in this chat.");
     return;
   }
 
@@ -474,7 +470,7 @@ export async function handleRaffleHistory(ctx: Context): Promise<void> {
     msg += `\n`;
   }
 
-  await ctx.reply(msg, { parse_mode: "HTML" });
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // /exportentries - Export all participants for a raffle
@@ -487,7 +483,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const isAdmin = await isGroupAdmin(ctx, userId);
   if (!isAdmin) {
-    await ctx.reply("Only group admins can export entries.");
+    await replyPrivately(ctx, "Only group admins can export entries.");
     return;
   }
 
@@ -497,7 +493,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
   if (!args) {
     const allRaffles = db.getRecentRafflesForChat(ctx.chat.id, 20);
     if (allRaffles.length === 0) {
-      await ctx.reply("No raffles found in this chat.");
+      await replyPrivately(ctx, "No raffles found in this chat.");
       return;
     }
     let msg = `Which raffle do you want to export?\n\n`;
@@ -505,30 +501,31 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
       const count = db.getEntryCount(r.id);
       msg += `/exportentries ${r.id} - ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
     }
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
     return;
   }
 
   const raffleId = parseInt(args, 10);
   if (isNaN(raffleId)) {
-    await ctx.reply("Please provide a valid raffle ID.");
+    await replyPrivately(ctx, "Please provide a valid raffle ID.");
     return;
   }
 
   const raffle = db.getRaffleById(raffleId);
   if (!raffle || raffle.chat_id !== ctx.chat.id) {
-    await ctx.reply("Raffle not found in this chat.");
+    await replyPrivately(ctx, "Raffle not found in this chat.");
     return;
   }
 
   const entries = db.getEntriesForRaffle(raffleId);
 
   if (entries.length === 0) {
-    await ctx.reply(`No entries found for raffle "${escapeHtml(raffle.title)}".`, {
-      parse_mode: "HTML",
-    });
+    await replyPrivately(ctx, `No entries found for raffle "${escapeHtml(raffle.title)}".`,
+      { parse_mode: "HTML" });
     return;
   }
+
+  const userId2 = ctx.from!.id;
 
   let msg = `📋 <b>Participants Export: ${escapeHtml(raffle.title)}</b>\n`;
   msg += `<b>Raffle ID:</b> ${raffle.id} | <b>Status:</b> ${raffle.status}\n`;
@@ -548,7 +545,6 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
 
   // Split if message is too long (Telegram limit is 4096)
   if (msg.length > 4000) {
-    // Send participant list as a document
     const csvLines = ["#,Display Name,Username,User ID,Entered At"];
     entries.forEach((e, i) => {
       csvLines.push(
@@ -557,14 +553,19 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     });
 
     const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
-    await ctx.replyWithDocument(
-      new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
-      {
-        caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nUse /rerun ${raffle.id} to create a new raffle with these same participants.`,
-      }
-    );
+    try {
+      await ctx.api.sendDocument(userId2,
+        new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
+        {
+          caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nUse /rerun ${raffle.id} to create a new raffle with these same participants.`,
+        }
+      );
+    } catch {
+      // DM failed, fall back to group with auto-delete
+      await replyPrivately(ctx, `Export has ${entries.length} entries — please DM me first so I can send you the file.`);
+    }
   } else {
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
   }
 }
 
@@ -578,7 +579,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const isAdmin = await isGroupAdmin(ctx, userId);
   if (!isAdmin) {
-    await ctx.reply("Only group admins can re-run raffles.");
+    await replyPrivately(ctx, "Only group admins can re-run raffles.");
     return;
   }
 
@@ -590,7 +591,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
       .getRecentRafflesForChat(ctx.chat.id, 20)
       .filter((r) => r.status === "drawn" || r.status === "closed");
     if (drawnRaffles.length === 0) {
-      await ctx.reply("No completed raffles to re-run.");
+      await replyPrivately(ctx, "No completed raffles to re-run.");
       return;
     }
     let msg = `Which raffle do you want to re-run?\n\n`;
@@ -598,25 +599,25 @@ export async function handleRerun(ctx: Context): Promise<void> {
       const count = db.getEntryCount(r.id);
       msg += `/rerun ${r.id} - ${escapeHtml(r.title)} (${count} entries)\n`;
     }
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
     return;
   }
 
   const sourceId = parseInt(args, 10);
   if (isNaN(sourceId)) {
-    await ctx.reply("Please provide a valid raffle ID.");
+    await replyPrivately(ctx, "Please provide a valid raffle ID.");
     return;
   }
 
   const sourceRaffle = db.getRaffleById(sourceId);
   if (!sourceRaffle || sourceRaffle.chat_id !== ctx.chat.id) {
-    await ctx.reply("Raffle not found in this chat.");
+    await replyPrivately(ctx, "Raffle not found in this chat.");
     return;
   }
 
   const sourceEntries = db.getEntriesForRaffle(sourceId);
   if (sourceEntries.length === 0) {
-    await ctx.reply("The source raffle has no entries to copy.");
+    await replyPrivately(ctx, "The source raffle has no entries to copy.");
     return;
   }
 

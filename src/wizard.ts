@@ -85,13 +85,6 @@ export async function startWizard(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    // Delete the /newraffle command from the group so it stays clean
-    try {
-      await ctx.deleteMessage();
-    } catch {
-      // Bot may not have delete permission
-    }
-
     // Send a brief note in the group that disappears
     const notice = await ctx.reply(
       `📝 Check your DMs @${ctx.from!.username || ctx.from!.first_name} — I sent you the raffle setup there.`

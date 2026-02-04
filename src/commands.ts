@@ -211,13 +211,6 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     .row()
     .text(`👥 Entries (0)`, `entries_${raffle.id}`);
 
-  // Delete the /newraffle command from the group to keep it clean
-  try {
-    await ctx.deleteMessage();
-  } catch {
-    // Bot may not have delete permission
-  }
-
   const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
     parse_mode: "HTML",
     reply_markup: keyboard,

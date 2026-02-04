@@ -57,6 +57,23 @@ if (DATA_RETENTION_HOURS > 0) {
 // Create bot
 const bot = new Bot(BOT_TOKEN);
 
+// --- Auto-delete command messages in group chats ---
+bot.use(async (ctx, next) => {
+  const isGroup =
+    ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+  const isCommand = ctx.message?.text?.startsWith("/");
+
+  if (isGroup && isCommand) {
+    try {
+      await ctx.deleteMessage();
+    } catch {
+      // Bot may not have delete permission
+    }
+  }
+
+  await next();
+});
+
 // --- Register commands ---
 bot.command("start", handleStart);
 bot.command("help", handleHelp);

@@ -33,6 +33,7 @@ interface WizardState {
   anonymous?: boolean;
   imageFileId?: string | null;
   startsAt?: string | null;
+  autoPin?: boolean;
   createdAt: number;
 }
 
@@ -431,6 +432,8 @@ function buildOptionsText(state: WizardState): string {
     msg += `🕐 <b>Delayed start:</b> Opens immediately\n`;
   }
 
+  msg += `📌 <b>Auto-pin:</b> ${state.autoPin ? "On ✅" : "Off"}\n`;
+
   return msg;
 }
 
@@ -453,6 +456,11 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
   kb.text(
     state.startsAt ? "🕐 Change Start" : "🕐 Delay Start",
     "wiz_opt_sched"
+  );
+  kb.row();
+  kb.text(
+    state.autoPin ? "📌 Pin: On" : "📌 Pin: Off",
+    "wiz_opt_pin"
   );
   kb.row();
   kb.text("✅ Create Raffle", "wiz_opt_create");
@@ -496,6 +504,14 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
 
     case "wiz_opt_anon":
       state.anonymous = !state.anonymous;
+      await ctx.editMessageText(buildOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildOptionsKeyboard(state),
+      });
+      break;
+
+    case "wiz_opt_pin":
+      state.autoPin = !state.autoPin;
       await ctx.editMessageText(buildOptionsText(state), {
         parse_mode: "HTML",
         reply_markup: buildOptionsKeyboard(state),
@@ -605,6 +621,7 @@ async function createRaffleFromWizard(
     sponsor_name: state.sponsorName || null,
     anonymous: state.anonymous ? 1 : 0,
     image_file_id: state.imageFileId || null,
+    auto_pin: state.autoPin ? 1 : 0,
   });
 
   cancelWizard(state.userId);
@@ -634,6 +651,17 @@ async function createRaffleFromWizard(
   );
 
   db.updateRaffleMessageId(raffle.id, msg.message_id);
+
+  // Auto-pin the raffle message if enabled
+  if (raffle.auto_pin) {
+    try {
+      await ctx.api.pinChatMessage(state.targetChatId, msg.message_id, {
+        disable_notification: true,
+      });
+    } catch {
+      // Bot may not have pin permission
+    }
+  }
 
   await ctx.reply(
     `✅ Raffle <b>${escapeHtml(raffle.title)}</b> has been posted to <b>${escapeHtml(state.targetChatTitle)}</b>!`,

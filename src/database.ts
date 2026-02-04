@@ -84,6 +84,12 @@ export function initDatabase(dbPath: string): Database.Database {
       UNIQUE(chat_id, name)
     );
 
+    CREATE TABLE IF NOT EXISTS chat_settings (
+      chat_id INTEGER PRIMARY KEY,
+      language TEXT NOT NULL DEFAULT 'en',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
@@ -139,6 +145,11 @@ function migrateDatabase(): void {
       "ALTER TABLE raffle_winners ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
     );
   }
+  if (!raffleColumns.includes("auto_pin")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN auto_pin INTEGER NOT NULL DEFAULT 0"
+    );
+  }
 }
 
 export function getDb(): Database.Database {
@@ -152,8 +163,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -510,6 +521,63 @@ export function purgeExpiredData(retentionHours: number): number {
 
   purgeAll();
   return raffleIds.length;
+}
+
+// --- Edit active raffle ---
+
+export function updateRaffleFields(
+  raffleId: number,
+  fields: Record<string, unknown>
+): boolean {
+  const allowedFields = [
+    "title",
+    "prize",
+    "prizes",
+    "max_entries",
+    "max_winners",
+    "ends_at",
+    "sponsor_name",
+    "description",
+  ];
+  const updates: string[] = [];
+  const values: unknown[] = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    if (allowedFields.includes(key)) {
+      updates.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+
+  if (updates.length === 0) return false;
+
+  values.push(raffleId);
+  const result = getDb()
+    .prepare(`UPDATE raffles SET ${updates.join(", ")} WHERE id = ?`)
+    .run(...values);
+  return result.changes > 0;
+}
+
+// --- Chat settings (language) ---
+
+export function getChatLanguage(chatId: number): string {
+  const row = getDb()
+    .prepare("SELECT language FROM chat_settings WHERE chat_id = ?")
+    .get(chatId) as { language: string } | undefined;
+  return row?.language || "en";
+}
+
+export function setChatLanguage(chatId: number, language: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO chat_settings (chat_id, language) VALUES (?, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET language = ?, updated_at = datetime('now')`
+    )
+    .run(chatId, language, language);
+}
+
+export function getSupportedLanguages(): string[] {
+  return ["en", "es", "pt", "ru", "fr", "de", "ar", "zh"];
 }
 
 // --- Utility ---

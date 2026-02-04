@@ -11,8 +11,11 @@ import {
   isGroupAdmin,
   parseEndTime,
   replyPrivately,
+  sleep,
+  performWheelSpin,
 } from "./helpers";
 import { startWizard, handleStartDeepLink } from "./wizard";
+import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
@@ -40,6 +43,8 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/templates - List saved templates\n` +
       `/usetemplate - Create raffle from template\n` +
       `/recurring - Toggle recurring raffles\n` +
+      `/editraffle - Edit an active raffle\n` +
+      `/language - Set bot language\n` +
       `/help - Show this help message\n\n` +
       `Add me to a group to get started!`,
     { parse_mode: "HTML" }
@@ -70,7 +75,8 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• 👁 Anonymous mode (hide entries until draw)\n` +
       `• 🖼 Raffle banner image\n` +
       `• 🕐 Delayed start time\n` +
-      `• 💎 Sponsor\n\n` +
+      `• 💎 Sponsor\n` +
+      `• 📌 Auto-pin raffle message\n\n` +
       `<b>Templates:</b>\n` +
       `/savetemplate - Save a reusable raffle config\n` +
       `/templates - List saved templates\n` +
@@ -79,13 +85,16 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `/recurring Name on/off - Toggle recurring raffles\n\n` +
       `<b>Management:</b>\n` +
       `/draw [id] - Draw winners (admin only)\n` +
+      `/editraffle [id] - Edit an active raffle (admin only)\n` +
       `/cancelraffle [id] - Cancel a raffle (admin only)\n` +
       `/exportentries [id] - Export all participants (admin only)\n` +
       `/rerun [id] - Re-run a past raffle with same participants (admin only)\n` +
+      `/language [code] - Set bot language (admin only)\n` +
       `/raffles - List open raffles in this chat\n` +
       `/rafflehistory - View recent raffle history\n` +
       `/myentries - See your active entries\n\n` +
-      `<b>Note:</b> Only group admins can create raffles and draw winners.`,
+      `<b>Note:</b> Only group admins can create raffles and draw winners.\n` +
+      `<b>Supported languages:</b> English, Espanol, Portugues, Русский, Francais, Deutsch`,
     { parse_mode: "HTML" });
 }
 
@@ -215,13 +224,15 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     sponsor_name: sponsorName,
     anonymous: 0,
     image_file_id: null,
+    auto_pin: 0,
   });
 
+  const lang = db.getChatLanguage(ctx.chat.id);
   const keyboard = new InlineKeyboard()
-    .text("🎟 Enter Raffle", `enter_${raffle.id}`)
-    .text("❌ Leave", `leave_${raffle.id}`)
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
-    .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
   const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
     parse_mode: "HTML",
@@ -336,11 +347,42 @@ export async function handleDraw(ctx: Context): Promise<void> {
     return;
   }
 
+  const lang = db.getChatLanguage(ctx.chat!.id);
+  const entries = db.getEntriesForRaffle(raffle.id);
+  const entryNames = entries.map((e) => e.user_display_name);
   const winners = db.selectWinners(raffle.id);
 
-  await ctx.reply(formatWinnersMessage(raffle, winners), {
-    parse_mode: "HTML",
-  });
+  // Wheel spin animation (only if 2+ entries for suspense)
+  if (entryNames.length >= 2) {
+    const spinMsgId = await performWheelSpin(
+      ctx.api,
+      ctx.chat!.id,
+      entryNames,
+      raffle.title,
+      lang
+    );
+
+    await sleep(1000);
+
+    // Edit spin message into final winners announcement
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        spinMsgId,
+        formatWinnersMessage(raffle, winners),
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // Fallback: send separate message
+      await ctx.reply(formatWinnersMessage(raffle, winners), {
+        parse_mode: "HTML",
+      });
+    }
+  } else {
+    await ctx.reply(formatWinnersMessage(raffle, winners), {
+      parse_mode: "HTML",
+    });
+  }
 
   await updateRafflePost(ctx, raffle.id);
 
@@ -657,6 +699,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
     sponsor_name: sourceRaffle.sponsor_name,
     anonymous: sourceRaffle.anonymous,
     image_file_id: sourceRaffle.image_file_id,
+    auto_pin: 0,
   });
 
   // Copy all entries from the source raffle
@@ -669,11 +712,12 @@ export async function handleRerun(ctx: Context): Promise<void> {
     }))
   );
 
+  const rerunLang = db.getChatLanguage(ctx.chat.id);
   const keyboard = new InlineKeyboard()
-    .text("🎟 Enter Raffle", `enter_${newRaffle.id}`)
-    .text("❌ Leave", `leave_${newRaffle.id}`)
+    .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
+    .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
     .row()
-    .text(`👥 Entries (${added})`, `entries_${newRaffle.id}`);
+    .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
 
   const msg = await ctx.reply(
     formatRaffleMessage(newRaffle, added) +
@@ -963,13 +1007,15 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     sponsor_name: template.sponsor_name,
     anonymous: template.anonymous,
     image_file_id: null,
+    auto_pin: 0,
   });
 
+  const lang = db.getChatLanguage(ctx.chat.id);
   const keyboard = new InlineKeyboard()
-    .text("🎟 Enter Raffle", `enter_${raffle.id}`)
-    .text("❌ Leave", `leave_${raffle.id}`)
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
-    .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
   const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
     parse_mode: "HTML",
@@ -1052,6 +1098,224 @@ export async function handleRecurring(ctx: Context): Promise<void> {
   }
 }
 
+// /editraffle - Edit an active raffle's settings
+export async function handleEditRaffle(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can edit raffles.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const args = text.replace(/^\/editraffle(@\w+)?/i, "").trim();
+
+  if (!args) {
+    const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+    if (openRaffles.length === 0) {
+      await replyPrivately(ctx, "No open raffles to edit.");
+      return;
+    }
+    let msg = `<b>Which raffle do you want to edit?</b>\n\n`;
+    for (const r of openRaffles) {
+      msg += `/editraffle ${r.id} - ${escapeHtml(r.title)}\n`;
+    }
+    msg += `\n<b>Usage:</b>\n`;
+    msg += `<code>/editraffle ID field:value</code>\n\n`;
+    msg += `<b>Fields you can edit:</b>\n`;
+    msg += `• <code>title:New Title</code>\n`;
+    msg += `• <code>prize:New Prize</code>\n`;
+    msg += `• <code>ends:2h</code> (extend/change end time)\n`;
+    msg += `• <code>max:100</code> (max entries)\n`;
+    msg += `• <code>winners:3</code> (number of winners)\n`;
+    msg += `• <code>sponsor:@Name</code> (or <code>sponsor:none</code>)\n\n`;
+    msg += `<b>Example:</b> <code>/editraffle ${openRaffles[0].id} title:Big Giveaway | ends:6h</code>`;
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  // Parse: /editraffle ID [field:value | field:value ...]
+  const parts = args.split(/\s+/);
+  const raffleId = parseInt(parts[0], 10);
+
+  if (isNaN(raffleId)) {
+    await replyPrivately(ctx, "Please provide a valid raffle ID.");
+    return;
+  }
+
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.chat_id !== ctx.chat.id) {
+    await replyPrivately(ctx, "Raffle not found in this chat.");
+    return;
+  }
+
+  if (raffle.status !== "open") {
+    await replyPrivately(ctx, "Only open raffles can be edited.");
+    return;
+  }
+
+  // If just the ID, show current settings
+  const editPart = args.slice(parts[0].length).trim();
+  if (!editPart) {
+    const count = db.getEntryCount(raffleId);
+    const maxStr = raffle.max_entries ? `${raffle.max_entries}` : "No limit";
+    let msg = `<b>Raffle #${raffle.id}: ${escapeHtml(raffle.title)}</b>\n\n`;
+    msg += `🎁 Prize: ${escapeHtml(raffle.prize)}\n`;
+    msg += `🏆 Winners: ${raffle.max_winners}\n`;
+    msg += `👥 Entries: ${count} (max: ${maxStr})\n`;
+    if (raffle.ends_at) {
+      msg += `⏰ Ends: ${formatCountdown(new Date(raffle.ends_at + "Z"))}\n`;
+    }
+    if (raffle.sponsor_name) {
+      msg += `💎 Sponsor: ${escapeHtml(raffle.sponsor_name)}\n`;
+    }
+    msg += `\n<b>To edit:</b> <code>/editraffle ${raffle.id} field:value</code>`;
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  // Parse field:value pairs (pipe-separated)
+  const fieldParts = editPart.split("|").map((p) => p.trim());
+  const updates: Record<string, unknown> = {};
+  const changes: string[] = [];
+
+  for (const fp of fieldParts) {
+    const titleMatch = fp.match(/^title\s*:\s*(.+)$/i);
+    const prizeMatch = fp.match(/^prize\s*:\s*(.+)$/i);
+    const endsMatch = fp.match(/^ends?\s*:\s*(.+)$/i);
+    const maxMatch = fp.match(/^max\s*:\s*(\d+|none)$/i);
+    const winnersMatch = fp.match(/^winners?\s*:\s*(\d+)$/i);
+    const sponsorMatch = fp.match(/^sponsor\s*:\s*(.+)$/i);
+
+    if (titleMatch) {
+      updates.title = titleMatch[1].trim();
+      changes.push(`Title → ${titleMatch[1].trim()}`);
+    } else if (prizeMatch) {
+      updates.prize = prizeMatch[1].trim();
+      changes.push(`Prize → ${prizeMatch[1].trim()}`);
+    } else if (endsMatch) {
+      const val = endsMatch[1].trim().toLowerCase();
+      if (val === "none" || val === "off") {
+        updates.ends_at = null;
+        changes.push("End time removed");
+      } else {
+        const parsed = parseEndTime(endsMatch[1].trim());
+        if (parsed) {
+          const endsAt = parsed
+            .toISOString()
+            .replace("T", " ")
+            .replace("Z", "")
+            .split(".")[0];
+          updates.ends_at = endsAt;
+          changes.push(`Ends → ${formatCountdown(parsed)}`);
+        } else {
+          await replyPrivately(ctx,
+            `Could not parse end time "${endsMatch[1]}". Use formats like: 30m, 2h, 1d`,
+          );
+          return;
+        }
+      }
+    } else if (maxMatch) {
+      const val = maxMatch[1].toLowerCase();
+      if (val === "none") {
+        updates.max_entries = null;
+        changes.push("Max entries removed");
+      } else {
+        updates.max_entries = Math.max(1, parseInt(val, 10));
+        changes.push(`Max entries → ${val}`);
+      }
+    } else if (winnersMatch) {
+      updates.max_winners = Math.max(
+        1,
+        Math.min(50, parseInt(winnersMatch[1], 10))
+      );
+      changes.push(`Winners → ${winnersMatch[1]}`);
+    } else if (sponsorMatch) {
+      const val = sponsorMatch[1].trim().toLowerCase();
+      if (val === "none" || val === "off") {
+        updates.sponsor_name = null;
+        changes.push("Sponsor removed");
+      } else {
+        updates.sponsor_name = sponsorMatch[1].trim();
+        changes.push(`Sponsor → ${sponsorMatch[1].trim()}`);
+      }
+    }
+  }
+
+  if (changes.length === 0) {
+    await replyPrivately(ctx,
+      `No valid changes found. Use format: <code>/editraffle ${raffleId} field:value</code>`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const updated = db.updateRaffleFields(raffleId, updates);
+  if (!updated) {
+    await replyPrivately(ctx, "Failed to update the raffle.");
+    return;
+  }
+
+  // Refresh the raffle post in the group
+  await updateRafflePost(ctx, raffleId);
+
+  let msg = `✅ <b>Raffle #${raffleId} updated:</b>\n`;
+  for (const c of changes) {
+    msg += `• ${escapeHtml(c)}\n`;
+  }
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+}
+
+// /language - Set the bot language for this chat
+export async function handleLanguage(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can change the language.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const args = text.replace(/^\/language(@\w+)?/i, "").trim().toLowerCase();
+
+  const current = db.getChatLanguage(ctx.chat.id);
+
+  if (!args) {
+    const langs = getAvailableLanguages();
+    let msg = `🌐 <b>${t(current, "misc.lang_current", { lang: getLanguageName(current) })}</b>\n\n`;
+    msg += `<b>Available languages:</b>\n`;
+    for (const l of langs) {
+      const marker = l.code === current ? " ✅" : "";
+      msg += `• <code>/language ${l.code}</code> — ${l.name}${marker}\n`;
+    }
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  const supported = db.getSupportedLanguages();
+  if (!supported.includes(args)) {
+    await replyPrivately(ctx,
+      `Language "${escapeHtml(args)}" is not supported.\nUse /language to see available options.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  db.setChatLanguage(ctx.chat.id, args);
+  const langName = getLanguageName(args);
+  await replyPrivately(ctx,
+    `🌐 ${t(args, "misc.lang_set", { lang: langName })}`,
+    { parse_mode: "HTML" });
+}
+
 // --- Callback query handlers ---
 
 export async function handleEnterCallback(ctx: Context): Promise<void> {
@@ -1069,23 +1333,66 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
   );
 
   const result = db.addEntry(raffleId, userId, userName, displayName);
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  const entryLang = chatId ? db.getChatLanguage(chatId) : "en";
 
   if (result.success) {
-    await ctx.answerCallbackQuery({ text: "🎟 You're in! Good luck!" });
+    await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
     await updateRafflePost(ctx, raffleId);
 
     // Auto-draw when max entries reached
     if (result.maxReached) {
       const raffle = db.getRaffleById(raffleId);
       if (raffle && raffle.status === "open") {
+        const lang = db.getChatLanguage(raffle.chat_id);
+        const entries = db.getEntriesForRaffle(raffleId);
+        const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffleId);
-        try {
-          await ctx.api.sendMessage(
-            raffle.chat_id,
-            formatWinnersMessage(raffle, winners),
-            { parse_mode: "HTML" }
-          );
-        } catch {}
+
+        // Wheel spin animation
+        if (entryNames.length >= 2) {
+          try {
+            const spinMsgId = await performWheelSpin(
+              ctx.api,
+              raffle.chat_id,
+              entryNames,
+              raffle.title,
+              lang
+            );
+            await sleep(1000);
+            try {
+              await ctx.api.editMessageText(
+                raffle.chat_id,
+                spinMsgId,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            } catch {
+              await ctx.api.sendMessage(
+                raffle.chat_id,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            }
+          } catch {
+            try {
+              await ctx.api.sendMessage(
+                raffle.chat_id,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            } catch {}
+          }
+        } else {
+          try {
+            await ctx.api.sendMessage(
+              raffle.chat_id,
+              formatWinnersMessage(raffle, winners),
+              { parse_mode: "HTML" }
+            );
+          } catch {}
+        }
+
         await updateRafflePost(ctx, raffleId);
         await notifyWinnersAndCreator(ctx.api, raffle, winners);
       }
@@ -1115,13 +1422,14 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
   }
 
   const removed = db.removeEntry(raffleId, ctx.from!.id);
+  const leaveLang = raffle ? db.getChatLanguage(raffle.chat_id) : "en";
 
   if (removed) {
-    await ctx.answerCallbackQuery({ text: "You've left the raffle." });
+    await ctx.answerCallbackQuery({ text: t(leaveLang, "entry.left") });
     await updateRafflePost(ctx, raffleId);
   } else {
     await ctx.answerCallbackQuery({
-      text: "You weren't in this raffle.",
+      text: t(leaveLang, "entry.not_in"),
       show_alert: true,
     });
   }
@@ -1176,13 +1484,15 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
 
   const count = db.getEntryCount(raffleId);
 
+  const lang = db.getChatLanguage(raffle.chat_id);
+
   try {
     if (raffle.status === "open") {
       const keyboard = new InlineKeyboard()
-        .text("🎟 Enter Raffle", `enter_${raffle.id}`)
-        .text("❌ Leave", `leave_${raffle.id}`)
+        .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+        .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
         .row()
-        .text(`👥 Entries (${count})`, `entries_${raffle.id}`);
+        .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
 
       await ctx.api.editMessageText(
         raffle.chat_id,

@@ -2,6 +2,7 @@ import type { Context } from "grammy";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
 import { getEntryCount } from "./database";
+import { t } from "./i18n";
 
 export function escapeHtml(text: string): string {
   return text
@@ -215,4 +216,76 @@ function getPositionLabel(position: number): string {
     default:
       return `${position}.`;
   }
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Perform a wheel spin animation by rapidly editing a message,
+ * cycling through entry names and slowing down to reveal winners.
+ * Returns the message ID of the spin message (for further editing).
+ */
+export async function performWheelSpin(
+  api: {
+    sendMessage: (
+      chatId: number,
+      text: string,
+      opts?: Record<string, unknown>
+    ) => Promise<{ message_id: number; chat: { id: number } }>;
+    editMessageText: (
+      chatId: number,
+      messageId: number,
+      text: string,
+      opts?: Record<string, unknown>
+    ) => Promise<unknown>;
+  },
+  chatId: number,
+  entryNames: string[],
+  raffleTitle: string,
+  lang: string = "en"
+): Promise<number> {
+  const title = escapeHtml(raffleTitle);
+
+  // Send initial spinning message
+  const spinMsg = await api.sendMessage(
+    chatId,
+    `🎰 <b>${t(lang, "spin.drawing", { title: raffleTitle })}</b>\n\n` +
+      `🔄 ${t(lang, "spin.spinning")}`,
+    { parse_mode: "HTML" }
+  );
+
+  const msgId = spinMsg.message_id;
+
+  // Timing: start fast, slow down for suspense
+  const delays = [500, 500, 500, 600, 700, 800, 1000, 1200, 1500, 2000];
+
+  for (let i = 0; i < delays.length; i++) {
+    await sleep(delays[i]);
+
+    // Pick a random name to display
+    const idx = Math.floor(Math.random() * entryNames.length);
+    const displayName = entryNames[idx];
+
+    // Visual progress bar
+    const filled = i + 1;
+    const empty = delays.length - filled;
+    const progress = "\u2593".repeat(filled) + "\u2591".repeat(empty);
+
+    try {
+      await api.editMessageText(
+        chatId,
+        msgId,
+        `🎰 <b>${t(lang, "spin.drawing", { title: raffleTitle })}</b>\n\n` +
+          `${progress}\n\n` +
+          `🎯 <b>${escapeHtml(displayName)}</b>`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // Edit failed (rate limit or deleted), skip frame
+    }
+  }
+
+  return msgId;
 }

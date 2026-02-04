@@ -25,6 +25,8 @@ export interface Raffle {
   anonymous: number;
   /** Telegram file_id for the raffle banner image */
   image_file_id: string | null;
+  /** Whether to auto-pin the raffle message in the group */
+  auto_pin: number;
   created_at: string;
   drawn_at: string | null;
 }
@@ -67,6 +69,7 @@ export interface CreateRaffleInput {
   sponsor_name: string | null;
   anonymous: number;
   image_file_id: string | null;
+  auto_pin: number;
 }
 
 export interface RaffleTemplate {

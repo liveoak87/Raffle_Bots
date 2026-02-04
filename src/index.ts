@@ -21,10 +21,19 @@ import {
   handleDeleteTemplate,
   handleUseTemplate,
   handleRecurring,
+  handleEditRaffle,
+  handleLanguage,
   notifyWinnersAndCreator,
 } from "./commands";
-import { formatWinnersMessage, escapeHtml, getUserDisplayName } from "./helpers";
+import {
+  formatWinnersMessage,
+  escapeHtml,
+  getUserDisplayName,
+  sleep,
+  performWheelSpin,
+} from "./helpers";
 import { parsePrizes } from "./types";
+import { t } from "./i18n";
 import {
   handleWizardMessage,
   handleWizardPhoto,
@@ -97,6 +106,8 @@ bot.command("templates", handleTemplates);
 bot.command("deletetemplate", handleDeleteTemplate);
 bot.command("usetemplate", handleUseTemplate);
 bot.command("recurring", handleRecurring);
+bot.command("editraffle", handleEditRaffle);
+bot.command("language", handleLanguage);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -146,28 +157,70 @@ async function checkExpiredRaffles(): Promise<void> {
 
       const entryCount = db.getEntryCount(raffle.id);
 
+      const lang = db.getChatLanguage(raffle.chat_id);
+
       if (entryCount === 0) {
         db.markRaffleDrawn(raffle.id);
         try {
           await bot.api.sendMessage(
             raffle.chat_id,
-            `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. No entries were received.`,
+            `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. ${t(lang, "winner.no_entries")}`,
             { parse_mode: "HTML" }
           );
         } catch {
           // Chat may no longer be accessible
         }
       } else {
+        const entries = db.getEntriesForRaffle(raffle.id);
+        const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
-        try {
-          await bot.api.sendMessage(
-            raffle.chat_id,
-            formatWinnersMessage(raffle, winners),
-            { parse_mode: "HTML" }
-          );
-        } catch {
-          // Chat may no longer be accessible
+
+        // Wheel spin animation
+        if (entryNames.length >= 2) {
+          try {
+            const spinMsgId = await performWheelSpin(
+              bot.api,
+              raffle.chat_id,
+              entryNames,
+              raffle.title,
+              lang
+            );
+            await sleep(1000);
+            try {
+              await bot.api.editMessageText(
+                raffle.chat_id,
+                spinMsgId,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            } catch {
+              await bot.api.sendMessage(
+                raffle.chat_id,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            }
+          } catch {
+            try {
+              await bot.api.sendMessage(
+                raffle.chat_id,
+                formatWinnersMessage(raffle, winners),
+                { parse_mode: "HTML" }
+              );
+            } catch {}
+          }
+        } else {
+          try {
+            await bot.api.sendMessage(
+              raffle.chat_id,
+              formatWinnersMessage(raffle, winners),
+              { parse_mode: "HTML" }
+            );
+          } catch {
+            // Chat may no longer be accessible
+          }
         }
+
         // DM winners and creator
         await notifyWinnersAndCreator(bot.api, raffle, winners);
       }
@@ -274,15 +327,17 @@ async function checkRecurringTemplates(): Promise<void> {
         sponsor_name: template.sponsor_name,
         anonymous: template.anonymous,
         image_file_id: null,
+        auto_pin: 0,
       });
 
       try {
         const { InlineKeyboard } = await import("grammy");
+        const recLang = db.getChatLanguage(template.chat_id);
         const keyboard = new InlineKeyboard()
-          .text("🎟 Enter Raffle", `enter_${raffle.id}`)
-          .text("❌ Leave", `leave_${raffle.id}`)
+          .text(`🎟 ${t(recLang, "btn.enter")}`, `enter_${raffle.id}`)
+          .text(`❌ ${t(recLang, "btn.leave")}`, `leave_${raffle.id}`)
           .row()
-          .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+          .text(`👥 ${t(recLang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
         const { formatRaffleMessage } = await import("./helpers");
         const msg = await bot.api.sendMessage(
@@ -372,6 +427,8 @@ async function main(): Promise<void> {
     { command: "templates", description: "List saved templates" },
     { command: "usetemplate", description: "Create raffle from template" },
     { command: "recurring", description: "Toggle recurring raffles" },
+    { command: "editraffle", description: "Edit an active raffle" },
+    { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help message" },
   ]);
 

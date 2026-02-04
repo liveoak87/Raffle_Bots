@@ -7,6 +7,7 @@ import {
   escapeHtml,
   isGroupAdmin,
   parseEndTime,
+  getForwardedChat,
 } from "./helpers";
 
 interface WizardState {
@@ -182,11 +183,28 @@ export async function handleStartDeepLink(
 
 /** Handle a text message in the bot's DMs during the wizard */
 export async function handleWizardMessage(ctx: Context): Promise<boolean> {
-  if (!ctx.from || !ctx.message?.text) return false;
+  if (!ctx.from || !ctx.message) return false;
 
   const state = getActiveWizard(ctx.from.id);
   if (!state) return false;
 
+  // Check for forwarded messages during require step
+  if (state.step === "require") {
+    const forwardChat = getForwardedChat(ctx.message);
+    if (forwardChat) {
+      state.requiredChatId = forwardChat.id;
+      state.requiredChatTitle = forwardChat.title;
+      await ctx.reply(
+        `✅ Detected group: <b>${escapeHtml(forwardChat.title)}</b>\nChat ID: <code>${forwardChat.id}</code>`,
+        { parse_mode: "HTML" }
+      );
+      await promptSponsorStep(ctx, state);
+      return true;
+    }
+  }
+
+  // Need text for other steps
+  if (!ctx.message.text) return false;
   const text = ctx.message.text.trim();
 
   // Allow cancellation at any step
@@ -418,9 +436,11 @@ export async function handleRequireCallback(ctx: Context): Promise<void> {
     await promptSponsorStep(ctx, state);
   } else if (data === "wiz_require_yes") {
     await ctx.editMessageText(
-      `Send the <b>group ID</b> and <b>name</b> like this:\n\n` +
+      `📋 <b>Forward a message</b> from the target group here and I'll detect it automatically.\n\n` +
+        `Or type the <b>group ID</b> and <b>name</b> manually:\n` +
         `<code>-1001234567890 VIP Members Club</code>\n\n` +
-        `<i>The bot must be admin in that group too. Type <code>skip</code> to skip.</i>`,
+        `💡 Use <code>/groupid</code> in the target group to get its ID.\n\n` +
+        `<i>Type <code>skip</code> to skip.</i>`,
       { parse_mode: "HTML" }
     );
   }
@@ -478,8 +498,8 @@ async function handleRequireText(
   const match = text.match(/^(-?\d+)\s+(.+)$/);
   if (!match) {
     await ctx.reply(
-      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\n` +
-        `💡 Use <code>/groupid</code> in the target group to get its ID.\n\n` +
+      `<b>Forward a message</b> from the target group, or type the ID and name:\n` +
+        `<code>-1001234567890 VIP Group</code>\n\n` +
         `Or type <code>skip</code> to skip.`,
       { parse_mode: "HTML" }
     );

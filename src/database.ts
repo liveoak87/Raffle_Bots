@@ -335,33 +335,47 @@ export function getExpiredOpenRaffles(): Raffle[] {
 // --- Data retention / auto-purge ---
 
 /**
- * Delete all raffles (and their entries + winners via CASCADE) that have been
- * completed (drawn or closed) for longer than `retentionHours`.
- * Returns the number of raffles purged.
+ * Purge entry data for completed raffles older than `retentionHours`.
+ * Keeps raffle records and winner records intact for history display.
+ * Only deletes the raffle_entries rows (the bulk data).
+ * Returns the number of raffles whose entries were purged.
  */
 export function purgeExpiredData(retentionHours: number): number {
-  // Delete drawn raffles older than retention period
-  const drawnResult = getDb()
+  // Find drawn raffles older than retention period
+  const drawnRaffles = getDb()
     .prepare(
-      `DELETE FROM raffles
+      `SELECT id FROM raffles
        WHERE status = 'drawn'
          AND drawn_at IS NOT NULL
          AND drawn_at <= datetime('now', ? || ' hours')`
     )
-    .run(`-${retentionHours}`);
+    .all(`-${retentionHours}`) as Array<{ id: number }>;
 
-  // Delete closed (cancelled) raffles older than retention period
-  // Closed raffles don't have drawn_at, so use created_at as reference
-  const closedResult = getDb()
+  // Find closed (cancelled) raffles older than retention period
+  const closedRaffles = getDb()
     .prepare(
-      `DELETE FROM raffles
+      `SELECT id FROM raffles
        WHERE status = 'closed'
          AND created_at <= datetime('now', ? || ' hours')`
     )
-    .run(`-${retentionHours}`);
+    .all(`-${retentionHours}`) as Array<{ id: number }>;
 
-  const total = drawnResult.changes + closedResult.changes;
-  return total;
+  const raffleIds = [...drawnRaffles, ...closedRaffles].map((r) => r.id);
+  if (raffleIds.length === 0) return 0;
+
+  // Delete only entries for these raffles (keep raffle records and winners for history)
+  const deleteEntries = getDb().prepare(
+    `DELETE FROM raffle_entries WHERE raffle_id = ?`
+  );
+
+  const purgeAll = getDb().transaction(() => {
+    for (const id of raffleIds) {
+      deleteEntries.run(id);
+    }
+  });
+
+  purgeAll();
+  return raffleIds.length;
 }
 
 // --- Utility ---

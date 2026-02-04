@@ -7,14 +7,22 @@ import {
   escapeHtml,
   isGroupAdmin,
   parseEndTime,
+  formatCountdown,
 } from "./helpers";
 
 interface WizardState {
-  step: "title" | "prize" | "winners" | "time" | "time_custom" | "sponsor";
-  /** The group chat where the raffle will be posted */
+  step:
+    | "title"
+    | "prize"
+    | "winners"
+    | "time"
+    | "time_custom"
+    | "options"
+    | "options_sponsor"
+    | "options_image"
+    | "options_scheduled";
   targetChatId: number;
   targetChatTitle: string;
-  /** The admin's private chat ID (where the wizard runs) */
   dmChatId: number;
   userId: number;
   title?: string;
@@ -22,13 +30,13 @@ interface WizardState {
   maxWinners?: number;
   endsAt?: string | null;
   sponsorName?: string | null;
+  anonymous?: boolean;
+  imageFileId?: string | null;
+  startsAt?: string | null;
   createdAt: number;
 }
 
-// Active wizards keyed by `userId` (one wizard per user at a time)
 const wizards = new Map<number, WizardState>();
-
-// Clean up stale wizards older than 30 minutes of inactivity
 const WIZARD_TIMEOUT = 30 * 60 * 1000;
 
 function cleanStaleWizards(): void {
@@ -44,7 +52,6 @@ export function getActiveWizard(userId: number): WizardState | undefined {
   cleanStaleWizards();
   const state = wizards.get(userId);
   if (state) {
-    // Reset inactivity timer on each interaction
     state.createdAt = Date.now();
   }
   return state;
@@ -54,10 +61,6 @@ export function cancelWizard(userId: number): void {
   wizards.delete(userId);
 }
 
-/**
- * Start the wizard. Called from /newraffle in a group.
- * Tries to DM the admin. If it works, the wizard runs in DMs.
- */
 export async function startWizard(ctx: Context): Promise<void> {
   const groupChatId = ctx.chat!.id;
   const groupTitle = ctx.chat!.title || "this group";
@@ -69,7 +72,6 @@ export async function startWizard(ctx: Context): Promise<void> {
     return;
   }
 
-  // Try to DM the admin
   try {
     const dmMsg = await ctx.api.sendMessage(
       userId,
@@ -79,7 +81,6 @@ export async function startWizard(ctx: Context): Promise<void> {
       { parse_mode: "HTML" }
     );
 
-    // Store wizard state keyed by user
     wizards.set(userId, {
       step: "title",
       targetChatId: groupChatId,
@@ -89,20 +90,15 @@ export async function startWizard(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    // Send a brief note in the group that disappears
     const notice = await ctx.reply(
       `📝 Check your DMs @${ctx.from!.username || ctx.from!.first_name} — I sent you the raffle setup there.`
     );
-    // Auto-delete the notice after 5 seconds
     setTimeout(async () => {
       try {
         await ctx.api.deleteMessage(groupChatId, notice.message_id);
-      } catch {
-        // Ignore
-      }
+      } catch {}
     }, 5000);
   } catch {
-    // DM failed — user hasn't started the bot yet
     const botInfo = await ctx.api.getMe();
     const keyboard = new InlineKeyboard().url(
       "Start a DM with me",
@@ -114,7 +110,6 @@ export async function startWizard(ctx: Context): Promise<void> {
         `Tap the button below to start a DM with me, then come back and try /newraffle again.`,
       { reply_markup: keyboard }
     );
-    // Auto-delete after 15 seconds
     setTimeout(async () => {
       try {
         await ctx.api.deleteMessage(groupChatId, fallback.message_id);
@@ -123,10 +118,6 @@ export async function startWizard(ctx: Context): Promise<void> {
   }
 }
 
-/**
- * Handle /start in private chat with a deep link for raffle creation.
- * e.g., /start newraffle_-1001234567890
- */
 export async function handleStartDeepLink(
   ctx: Context,
   payload: string
@@ -137,7 +128,6 @@ export async function handleStartDeepLink(
   const groupChatId = parseInt(match[1], 10);
   const userId = ctx.from!.id;
 
-  // Verify user is admin in that group
   try {
     const member = await ctx.api.getChatMember(groupChatId, userId);
     if (member.status !== "administrator" && member.status !== "creator") {
@@ -155,9 +145,7 @@ export async function handleStartDeepLink(
     if ("title" in chat) {
       groupTitle = chat.title || groupTitle;
     }
-  } catch {
-    // Use default
-  }
+  } catch {}
 
   wizards.set(userId, {
     step: "title",
@@ -187,14 +175,12 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
 
   const text = ctx.message.text.trim();
 
-  // Allow cancellation at any step
   if (text.toLowerCase() === "/cancel") {
     cancelWizard(ctx.from.id);
     await ctx.reply("Raffle creation cancelled.");
     return true;
   }
 
-  // Ignore other commands during wizard
   if (text.startsWith("/")) return false;
 
   switch (state.step) {
@@ -204,11 +190,30 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handlePrizeStep(ctx, state, text);
     case "time_custom":
       return await handleCustomTimeStep(ctx, state, text);
-    case "sponsor":
-      return await handleSponsorText(ctx, state, text);
+    case "options_sponsor":
+      return await handleOptionsSponsorText(ctx, state, text);
+    case "options_scheduled":
+      return await handleOptionsScheduledText(ctx, state, text);
     default:
       return false;
   }
+}
+
+/** Handle a photo message in the wizard (for image upload) */
+export async function handleWizardPhoto(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.photo) return false;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state || state.step !== "options_image") return false;
+
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+  state.imageFileId = largest.file_id;
+  state.step = "options";
+
+  await ctx.reply(`✅ Image added!`);
+  await sendOptionsScreen(ctx, state);
+  return true;
 }
 
 async function handleTitleStep(
@@ -348,8 +353,7 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
         `• <code>45m</code> — 45 minutes\n` +
         `• <code>3h</code> — 3 hours\n` +
         `• <code>12h</code> — 12 hours\n` +
-        `• <code>2d</code> — 2 days\n` +
-        `• <code>2025-12-31 23:59</code> — specific date/time (UTC)\n\n` +
+        `• <code>2d</code> — 2 days\n\n` +
         `<i>Or type /cancel to stop.</i>`,
       { parse_mode: "HTML" }
     );
@@ -378,7 +382,7 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
   }
 
   await ctx.answerCallbackQuery();
-  await promptSponsorStep(ctx, state);
+  await sendOptionsScreen(ctx, state);
 }
 
 async function handleCustomTimeStep(
@@ -390,7 +394,7 @@ async function handleCustomTimeStep(
   if (!parsed) {
     await ctx.reply(
       `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
-        `Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>, or <code>2025-12-31 23:59</code>`,
+        `Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>`,
       { parse_mode: "HTML" }
     );
     return true;
@@ -402,60 +406,129 @@ async function handleCustomTimeStep(
     .replace("Z", "")
     .split(".")[0];
 
-  await ctx.reply(
-    `✅ Time limit: <b>${escapeHtml(text)}</b>`,
-    { parse_mode: "HTML" }
-  );
-  await promptSponsorStep(ctx, state);
+  await sendOptionsScreen(ctx, state);
   return true;
 }
 
-async function promptSponsorStep(
+// --- Options screen ---
+
+function buildOptionsText(state: WizardState): string {
+  let msg = `⚙️ <b>Options</b> — tap to change, then Create:\n\n`;
+
+  const sponsor = state.sponsorName
+    ? `${escapeHtml(state.sponsorName)} ✅`
+    : "None";
+  msg += `💎 <b>Sponsor:</b> ${sponsor}\n`;
+
+  msg += `👁 <b>Hidden entries:</b> ${state.anonymous ? "On ✅" : "Off"}\n`;
+
+  msg += `🖼 <b>Image:</b> ${state.imageFileId ? "Added ✅" : "None"}\n`;
+
+  if (state.startsAt) {
+    const startsDate = new Date(state.startsAt + "Z");
+    msg += `🕐 <b>Delayed start:</b> ${formatCountdown(startsDate).replace(" remaining", "")} ✅\n`;
+  } else {
+    msg += `🕐 <b>Delayed start:</b> Opens immediately\n`;
+  }
+
+  return msg;
+}
+
+function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
+  const kb = new InlineKeyboard();
+
+  kb.text(
+    state.sponsorName ? "💎 Change Sponsor" : "💎 Set Sponsor",
+    "wiz_opt_sponsor"
+  );
+  kb.text(
+    state.anonymous ? "👁 Entries: Hidden" : "👁 Entries: Visible",
+    "wiz_opt_anon"
+  );
+  kb.row();
+  kb.text(
+    state.imageFileId ? "🖼 Replace Image" : "🖼 Add Image",
+    "wiz_opt_image"
+  );
+  kb.text(
+    state.startsAt ? "🕐 Change Start" : "🕐 Delay Start",
+    "wiz_opt_sched"
+  );
+  kb.row();
+  kb.text("✅ Create Raffle", "wiz_opt_create");
+
+  return kb;
+}
+
+async function sendOptionsScreen(
   ctx: Context,
   state: WizardState
 ): Promise<void> {
-  state.step = "sponsor";
-
-  const keyboard = new InlineKeyboard()
-    .text("No sponsor", "wiz_sponsor_none")
-    .row()
-    .text("Yes — I'll type the name", "wiz_sponsor_yes");
-
-  await ctx.reply(
-    `Add a <b>sponsor</b> to this raffle?\n\n` +
-      `<i>The sponsor's name will be displayed on the raffle post.</i>`,
-    { parse_mode: "HTML", reply_markup: keyboard }
-  );
+  state.step = "options";
+  await ctx.reply(buildOptionsText(state), {
+    parse_mode: "HTML",
+    reply_markup: buildOptionsKeyboard(state),
+  });
 }
 
-export async function handleSponsorCallback(ctx: Context): Promise<void> {
+export async function handleOptionsCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
   if (!data || !ctx.from) return;
 
   const state = getActiveWizard(ctx.from.id);
-  if (!state || state.step !== "sponsor") {
+  if (!state || !state.step.startsWith("options")) {
     await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
     return;
   }
 
   await ctx.answerCallbackQuery();
 
-  if (data === "wiz_sponsor_none") {
-    state.sponsorName = null;
-    await createRaffleFromWizard(ctx, state);
-  } else if (data === "wiz_sponsor_yes") {
-    await ctx.editMessageText(
-      `Type the <b>sponsor name</b>:\n\n` +
-        `Examples:\n` +
-        `• <code>RedBeard Peptides</code>\n` +
-        `• <code>@SponsorUsername</code>\n\n` +
-        `<i>Or type <code>skip</code> to skip.</i>`,
-      { parse_mode: "HTML" }
-    );
+  switch (data) {
+    case "wiz_opt_sponsor":
+      state.step = "options_sponsor";
+      await ctx.editMessageText(
+        `💎 Type the <b>sponsor name</b>:\n\n` +
+          `Examples: <code>RedBeard Peptides</code> or <code>@SponsorUsername</code>\n\n` +
+          `<i>Type <code>skip</code> to remove sponsor.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "wiz_opt_anon":
+      state.anonymous = !state.anonymous;
+      await ctx.editMessageText(buildOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildOptionsKeyboard(state),
+      });
+      break;
+
+    case "wiz_opt_image":
+      state.step = "options_image";
+      await ctx.editMessageText(
+        `🖼 Send a <b>photo</b> for the raffle banner.\n\n` +
+          `<i>Type <code>skip</code> to remove image.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "wiz_opt_sched":
+      state.step = "options_scheduled";
+      await ctx.editMessageText(
+        `🕐 When should the raffle <b>open for entries</b>?\n\n` +
+          `Type a delay like: <code>30m</code>, <code>2h</code>, <code>1d</code>\n` +
+          `Or a specific time: <code>2025-12-31 18:00</code>\n\n` +
+          `<i>Type <code>skip</code> to open immediately.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "wiz_opt_create":
+      await createRaffleFromWizard(ctx, state);
+      break;
   }
 }
 
-async function handleSponsorText(
+async function handleOptionsSponsorText(
   ctx: Context,
   state: WizardState,
   text: string
@@ -465,7 +538,38 @@ async function handleSponsorText(
   } else {
     state.sponsorName = text;
   }
-  await createRaffleFromWizard(ctx, state);
+  await sendOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleOptionsScheduledText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.startsAt = null;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const parsed = parseEndTime(text);
+  if (!parsed) {
+    await ctx.reply(
+      `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
+        `Use formats like: <code>30m</code>, <code>2h</code>, <code>1d</code>`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  state.startsAt = parsed
+    .toISOString()
+    .replace("T", " ")
+    .replace("Z", "")
+    .split(".")[0];
+
+  await sendOptionsScreen(ctx, state);
   return true;
 }
 
@@ -495,12 +599,24 @@ async function createRaffleFromWizard(
     max_entries: null,
     max_winners: state.maxWinners || 1,
     ends_at: state.endsAt || null,
+    starts_at: state.startsAt || null,
     required_chat_id: null,
     required_chat_title: null,
     sponsor_name: state.sponsorName || null,
+    anonymous: state.anonymous ? 1 : 0,
+    image_file_id: state.imageFileId || null,
   });
 
   cancelWizard(state.userId);
+
+  // If the raffle has an image, send it first as a banner
+  if (raffle.image_file_id) {
+    try {
+      await ctx.api.sendPhoto(state.targetChatId, raffle.image_file_id);
+    } catch {
+      // Image send failed — continue without it
+    }
+  }
 
   const keyboard = new InlineKeyboard()
     .text("🎟 Enter Raffle", `enter_${raffle.id}`)
@@ -508,7 +624,6 @@ async function createRaffleFromWizard(
     .row()
     .text(`👥 Entries (0)`, `entries_${raffle.id}`);
 
-  // Post the raffle to the GROUP (not the DM)
   const msg = await ctx.api.sendMessage(
     state.targetChatId,
     formatRaffleMessage(raffle, 0),
@@ -520,7 +635,6 @@ async function createRaffleFromWizard(
 
   db.updateRaffleMessageId(raffle.id, msg.message_id);
 
-  // Confirm to the admin in DMs
   await ctx.reply(
     `✅ Raffle <b>${escapeHtml(raffle.title)}</b> has been posted to <b>${escapeHtml(state.targetChatTitle)}</b>!`,
     { parse_mode: "HTML" }

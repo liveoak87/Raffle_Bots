@@ -48,6 +48,17 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
     msg += `⏰ <b>Ends:</b> ${formatCountdown(endsDate)}\n`;
   }
 
+  if (raffle.starts_at) {
+    const startsDate = new Date(raffle.starts_at + "Z");
+    if (startsDate > new Date()) {
+      msg += `🕐 <b>Opens:</b> ${formatCountdown(startsDate).replace(" remaining", "")}\n`;
+    }
+  }
+
+  if (raffle.anonymous) {
+    msg += `👁 <b>Entries:</b> Hidden until draw\n`;
+  }
+
   if (raffle.sponsor_name) {
     msg += `💎 <b>Sponsored by:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
   }

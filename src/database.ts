@@ -4,6 +4,7 @@ import type {
   RaffleEntry,
   RaffleWinner,
   CreateRaffleInput,
+  RaffleTemplate,
 } from "./types";
 import { getPrizeForPosition } from "./types";
 
@@ -28,11 +29,14 @@ export function initDatabase(dbPath: string): Database.Database {
       max_entries INTEGER,
       max_winners INTEGER NOT NULL DEFAULT 1,
       ends_at TEXT,
+      starts_at TEXT,
       status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed', 'drawn')),
       message_id INTEGER,
       required_chat_id INTEGER,
       required_chat_title TEXT,
       sponsor_name TEXT,
+      anonymous INTEGER NOT NULL DEFAULT 0,
+      image_file_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       drawn_at TEXT
     );
@@ -60,10 +64,31 @@ export function initDatabase(dbPath: string): Database.Database {
       FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS raffle_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id INTEGER NOT NULL,
+      creator_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      title TEXT NOT NULL,
+      prize TEXT NOT NULL,
+      prizes TEXT,
+      max_entries INTEGER,
+      max_winners INTEGER NOT NULL DEFAULT 1,
+      duration_minutes INTEGER,
+      sponsor_name TEXT,
+      anonymous INTEGER NOT NULL DEFAULT 0,
+      recurring_interval_minutes INTEGER,
+      recurring_active INTEGER NOT NULL DEFAULT 0,
+      next_run_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chat_id, name)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_user_id ON raffle_entries(user_id);
+    CREATE INDEX IF NOT EXISTS idx_templates_chat_id ON raffle_templates(chat_id);
   `);
 
   // Run migrations for existing databases
@@ -93,6 +118,17 @@ function migrateDatabase(): void {
   if (!raffleColumns.includes("sponsor_name")) {
     getDb().exec("ALTER TABLE raffles ADD COLUMN sponsor_name TEXT");
   }
+  if (!raffleColumns.includes("starts_at")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN starts_at TEXT");
+  }
+  if (!raffleColumns.includes("anonymous")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN anonymous INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("image_file_id")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN image_file_id TEXT");
+  }
   if (!winnerColumns.includes("prize")) {
     getDb().exec(
       "ALTER TABLE raffle_winners ADD COLUMN prize TEXT NOT NULL DEFAULT ''"
@@ -116,8 +152,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, required_chat_id, required_chat_title, sponsor_name)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @required_chat_id, @required_chat_title, @sponsor_name)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -182,7 +218,7 @@ export function addEntry(
   userId: number,
   userName: string,
   displayName: string
-): { success: boolean; reason?: string } {
+): { success: boolean; reason?: string; maxReached?: boolean } {
   const raffle = getRaffleById(raffleId);
   if (!raffle) return { success: false, reason: "Raffle not found." };
   if (raffle.status !== "open")
@@ -190,6 +226,11 @@ export function addEntry(
 
   if (raffle.ends_at && new Date(raffle.ends_at + "Z") < new Date()) {
     return { success: false, reason: "This raffle has expired." };
+  }
+
+  // Check scheduled start time
+  if (raffle.starts_at && new Date(raffle.starts_at + "Z") > new Date()) {
+    return { success: false, reason: "This raffle hasn't opened yet." };
   }
 
   if (raffle.max_entries) {
@@ -206,7 +247,13 @@ export function addEntry(
          VALUES (?, ?, ?, ?)`
       )
       .run(raffleId, userId, userName, displayName);
-    return { success: true };
+
+    // Check if max entries reached after this insert
+    const maxReached =
+      raffle.max_entries !== null &&
+      getEntryCount(raffleId) >= raffle.max_entries;
+
+    return { success: true, maxReached };
   } catch (err: any) {
     if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
       return { success: false, reason: "You already entered this raffle!" };
@@ -330,6 +377,93 @@ export function getExpiredOpenRaffles(): Raffle[] {
       "SELECT * FROM raffles WHERE status = 'open' AND ends_at IS NOT NULL AND ends_at <= datetime('now')"
     )
     .all() as Raffle[];
+}
+
+// --- Templates ---
+
+export function createTemplate(input: {
+  chat_id: number;
+  creator_id: number;
+  name: string;
+  title: string;
+  prize: string;
+  prizes: string | null;
+  max_entries: number | null;
+  max_winners: number;
+  duration_minutes: number | null;
+  sponsor_name: string | null;
+  anonymous: number;
+  recurring_interval_minutes: number | null;
+}): RaffleTemplate {
+  const stmt = getDb().prepare(`
+    INSERT INTO raffle_templates (chat_id, creator_id, name, title, prize, prizes, max_entries, max_winners, duration_minutes, sponsor_name, anonymous, recurring_interval_minutes, recurring_active, next_run_at)
+    VALUES (@chat_id, @creator_id, @name, @title, @prize, @prizes, @max_entries, @max_winners, @duration_minutes, @sponsor_name, @anonymous, @recurring_interval_minutes, 0, NULL)
+  `);
+  const result = stmt.run(input);
+  return getDb()
+    .prepare("SELECT * FROM raffle_templates WHERE id = ?")
+    .get(result.lastInsertRowid) as RaffleTemplate;
+}
+
+export function getTemplatesForChat(chatId: number): RaffleTemplate[] {
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffle_templates WHERE chat_id = ? ORDER BY name ASC"
+    )
+    .all(chatId) as RaffleTemplate[];
+}
+
+export function getTemplateByName(
+  chatId: number,
+  name: string
+): RaffleTemplate | undefined {
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffle_templates WHERE chat_id = ? AND name = ? COLLATE NOCASE"
+    )
+    .get(chatId, name) as RaffleTemplate | undefined;
+}
+
+export function deleteTemplate(chatId: number, name: string): boolean {
+  const result = getDb()
+    .prepare(
+      "DELETE FROM raffle_templates WHERE chat_id = ? AND name = ? COLLATE NOCASE"
+    )
+    .run(chatId, name);
+  return result.changes > 0;
+}
+
+export function setRecurringActive(
+  templateId: number,
+  active: boolean,
+  nextRunAt: string | null
+): void {
+  getDb()
+    .prepare(
+      "UPDATE raffle_templates SET recurring_active = ?, next_run_at = ? WHERE id = ?"
+    )
+    .run(active ? 1 : 0, nextRunAt, templateId);
+}
+
+export function getDueRecurringTemplates(): RaffleTemplate[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM raffle_templates
+       WHERE recurring_active = 1
+         AND recurring_interval_minutes IS NOT NULL
+         AND next_run_at IS NOT NULL
+         AND next_run_at <= datetime('now')`
+    )
+    .all() as RaffleTemplate[];
+}
+
+export function updateNextRunAt(
+  templateId: number,
+  nextRunAt: string
+): void {
+  getDb()
+    .prepare("UPDATE raffle_templates SET next_run_at = ? WHERE id = ?")
+    .run(nextRunAt, templateId);
 }
 
 // --- Data retention / auto-purge ---

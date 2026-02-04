@@ -36,6 +36,10 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/rafflehistory - View past raffles\n` +
       `/exportentries - Export participant list\n` +
       `/rerun - Re-run a raffle with same participants\n` +
+      `/savetemplate - Save a reusable template\n` +
+      `/templates - List saved templates\n` +
+      `/usetemplate - Create raffle from template\n` +
+      `/recurring - Toggle recurring raffles\n` +
       `/help - Show this help message\n\n` +
       `Add me to a group to get started!`,
     { parse_mode: "HTML" }
@@ -47,7 +51,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
   await replyPrivately(ctx,
     `🎟 <b>Raffle Bot Help</b>\n\n` +
       `<b>Creating a Raffle:</b>\n` +
-      `/newraffle - Show creation help\n\n` +
+      `/newraffle - Interactive wizard (in DMs)\n\n` +
       `<b>Quick format:</b>\n` +
       `<code>/newraffle Title | Prize</code>\n\n` +
       `<b>With options:</b>\n` +
@@ -59,10 +63,20 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• <b>Prize</b> - Single prize (or use prizes: for multiple)\n` +
       `• <b>prizes: A, B, C</b> - Comma-separated prizes for 1st, 2nd, 3rd...\n` +
       `• <b>winners:N</b> - Number of winners (default: 1, auto-set from prizes count)\n` +
-      `• <b>max:N</b> - Maximum entries (optional)\n` +
+      `• <b>max:N</b> - Maximum entries (auto-draws when full)\n` +
       `• <b>ends:TIME</b> - Auto-close time (30m, 2h, 1d)\n` +
       `• <b>sponsor:Name</b> - Add a sponsor to the raffle\n\n` +
-      `<b>Time formats:</b> 30m, 2h, 1d, or YYYY-MM-DD HH:MM\n\n` +
+      `<b>Wizard options:</b> The interactive wizard also supports:\n` +
+      `• 👁 Anonymous mode (hide entries until draw)\n` +
+      `• 🖼 Raffle banner image\n` +
+      `• 🕐 Delayed start time\n` +
+      `• 💎 Sponsor\n\n` +
+      `<b>Templates:</b>\n` +
+      `/savetemplate - Save a reusable raffle config\n` +
+      `/templates - List saved templates\n` +
+      `/usetemplate Name - Create raffle from template\n` +
+      `/deletetemplate Name - Delete a template\n` +
+      `/recurring Name on/off - Toggle recurring raffles\n\n` +
       `<b>Management:</b>\n` +
       `/draw [id] - Draw winners (admin only)\n` +
       `/cancelraffle [id] - Cancel a raffle (admin only)\n` +
@@ -195,9 +209,12 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     max_entries: maxEntries,
     max_winners: maxWinners,
     ends_at: endsAt,
+    starts_at: null,
     required_chat_id: null,
     required_chat_title: null,
     sponsor_name: sponsorName,
+    anonymous: 0,
+    image_file_id: null,
   });
 
   const keyboard = new InlineKeyboard()
@@ -634,9 +651,12 @@ export async function handleRerun(ctx: Context): Promise<void> {
     max_entries: null, // Don't limit since we're pre-filling
     max_winners: sourceRaffle.max_winners,
     ends_at: null,
+    starts_at: null,
     required_chat_id: sourceRaffle.required_chat_id,
     required_chat_title: sourceRaffle.required_chat_title,
     sponsor_name: sourceRaffle.sponsor_name,
+    anonymous: sourceRaffle.anonymous,
+    image_file_id: sourceRaffle.image_file_id,
   });
 
   // Copy all entries from the source raffle
@@ -667,6 +687,371 @@ export async function handleRerun(ctx: Context): Promise<void> {
   db.updateRaffleMessageId(newRaffle.id, msg.message_id);
 }
 
+// /savetemplate - Save a raffle configuration as a reusable template
+export async function handleSaveTemplate(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can save templates.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const args = text.replace(/^\/savetemplate(@\w+)?/i, "").trim();
+
+  if (!args) {
+    await replyPrivately(ctx,
+      `<b>Save a raffle template</b>\n\n` +
+        `<code>/savetemplate Name | Title | Prize | winners:N | ends:30m</code>\n\n` +
+        `The first value is the template name (used to recall it later).\n` +
+        `Remaining values use the same format as /newraffle.\n\n` +
+        `Optional: <code>recurring:6h</code> to auto-create on a schedule.\n\n` +
+        `Use <code>/templates</code> to list saved templates.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const parts = args.split("|").map((p) => p.trim());
+  const templateName = parts[0];
+  if (!templateName) {
+    await replyPrivately(ctx, "Template name is required.");
+    return;
+  }
+
+  const title = parts[1] || templateName;
+  let singlePrize = "";
+  let prizesList: string[] | null = null;
+  let maxWinners = 1;
+  let maxEntries: number | null = null;
+  let durationMinutes: number | null = null;
+  let sponsorName: string | null = null;
+  let anonymous = 0;
+  let recurringMinutes: number | null = null;
+
+  for (let i = 2; i < parts.length; i++) {
+    const part = parts[i];
+    const partLower = part.toLowerCase();
+
+    const winnersMatch = partLower.match(/^winners?\s*:\s*(\d+)$/);
+    const maxMatch = partLower.match(/^max\s*:\s*(\d+)$/);
+    const endsMatch = part.match(/^ends?\s*:\s*(.+)$/i);
+    const prizesMatch = part.match(/^prizes?\s*:\s*(.+)$/i);
+    const sponsorMatch = part.match(/^sponsor\s*:\s*(.+)$/i);
+    const recurringMatch = part.match(/^recurring\s*:\s*(.+)$/i);
+    const anonMatch = partLower.match(/^anonymous\s*:\s*(on|off|true|false|1|0|yes|no)$/);
+
+    if (winnersMatch) {
+      maxWinners = Math.max(1, Math.min(50, parseInt(winnersMatch[1], 10)));
+    } else if (maxMatch) {
+      maxEntries = Math.max(1, parseInt(maxMatch[1], 10));
+    } else if (endsMatch) {
+      const val = endsMatch[1].trim().toLowerCase();
+      const durationMatch = val.match(/^(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
+      if (durationMatch) {
+        const amount = parseInt(durationMatch[1], 10);
+        const unit = durationMatch[2].toLowerCase();
+        if (unit.startsWith("m")) durationMinutes = amount;
+        else if (unit.startsWith("h")) durationMinutes = amount * 60;
+        else if (unit.startsWith("d")) durationMinutes = amount * 60 * 24;
+      }
+    } else if (prizesMatch) {
+      prizesList = prizesMatch[1]
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+    } else if (sponsorMatch) {
+      sponsorName = sponsorMatch[1].trim();
+    } else if (recurringMatch) {
+      const val = recurringMatch[1].trim().toLowerCase();
+      const recMatch = val.match(/^(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
+      if (recMatch) {
+        const amount = parseInt(recMatch[1], 10);
+        const unit = recMatch[2].toLowerCase();
+        if (unit.startsWith("m")) recurringMinutes = amount;
+        else if (unit.startsWith("h")) recurringMinutes = amount * 60;
+        else if (unit.startsWith("d")) recurringMinutes = amount * 60 * 24;
+      }
+    } else if (anonMatch) {
+      const val = anonMatch[1].toLowerCase();
+      anonymous = ["on", "true", "1", "yes"].includes(val) ? 1 : 0;
+    } else if (!singlePrize) {
+      singlePrize = part;
+    }
+  }
+
+  if (prizesList && prizesList.length > 1) {
+    const explicitWinners = parts.some((p) =>
+      p.toLowerCase().match(/^winners?\s*:\s*\d+$/)
+    );
+    if (!explicitWinners) {
+      maxWinners = prizesList.length;
+    }
+  }
+
+  const finalPrize = singlePrize || (prizesList ? prizesList[0] : title);
+
+  try {
+    const template = db.createTemplate({
+      chat_id: ctx.chat.id,
+      creator_id: userId,
+      name: templateName,
+      title,
+      prize: finalPrize,
+      prizes: prizesList ? JSON.stringify(prizesList) : null,
+      max_entries: maxEntries,
+      max_winners: maxWinners,
+      duration_minutes: durationMinutes,
+      sponsor_name: sponsorName,
+      anonymous,
+      recurring_interval_minutes: recurringMinutes,
+    });
+
+    let msg = `✅ Template <b>${escapeHtml(templateName)}</b> saved!\n\n`;
+    msg += `📋 Title: ${escapeHtml(title)}\n`;
+    msg += `🎁 Prize: ${escapeHtml(finalPrize)}\n`;
+    msg += `🏆 Winners: ${maxWinners}\n`;
+    if (durationMinutes) msg += `⏰ Duration: ${durationMinutes}m\n`;
+    if (recurringMinutes) msg += `🔄 Recurring: every ${recurringMinutes}m\n`;
+
+    msg += `\nUse <code>/usetemplate ${escapeHtml(templateName)}</code> to create a raffle from this template.`;
+
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  } catch (err: any) {
+    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      await replyPrivately(ctx,
+        `A template named "${escapeHtml(templateName)}" already exists in this chat.\nDelete it first with <code>/deletetemplate ${escapeHtml(templateName)}</code>`,
+        { parse_mode: "HTML" });
+    } else {
+      throw err;
+    }
+  }
+}
+
+// /templates - List saved templates
+export async function handleTemplates(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const templates = db.getTemplatesForChat(ctx.chat.id);
+
+  if (templates.length === 0) {
+    await replyPrivately(ctx,
+      "No templates saved for this chat.\nUse /savetemplate to create one.");
+    return;
+  }
+
+  let msg = `📋 <b>Saved Templates (${templates.length})</b>\n\n`;
+  for (const t of templates) {
+    msg += `<b>${escapeHtml(t.name)}</b>\n`;
+    msg += `  📝 ${escapeHtml(t.title)} | 🎁 ${escapeHtml(t.prize)} | 🏆 ${t.max_winners}w\n`;
+    if (t.duration_minutes) msg += `  ⏰ ${t.duration_minutes}m`;
+    if (t.recurring_interval_minutes) {
+      msg += ` | 🔄 every ${t.recurring_interval_minutes}m`;
+      msg += t.recurring_active ? " (active)" : " (paused)";
+    }
+    if (t.duration_minutes || t.recurring_interval_minutes) msg += `\n`;
+    msg += `  → <code>/usetemplate ${escapeHtml(t.name)}</code>\n\n`;
+  }
+
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+}
+
+// /deletetemplate - Delete a saved template
+export async function handleDeleteTemplate(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can delete templates.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const name = text.replace(/^\/deletetemplate(@\w+)?/i, "").trim();
+
+  if (!name) {
+    await replyPrivately(ctx,
+      "Usage: <code>/deletetemplate TemplateName</code>",
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const deleted = db.deleteTemplate(ctx.chat.id, name);
+  if (deleted) {
+    await replyPrivately(ctx,
+      `✅ Template <b>${escapeHtml(name)}</b> deleted.`,
+      { parse_mode: "HTML" });
+  } else {
+    await replyPrivately(ctx,
+      `Template "${escapeHtml(name)}" not found.`,
+      { parse_mode: "HTML" });
+  }
+}
+
+// /usetemplate - Create a raffle from a saved template
+export async function handleUseTemplate(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can create raffles.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const name = text.replace(/^\/usetemplate(@\w+)?/i, "").trim();
+
+  if (!name) {
+    await replyPrivately(ctx,
+      "Usage: <code>/usetemplate TemplateName</code>\n\nUse /templates to see saved templates.",
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const template = db.getTemplateByName(ctx.chat.id, name);
+  if (!template) {
+    await replyPrivately(ctx,
+      `Template "${escapeHtml(name)}" not found. Use /templates to see saved templates.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const displayName = getUserDisplayName(
+    ctx.from!.first_name,
+    ctx.from!.last_name
+  );
+
+  let endsAt: string | null = null;
+  if (template.duration_minutes) {
+    const endDate = new Date(Date.now() + template.duration_minutes * 60 * 1000);
+    endsAt = endDate
+      .toISOString()
+      .replace("T", " ")
+      .replace("Z", "")
+      .split(".")[0];
+  }
+
+  const raffle = db.createRaffle({
+    chat_id: ctx.chat.id,
+    creator_id: userId,
+    creator_name: displayName,
+    title: template.title,
+    description: "",
+    prize: template.prize,
+    prizes: template.prizes,
+    max_entries: template.max_entries,
+    max_winners: template.max_winners,
+    ends_at: endsAt,
+    starts_at: null,
+    required_chat_id: null,
+    required_chat_title: null,
+    sponsor_name: template.sponsor_name,
+    anonymous: template.anonymous,
+    image_file_id: null,
+  });
+
+  const keyboard = new InlineKeyboard()
+    .text("🎟 Enter Raffle", `enter_${raffle.id}`)
+    .text("❌ Leave", `leave_${raffle.id}`)
+    .row()
+    .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+
+  const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
+
+  db.updateRaffleMessageId(raffle.id, msg.message_id);
+}
+
+// /recurring - Toggle recurring on/off for a template
+export async function handleRecurring(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can manage recurring raffles.");
+    return;
+  }
+
+  const text = ctx.message?.text || "";
+  const args = text.replace(/^\/recurring(@\w+)?/i, "").trim();
+
+  if (!args) {
+    await replyPrivately(ctx,
+      `<b>Recurring Raffles</b>\n\n` +
+        `<code>/recurring TemplateName on</code> — Start recurring\n` +
+        `<code>/recurring TemplateName off</code> — Stop recurring\n\n` +
+        `The template must have a <code>recurring:TIME</code> interval set.\n` +
+        `Use <code>/templates</code> to see your saved templates.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const parts = args.split(/\s+/);
+  const action = parts.pop()?.toLowerCase();
+  const name = parts.join(" ");
+
+  if (!name || (action !== "on" && action !== "off")) {
+    await replyPrivately(ctx,
+      "Usage: <code>/recurring TemplateName on</code> or <code>/recurring TemplateName off</code>",
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  const template = db.getTemplateByName(ctx.chat.id, name);
+  if (!template) {
+    await replyPrivately(ctx,
+      `Template "${escapeHtml(name)}" not found.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  if (!template.recurring_interval_minutes) {
+    await replyPrivately(ctx,
+      `Template "${escapeHtml(name)}" doesn't have a recurring interval set.\nRe-create it with <code>recurring:TIME</code> parameter.`,
+      { parse_mode: "HTML" });
+    return;
+  }
+
+  if (action === "on") {
+    const nextRun = new Date(Date.now() + template.recurring_interval_minutes * 60 * 1000);
+    const nextRunStr = nextRun
+      .toISOString()
+      .replace("T", " ")
+      .replace("Z", "")
+      .split(".")[0];
+    db.setRecurringActive(template.id, true, nextRunStr);
+    await replyPrivately(ctx,
+      `🔄 Recurring <b>activated</b> for "${escapeHtml(name)}".\nNext raffle in ${template.recurring_interval_minutes} minutes.`,
+      { parse_mode: "HTML" });
+  } else {
+    db.setRecurringActive(template.id, false, null);
+    await replyPrivately(ctx,
+      `⏸ Recurring <b>paused</b> for "${escapeHtml(name)}".`,
+      { parse_mode: "HTML" });
+  }
+}
+
 // --- Callback query handlers ---
 
 export async function handleEnterCallback(ctx: Context): Promise<void> {
@@ -688,6 +1073,23 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
   if (result.success) {
     await ctx.answerCallbackQuery({ text: "🎟 You're in! Good luck!" });
     await updateRafflePost(ctx, raffleId);
+
+    // Auto-draw when max entries reached
+    if (result.maxReached) {
+      const raffle = db.getRaffleById(raffleId);
+      if (raffle && raffle.status === "open") {
+        const winners = db.selectWinners(raffleId);
+        try {
+          await ctx.api.sendMessage(
+            raffle.chat_id,
+            formatWinnersMessage(raffle, winners),
+            { parse_mode: "HTML" }
+          );
+        } catch {}
+        await updateRafflePost(ctx, raffleId);
+        await notifyWinnersAndCreator(ctx.api, raffle, winners);
+      }
+    }
   } else {
     await ctx.answerCallbackQuery({
       text: result.reason || "Could not enter.",
@@ -731,6 +1133,20 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
 
   const raffleId = parseInt(data.replace("entries_", ""), 10);
   if (isNaN(raffleId)) return;
+
+  const raffle = db.getRaffleById(raffleId);
+
+  // Anonymous mode: hide entry names until drawn
+  if (raffle && raffle.anonymous && raffle.status !== "drawn") {
+    const count = db.getEntryCount(raffleId);
+    await ctx.answerCallbackQuery({
+      text: count === 0
+        ? "No entries yet. Be the first!"
+        : `${count} entries so far. Names hidden until draw!`,
+      show_alert: true,
+    });
+    return;
+  }
 
   const entries = db.getEntriesForRaffle(raffleId);
 

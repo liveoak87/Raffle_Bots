@@ -16,15 +16,21 @@ import {
   handleEnterCallback,
   handleLeaveCallback,
   handleEntriesCallback,
+  handleSaveTemplate,
+  handleTemplates,
+  handleDeleteTemplate,
+  handleUseTemplate,
+  handleRecurring,
   notifyWinnersAndCreator,
 } from "./commands";
-import { formatWinnersMessage, escapeHtml } from "./helpers";
+import { formatWinnersMessage, escapeHtml, getUserDisplayName } from "./helpers";
 import { parsePrizes } from "./types";
 import {
   handleWizardMessage,
+  handleWizardPhoto,
   handleWinnersCallback,
   handleTimeCallback,
-  handleSponsorCallback,
+  handleOptionsCallback,
   handleStartDeepLink,
   getActiveWizard,
 } from "./wizard";
@@ -86,6 +92,11 @@ bot.command("myentries", handleMyEntries);
 bot.command("rafflehistory", handleRaffleHistory);
 bot.command("exportentries", handleExportEntries);
 bot.command("rerun", handleRerun);
+bot.command("savetemplate", handleSaveTemplate);
+bot.command("templates", handleTemplates);
+bot.command("deletetemplate", handleDeleteTemplate);
+bot.command("usetemplate", handleUseTemplate);
+bot.command("recurring", handleRecurring);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -95,7 +106,7 @@ bot.callbackQuery(/^entries_\d+$/, handleEntriesCallback);
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
 bot.callbackQuery(/^wiz_time_/, handleTimeCallback);
-bot.callbackQuery(/^wiz_sponsor_/, handleSponsorCallback);
+bot.callbackQuery(/^wiz_opt_/, handleOptionsCallback);
 
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {
@@ -111,6 +122,17 @@ bot.on("message:text", async (ctx) => {
   if (!state) return;
 
   await handleWizardMessage(ctx);
+});
+
+// --- Handle photo messages (for wizard image upload in DMs) ---
+bot.on("message:photo", async (ctx) => {
+  if (!ctx.from) return;
+  if (ctx.chat.type !== "private") return;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state) return;
+
+  await handleWizardPhoto(ctx);
 });
 
 // --- Auto-draw expired raffles ---
@@ -216,6 +238,119 @@ function purgeOldData(): void {
   }
 }
 
+// --- Auto-create recurring raffles from templates ---
+const RECURRING_CHECK_INTERVAL = 60_000; // 1 minute
+
+async function checkRecurringTemplates(): Promise<void> {
+  try {
+    const dueTemplates = db.getDueRecurringTemplates();
+    for (const template of dueTemplates) {
+      console.log(`Creating recurring raffle from template: ${template.name} (ID: ${template.id})`);
+
+      let endsAt: string | null = null;
+      if (template.duration_minutes) {
+        const endDate = new Date(Date.now() + template.duration_minutes * 60 * 1000);
+        endsAt = endDate
+          .toISOString()
+          .replace("T", " ")
+          .replace("Z", "")
+          .split(".")[0];
+      }
+
+      const raffle = db.createRaffle({
+        chat_id: template.chat_id,
+        creator_id: template.creator_id,
+        creator_name: "Recurring Raffle",
+        title: template.title,
+        description: "",
+        prize: template.prize,
+        prizes: template.prizes,
+        max_entries: template.max_entries,
+        max_winners: template.max_winners,
+        ends_at: endsAt,
+        starts_at: null,
+        required_chat_id: null,
+        required_chat_title: null,
+        sponsor_name: template.sponsor_name,
+        anonymous: template.anonymous,
+        image_file_id: null,
+      });
+
+      try {
+        const { InlineKeyboard } = await import("grammy");
+        const keyboard = new InlineKeyboard()
+          .text("🎟 Enter Raffle", `enter_${raffle.id}`)
+          .text("❌ Leave", `leave_${raffle.id}`)
+          .row()
+          .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+
+        const { formatRaffleMessage } = await import("./helpers");
+        const msg = await bot.api.sendMessage(
+          template.chat_id,
+          formatRaffleMessage(raffle, 0),
+          { parse_mode: "HTML", reply_markup: keyboard }
+        );
+
+        db.updateRaffleMessageId(raffle.id, msg.message_id);
+      } catch (err) {
+        console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
+      }
+
+      // Schedule the next run
+      const nextRun = new Date(Date.now() + template.recurring_interval_minutes! * 60 * 1000);
+      const nextRunStr = nextRun
+        .toISOString()
+        .replace("T", " ")
+        .replace("Z", "")
+        .split(".")[0];
+      db.updateNextRunAt(template.id, nextRunStr);
+    }
+  } catch (err) {
+    console.error("Error checking recurring templates:", err);
+  }
+}
+
+// --- Inline mode ---
+bot.on("inline_query", async (ctx) => {
+  const query = ctx.inlineQuery.query.trim();
+
+  // Show open raffles the user's groups have
+  // For now, show a simple "create raffle" suggestion
+  try {
+    const results = [];
+
+    if (!query) {
+      results.push({
+        type: "article" as const,
+        id: "help",
+        title: "Raffle Bot",
+        description: "Add me to a group and use /newraffle to create raffles!",
+        input_message_content: {
+          message_text:
+            "🎟 <b>Raffle Bot</b>\n\nAdd me to a group chat and use /newraffle to create interactive raffles with prizes, auto-draw, templates, and more!",
+          parse_mode: "HTML" as const,
+        },
+      });
+    } else {
+      results.push({
+        type: "article" as const,
+        id: "create",
+        title: `Create raffle: ${query}`,
+        description: "Add me to a group first, then use /newraffle",
+        input_message_content: {
+          message_text:
+            `🎟 <b>${escapeHtml(query)}</b>\n\nTo create this raffle, add @${(await bot.api.getMe()).username} to your group and use:\n<code>/newraffle ${escapeHtml(query)}</code>`,
+          parse_mode: "HTML" as const,
+        },
+      });
+    }
+
+    await ctx.answerInlineQuery(results, { cache_time: 10 });
+  } catch (err) {
+    console.error("Inline query error:", err);
+  }
+});
+
 // --- Error handling ---
 bot.catch((err) => {
   console.error("Bot error:", err);
@@ -233,11 +368,18 @@ async function main(): Promise<void> {
     { command: "rafflehistory", description: "View past raffles" },
     { command: "exportentries", description: "Export participant list" },
     { command: "rerun", description: "Re-run a raffle with same participants" },
+    { command: "savetemplate", description: "Save a reusable raffle template" },
+    { command: "templates", description: "List saved templates" },
+    { command: "usetemplate", description: "Create raffle from template" },
+    { command: "recurring", description: "Toggle recurring raffles" },
     { command: "help", description: "Show help message" },
   ]);
 
   // Start expiry checker
   setInterval(checkExpiredRaffles, EXPIRY_CHECK_INTERVAL);
+
+  // Start recurring template checker
+  setInterval(checkRecurringTemplates, RECURRING_CHECK_INTERVAL);
 
   // Start data retention purge (run once at startup, then hourly)
   purgeOldData();

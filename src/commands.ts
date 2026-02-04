@@ -11,10 +11,18 @@ import {
   isUserInChat,
   parseEndTime,
 } from "./helpers";
-import { startWizard } from "./wizard";
+import { startWizard, handleStartDeepLink } from "./wizard";
 
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
+  // Check for deep link payload (e.g., /start newraffle_-1001234567890)
+  const text = ctx.message?.text || "";
+  const payload = text.replace(/^\/start(@\w+)?/i, "").trim();
+  if (payload) {
+    const handled = await handleStartDeepLink(ctx, payload);
+    if (handled) return;
+  }
+
   await ctx.reply(
     `🎟 <b>Raffle Bot</b>\n\n` +
       `I help you run raffles in Telegram group chats!\n\n` +

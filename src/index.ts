@@ -24,8 +24,8 @@ import {
   handleWinnersCallback,
   handleTimeCallback,
   handleRequireCallback,
+  handleStartDeepLink,
   getActiveWizard,
-  handleRequireText,
 } from "./wizard";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -79,24 +79,19 @@ bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
 bot.callbackQuery(/^wiz_time_/, handleTimeCallback);
 bot.callbackQuery(/^wiz_require_/, handleRequireCallback);
 
-// --- Handle text messages (for wizard responses) ---
+// --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {
-  if (!ctx.chat || ctx.chat.type === "private") return;
   if (!ctx.from) return;
   // Skip commands — they're handled above
   if (ctx.message.text.startsWith("/")) return;
 
+  // Only process wizard messages in private chat (DMs)
+  if (ctx.chat.type !== "private") return;
+
   // Check if user has an active wizard
-  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  const state = getActiveWizard(ctx.from.id);
   if (!state) return;
 
-  // Handle the "require" step text input separately
-  if (state.step === "require") {
-    await handleRequireText(ctx, state, ctx.message.text.trim());
-    return;
-  }
-
-  // Handle title/prize text steps
   await handleWizardMessage(ctx);
 });
 

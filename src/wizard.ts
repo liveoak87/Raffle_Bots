@@ -1,10 +1,20 @@
 import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
-import { isGroupAdmin } from "./helpers";
+import * as db from "./database";
+import {
+  getUserDisplayName,
+  formatRaffleMessage,
+  escapeHtml,
+  isGroupAdmin,
+} from "./helpers";
 
 interface WizardState {
   step: "title" | "prize" | "winners" | "time" | "require";
-  chatId: number;
+  /** The group chat where the raffle will be posted */
+  targetChatId: number;
+  targetChatTitle: string;
+  /** The admin's private chat ID (where the wizard runs) */
+  dmChatId: number;
   userId: number;
   title?: string;
   prizes?: string[];
@@ -15,15 +25,11 @@ interface WizardState {
   createdAt: number;
 }
 
-// Active wizards keyed by `chatId:userId`
-const wizards = new Map<string, WizardState>();
+// Active wizards keyed by `userId` (one wizard per user at a time)
+const wizards = new Map<number, WizardState>();
 
 // Clean up stale wizards older than 10 minutes
 const WIZARD_TIMEOUT = 10 * 60 * 1000;
-
-function wizardKey(chatId: number, userId: number): string {
-  return `${chatId}:${userId}`;
-}
 
 function cleanStaleWizards(): void {
   const now = Date.now();
@@ -34,21 +40,22 @@ function cleanStaleWizards(): void {
   }
 }
 
-export function getActiveWizard(
-  chatId: number,
-  userId: number
-): WizardState | undefined {
+export function getActiveWizard(userId: number): WizardState | undefined {
   cleanStaleWizards();
-  return wizards.get(wizardKey(chatId, userId));
+  return wizards.get(userId);
 }
 
-export function cancelWizard(chatId: number, userId: number): void {
-  wizards.delete(wizardKey(chatId, userId));
+export function cancelWizard(userId: number): void {
+  wizards.delete(userId);
 }
 
-/** Start the wizard when /newraffle is called with no arguments */
+/**
+ * Start the wizard. Called from /newraffle in a group.
+ * Tries to DM the admin. If it works, the wizard runs in DMs.
+ */
 export async function startWizard(ctx: Context): Promise<void> {
-  const chatId = ctx.chat!.id;
+  const groupChatId = ctx.chat!.id;
+  const groupTitle = ctx.chat!.title || "this group";
   const userId = ctx.from!.id;
 
   const isAdmin = await isGroupAdmin(ctx, userId);
@@ -57,34 +64,128 @@ export async function startWizard(ctx: Context): Promise<void> {
     return;
   }
 
-  const key = wizardKey(chatId, userId);
-  wizards.set(key, {
+  // Try to DM the admin
+  try {
+    const dmMsg = await ctx.api.sendMessage(
+      userId,
+      `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
+        `Step 1 of 5: What's the <b>title</b> of your raffle?\n\n` +
+        `<i>Just type it and send. Or /cancel to stop.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    // Store wizard state keyed by user
+    wizards.set(userId, {
+      step: "title",
+      targetChatId: groupChatId,
+      targetChatTitle: groupTitle,
+      dmChatId: dmMsg.chat.id,
+      userId,
+      createdAt: Date.now(),
+    });
+
+    // Delete the /newraffle command from the group so it stays clean
+    try {
+      await ctx.deleteMessage();
+    } catch {
+      // Bot may not have delete permission
+    }
+
+    // Send a brief note in the group that disappears
+    const notice = await ctx.reply(
+      `📝 Check your DMs @${ctx.from!.username || ctx.from!.first_name} — I sent you the raffle setup there.`
+    );
+    // Auto-delete the notice after 5 seconds
+    setTimeout(async () => {
+      try {
+        await ctx.api.deleteMessage(groupChatId, notice.message_id);
+      } catch {
+        // Ignore
+      }
+    }, 5000);
+  } catch {
+    // DM failed — user hasn't started the bot yet
+    const botInfo = await ctx.api.getMe();
+    const keyboard = new InlineKeyboard().url(
+      "Start a DM with me",
+      `https://t.me/${botInfo.username}?start=newraffle_${groupChatId}`
+    );
+
+    await ctx.reply(
+      `I need to set up the raffle in a private message so the group stays clean.\n\n` +
+        `Tap the button below to start a DM with me, then come back and try /newraffle again.`,
+      { reply_markup: keyboard }
+    );
+  }
+}
+
+/**
+ * Handle /start in private chat with a deep link for raffle creation.
+ * e.g., /start newraffle_-1001234567890
+ */
+export async function handleStartDeepLink(
+  ctx: Context,
+  payload: string
+): Promise<boolean> {
+  const match = payload.match(/^newraffle_(-?\d+)$/);
+  if (!match) return false;
+
+  const groupChatId = parseInt(match[1], 10);
+  const userId = ctx.from!.id;
+
+  // Verify user is admin in that group
+  try {
+    const member = await ctx.api.getChatMember(groupChatId, userId);
+    if (member.status !== "administrator" && member.status !== "creator") {
+      await ctx.reply("You must be an admin in that group to create raffles.");
+      return true;
+    }
+  } catch {
+    await ctx.reply("I couldn't verify your admin status in that group.");
+    return true;
+  }
+
+  let groupTitle = "the group";
+  try {
+    const chat = await ctx.api.getChat(groupChatId);
+    if ("title" in chat) {
+      groupTitle = chat.title || groupTitle;
+    }
+  } catch {
+    // Use default
+  }
+
+  wizards.set(userId, {
     step: "title",
-    chatId,
+    targetChatId: groupChatId,
+    targetChatTitle: groupTitle,
+    dmChatId: ctx.chat!.id,
     userId,
     createdAt: Date.now(),
   });
 
   await ctx.reply(
-    `📝 <b>Create a Raffle</b>\n\n` +
+    `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
       `Step 1 of 5: What's the <b>title</b> of your raffle?\n\n` +
       `<i>Just type it and send. Or /cancel to stop.</i>`,
     { parse_mode: "HTML" }
   );
+
+  return true;
 }
 
-/** Handle a text message that might be a wizard response */
+/** Handle a text message in the bot's DMs during the wizard */
 export async function handleWizardMessage(ctx: Context): Promise<boolean> {
-  if (!ctx.chat || !ctx.from || !ctx.message?.text) return false;
+  if (!ctx.from || !ctx.message?.text) return false;
 
-  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  const state = getActiveWizard(ctx.from.id);
   if (!state) return false;
 
   const text = ctx.message.text.trim();
 
   // Allow cancellation at any step
   if (text.toLowerCase() === "/cancel") {
-    cancelWizard(ctx.chat.id, ctx.from.id);
+    cancelWizard(ctx.from.id);
     await ctx.reply("Raffle creation cancelled.");
     return true;
   }
@@ -97,6 +198,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleTitleStep(ctx, state, text);
     case "prize":
       return await handlePrizeStep(ctx, state, text);
+    case "require":
+      return await handleRequireText(ctx, state, text);
     default:
       return false;
   }
@@ -155,11 +258,9 @@ async function handlePrizeStep(
   const keyboard = new InlineKeyboard();
 
   if (prizes.length > 1) {
-    // If multiple prizes, default to matching prize count
     keyboard
       .text(`${prizes.length} (match prizes)`, `wiz_winners_${prizes.length}`)
       .row();
-    // Also offer other options
     const options = [1, 2, 3, 5, 10].filter((n) => n !== prizes.length);
     for (const n of options.slice(0, 4)) {
       keyboard.text(`${n}`, `wiz_winners_${n}`);
@@ -183,9 +284,9 @@ async function handlePrizeStep(
 
 export async function handleWinnersCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
-  if (!data || !ctx.chat || !ctx.from) return;
+  if (!data || !ctx.from) return;
 
-  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  const state = getActiveWizard(ctx.from.id);
   if (!state || state.step !== "winners") {
     await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
     return;
@@ -220,9 +321,9 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
 
 export async function handleTimeCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
-  if (!data || !ctx.chat || !ctx.from) return;
+  if (!data || !ctx.from) return;
 
-  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  const state = getActiveWizard(ctx.from.id);
   if (!state || state.step !== "time") {
     await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
     return;
@@ -272,9 +373,9 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
 
 export async function handleRequireCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
-  if (!data || !ctx.chat || !ctx.from) return;
+  if (!data || !ctx.from) return;
 
-  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  const state = getActiveWizard(ctx.from.id);
   if (!state || state.step !== "require") {
     await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
     return;
@@ -290,20 +391,18 @@ export async function handleRequireCallback(ctx: Context): Promise<void> {
     await ctx.editMessageText(
       `Send the <b>group ID</b> and <b>name</b> like this:\n\n` +
         `<code>-1001234567890 VIP Members Club</code>\n\n` +
-        `<i>The bot must be admin in that group too. Send /cancel to skip.</i>`,
+        `<i>The bot must be admin in that group too. Type <code>skip</code> to skip.</i>`,
       { parse_mode: "HTML" }
     );
-    // Keep step as "require" — we'll handle the text reply
   }
 }
 
-/** Handle text reply for the require step */
-export async function handleRequireText(
+async function handleRequireText(
   ctx: Context,
   state: WizardState,
   text: string
 ): Promise<boolean> {
-  if (text.toLowerCase() === "/cancel" || text.toLowerCase() === "skip") {
+  if (text.toLowerCase() === "skip") {
     state.requiredChatId = null;
     state.requiredChatTitle = null;
     await createRaffleFromWizard(ctx, state);
@@ -313,7 +412,7 @@ export async function handleRequireText(
   const match = text.match(/^(-?\d+)\s+(.+)$/);
   if (!match) {
     await ctx.reply(
-      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\nOr type <code>skip</code> to skip this step.`,
+      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\nOr type <code>skip</code> to skip.`,
       { parse_mode: "HTML" }
     );
     return true;
@@ -325,14 +424,7 @@ export async function handleRequireText(
   return true;
 }
 
-// --- Create the raffle from collected wizard state ---
-
-import * as db from "./database";
-import {
-  getUserDisplayName,
-  formatRaffleMessage,
-  escapeHtml,
-} from "./helpers";
+// --- Create the raffle and post it to the group ---
 
 async function createRaffleFromWizard(
   ctx: Context,
@@ -348,7 +440,7 @@ async function createRaffleFromWizard(
   const prizesJson = prizes.length > 1 ? JSON.stringify(prizes) : null;
 
   const raffle = db.createRaffle({
-    chat_id: state.chatId,
+    chat_id: state.targetChatId,
     creator_id: state.userId,
     creator_name: displayName,
     title: state.title || "Raffle",
@@ -362,8 +454,7 @@ async function createRaffleFromWizard(
     required_chat_title: state.requiredChatTitle || null,
   });
 
-  // Clean up wizard state
-  cancelWizard(state.chatId, state.userId);
+  cancelWizard(state.userId);
 
   const keyboard = new InlineKeyboard()
     .text("🎟 Enter Raffle", `enter_${raffle.id}`)
@@ -371,10 +462,21 @@ async function createRaffleFromWizard(
     .row()
     .text(`👥 Entries (0)`, `entries_${raffle.id}`);
 
-  const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
-    parse_mode: "HTML",
-    reply_markup: keyboard,
-  });
+  // Post the raffle to the GROUP (not the DM)
+  const msg = await ctx.api.sendMessage(
+    state.targetChatId,
+    formatRaffleMessage(raffle, 0),
+    {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    }
+  );
 
   db.updateRaffleMessageId(raffle.id, msg.message_id);
+
+  // Confirm to the admin in DMs
+  await ctx.reply(
+    `✅ Raffle <b>${escapeHtml(raffle.title)}</b> has been posted to <b>${escapeHtml(state.targetChatTitle)}</b>!`,
+    { parse_mode: "HTML" }
+  );
 }

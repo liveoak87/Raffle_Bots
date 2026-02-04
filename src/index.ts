@@ -19,6 +19,14 @@ import {
 } from "./commands";
 import { formatWinnersMessage, escapeHtml } from "./helpers";
 import { parsePrizes } from "./types";
+import {
+  handleWizardMessage,
+  handleWinnersCallback,
+  handleTimeCallback,
+  handleRequireCallback,
+  getActiveWizard,
+  handleRequireText,
+} from "./wizard";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -65,6 +73,32 @@ bot.command("rerun", handleRerun);
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
 bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
 bot.callbackQuery(/^entries_\d+$/, handleEntriesCallback);
+
+// --- Wizard callback queries ---
+bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
+bot.callbackQuery(/^wiz_time_/, handleTimeCallback);
+bot.callbackQuery(/^wiz_require_/, handleRequireCallback);
+
+// --- Handle text messages (for wizard responses) ---
+bot.on("message:text", async (ctx) => {
+  if (!ctx.chat || ctx.chat.type === "private") return;
+  if (!ctx.from) return;
+  // Skip commands — they're handled above
+  if (ctx.message.text.startsWith("/")) return;
+
+  // Check if user has an active wizard
+  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  if (!state) return;
+
+  // Handle the "require" step text input separately
+  if (state.step === "require") {
+    await handleRequireText(ctx, state, ctx.message.text.trim());
+    return;
+  }
+
+  // Handle title/prize text steps
+  await handleWizardMessage(ctx);
+});
 
 // --- Auto-draw expired raffles ---
 const EXPIRY_CHECK_INTERVAL = 30_000; // 30 seconds

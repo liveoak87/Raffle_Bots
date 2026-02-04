@@ -1,0 +1,380 @@
+import { InlineKeyboard } from "grammy";
+import type { Context } from "grammy";
+import { isGroupAdmin } from "./helpers";
+
+interface WizardState {
+  step: "title" | "prize" | "winners" | "time" | "require";
+  chatId: number;
+  userId: number;
+  title?: string;
+  prizes?: string[];
+  maxWinners?: number;
+  endsAt?: string | null;
+  requiredChatId?: number | null;
+  requiredChatTitle?: string | null;
+  createdAt: number;
+}
+
+// Active wizards keyed by `chatId:userId`
+const wizards = new Map<string, WizardState>();
+
+// Clean up stale wizards older than 10 minutes
+const WIZARD_TIMEOUT = 10 * 60 * 1000;
+
+function wizardKey(chatId: number, userId: number): string {
+  return `${chatId}:${userId}`;
+}
+
+function cleanStaleWizards(): void {
+  const now = Date.now();
+  for (const [key, state] of wizards) {
+    if (now - state.createdAt > WIZARD_TIMEOUT) {
+      wizards.delete(key);
+    }
+  }
+}
+
+export function getActiveWizard(
+  chatId: number,
+  userId: number
+): WizardState | undefined {
+  cleanStaleWizards();
+  return wizards.get(wizardKey(chatId, userId));
+}
+
+export function cancelWizard(chatId: number, userId: number): void {
+  wizards.delete(wizardKey(chatId, userId));
+}
+
+/** Start the wizard when /newraffle is called with no arguments */
+export async function startWizard(ctx: Context): Promise<void> {
+  const chatId = ctx.chat!.id;
+  const userId = ctx.from!.id;
+
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await ctx.reply("Only group admins can create raffles.");
+    return;
+  }
+
+  const key = wizardKey(chatId, userId);
+  wizards.set(key, {
+    step: "title",
+    chatId,
+    userId,
+    createdAt: Date.now(),
+  });
+
+  await ctx.reply(
+    `📝 <b>Create a Raffle</b>\n\n` +
+      `Step 1 of 5: What's the <b>title</b> of your raffle?\n\n` +
+      `<i>Just type it and send. Or /cancel to stop.</i>`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/** Handle a text message that might be a wizard response */
+export async function handleWizardMessage(ctx: Context): Promise<boolean> {
+  if (!ctx.chat || !ctx.from || !ctx.message?.text) return false;
+
+  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  if (!state) return false;
+
+  const text = ctx.message.text.trim();
+
+  // Allow cancellation at any step
+  if (text.toLowerCase() === "/cancel") {
+    cancelWizard(ctx.chat.id, ctx.from.id);
+    await ctx.reply("Raffle creation cancelled.");
+    return true;
+  }
+
+  // Ignore other commands during wizard
+  if (text.startsWith("/")) return false;
+
+  switch (state.step) {
+    case "title":
+      return await handleTitleStep(ctx, state, text);
+    case "prize":
+      return await handlePrizeStep(ctx, state, text);
+    default:
+      return false;
+  }
+}
+
+async function handleTitleStep(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  state.title = text;
+  state.step = "prize";
+
+  await ctx.reply(
+    `✅ Title: <b>${escapeHtml(text)}</b>\n\n` +
+      `Step 2 of 5: What's the <b>prize</b>?\n\n` +
+      `Send one prize, or <b>multiple prizes separated by commas</b> for different winner positions.\n\n` +
+      `Examples:\n` +
+      `• <code>$50 Gift Card</code>\n` +
+      `• <code>$100, $50, $25</code>`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
+async function handlePrizeStep(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const prizes = text
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  if (prizes.length === 0) {
+    await ctx.reply("Please enter at least one prize.");
+    return true;
+  }
+
+  state.prizes = prizes;
+  state.step = "winners";
+
+  let prizeDisplay: string;
+  if (prizes.length > 1) {
+    prizeDisplay = prizes
+      .map((p, i) => {
+        const label = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
+        return `${label} ${escapeHtml(p)}`;
+      })
+      .join("\n");
+  } else {
+    prizeDisplay = `🎁 ${escapeHtml(prizes[0])}`;
+  }
+
+  const keyboard = new InlineKeyboard();
+
+  if (prizes.length > 1) {
+    // If multiple prizes, default to matching prize count
+    keyboard
+      .text(`${prizes.length} (match prizes)`, `wiz_winners_${prizes.length}`)
+      .row();
+    // Also offer other options
+    const options = [1, 2, 3, 5, 10].filter((n) => n !== prizes.length);
+    for (const n of options.slice(0, 4)) {
+      keyboard.text(`${n}`, `wiz_winners_${n}`);
+    }
+  } else {
+    keyboard
+      .text("1", "wiz_winners_1")
+      .text("2", "wiz_winners_2")
+      .text("3", "wiz_winners_3")
+      .text("5", "wiz_winners_5")
+      .text("10", "wiz_winners_10");
+  }
+
+  await ctx.reply(
+    `✅ Prizes:\n${prizeDisplay}\n\n` +
+      `Step 3 of 5: How many <b>winners</b>?`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+  return true;
+}
+
+export async function handleWinnersCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.chat || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  if (!state || state.step !== "winners") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  const num = parseInt(data.replace("wiz_winners_", ""), 10);
+  if (isNaN(num) || num < 1) return;
+
+  state.maxWinners = num;
+  state.step = "time";
+
+  await ctx.answerCallbackQuery();
+
+  const keyboard = new InlineKeyboard()
+    .text("15 min", "wiz_time_15m")
+    .text("30 min", "wiz_time_30m")
+    .text("1 hour", "wiz_time_1h")
+    .row()
+    .text("2 hours", "wiz_time_2h")
+    .text("6 hours", "wiz_time_6h")
+    .text("1 day", "wiz_time_1d")
+    .row()
+    .text("No time limit", "wiz_time_none");
+
+  await ctx.editMessageText(
+    `✅ Winners: <b>${num}</b>\n\n` +
+      `Step 4 of 5: Set a <b>time limit</b>?\n\n` +
+      `The raffle will auto-draw when time runs out.`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
+export async function handleTimeCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.chat || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  if (!state || state.step !== "time") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  const timeValue = data.replace("wiz_time_", "");
+
+  if (timeValue === "none") {
+    state.endsAt = null;
+  } else {
+    const now = new Date();
+    let ms = 0;
+    switch (timeValue) {
+      case "15m": ms = 15 * 60 * 1000; break;
+      case "30m": ms = 30 * 60 * 1000; break;
+      case "1h": ms = 60 * 60 * 1000; break;
+      case "2h": ms = 2 * 60 * 60 * 1000; break;
+      case "6h": ms = 6 * 60 * 60 * 1000; break;
+      case "1d": ms = 24 * 60 * 60 * 1000; break;
+    }
+    const endDate = new Date(now.getTime() + ms);
+    state.endsAt = endDate
+      .toISOString()
+      .replace("T", " ")
+      .replace("Z", "")
+      .split(".")[0];
+  }
+
+  state.step = "require";
+
+  await ctx.answerCallbackQuery();
+
+  const timeDisplay = timeValue === "none" ? "No limit (manual draw)" : timeValue;
+
+  const keyboard = new InlineKeyboard()
+    .text("No requirement", "wiz_require_none")
+    .row()
+    .text("Yes — I'll type the group ID", "wiz_require_yes");
+
+  await ctx.editMessageText(
+    `✅ Time limit: <b>${timeDisplay}</b>\n\n` +
+      `Step 5 of 5: Require members to be in <b>another group</b> to enter?\n\n` +
+      `<i>This blocks anyone who isn't a member of a specific group.</i>`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
+export async function handleRequireCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.chat || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.chat.id, ctx.from.id);
+  if (!state || state.step !== "require") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  if (data === "wiz_require_none") {
+    state.requiredChatId = null;
+    state.requiredChatTitle = null;
+    await createRaffleFromWizard(ctx, state);
+  } else if (data === "wiz_require_yes") {
+    await ctx.editMessageText(
+      `Send the <b>group ID</b> and <b>name</b> like this:\n\n` +
+        `<code>-1001234567890 VIP Members Club</code>\n\n` +
+        `<i>The bot must be admin in that group too. Send /cancel to skip.</i>`,
+      { parse_mode: "HTML" }
+    );
+    // Keep step as "require" — we'll handle the text reply
+  }
+}
+
+/** Handle text reply for the require step */
+export async function handleRequireText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "/cancel" || text.toLowerCase() === "skip") {
+    state.requiredChatId = null;
+    state.requiredChatTitle = null;
+    await createRaffleFromWizard(ctx, state);
+    return true;
+  }
+
+  const match = text.match(/^(-?\d+)\s+(.+)$/);
+  if (!match) {
+    await ctx.reply(
+      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\nOr type <code>skip</code> to skip this step.`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  state.requiredChatId = parseInt(match[1], 10);
+  state.requiredChatTitle = match[2].trim();
+  await createRaffleFromWizard(ctx, state);
+  return true;
+}
+
+// --- Create the raffle from collected wizard state ---
+
+import * as db from "./database";
+import {
+  getUserDisplayName,
+  formatRaffleMessage,
+  escapeHtml,
+} from "./helpers";
+
+async function createRaffleFromWizard(
+  ctx: Context,
+  state: WizardState
+): Promise<void> {
+  const displayName = getUserDisplayName(
+    ctx.from!.first_name,
+    ctx.from!.last_name
+  );
+
+  const prizes = state.prizes || ["Prize"];
+  const singlePrize = prizes[0];
+  const prizesJson = prizes.length > 1 ? JSON.stringify(prizes) : null;
+
+  const raffle = db.createRaffle({
+    chat_id: state.chatId,
+    creator_id: state.userId,
+    creator_name: displayName,
+    title: state.title || "Raffle",
+    description: "",
+    prize: singlePrize,
+    prizes: prizesJson,
+    max_entries: null,
+    max_winners: state.maxWinners || 1,
+    ends_at: state.endsAt || null,
+    required_chat_id: state.requiredChatId || null,
+    required_chat_title: state.requiredChatTitle || null,
+  });
+
+  // Clean up wizard state
+  cancelWizard(state.chatId, state.userId);
+
+  const keyboard = new InlineKeyboard()
+    .text("🎟 Enter Raffle", `enter_${raffle.id}`)
+    .text("❌ Leave", `leave_${raffle.id}`)
+    .row()
+    .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+
+  const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
+
+  db.updateRaffleMessageId(raffle.id, msg.message_id);
+}

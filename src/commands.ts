@@ -11,6 +11,7 @@ import {
   isUserInChat,
   parseEndTime,
 } from "./helpers";
+import { startWizard } from "./wizard";
 
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
@@ -86,24 +87,8 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   const args = text.replace(/^\/newraffle(@\w+)?/i, "").trim();
 
   if (!args) {
-    await ctx.reply(
-      `📝 <b>Create a Raffle</b>\n\n` +
-        `<b>Basic:</b>\n` +
-        `<code>/newraffle Title | Prize</code>\n\n` +
-        `<b>With options:</b>\n` +
-        `<code>/newraffle Title | Prize | winners:3 | max:100 | ends:2h</code>\n\n` +
-        `<b>Multiple prizes:</b>\n` +
-        `<code>/newraffle Title | prizes: $100, $50, $25 | ends:1d</code>\n\n` +
-        `<b>Require group membership:</b>\n` +
-        `<code>/newraffle Title | Prize | require:-1001234567890 VIP Group</code>\n\n` +
-        `<b>Options:</b>\n` +
-        `• <b>winners:N</b> - Number of winners (default: 1)\n` +
-        `• <b>max:N</b> - Max entries allowed\n` +
-        `• <b>ends:TIME</b> - Auto-close (30m, 2h, 1d, etc.)\n` +
-        `• <b>prizes: A, B, C</b> - Different prize per winner\n` +
-        `• <b>require:CHAT_ID Name</b> - Must be in another group`,
-      { parse_mode: "HTML" }
-    );
+    // Launch the interactive wizard
+    await startWizard(ctx);
     return;
   }
 

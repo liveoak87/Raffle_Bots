@@ -6,10 +6,11 @@ import {
   formatRaffleMessage,
   escapeHtml,
   isGroupAdmin,
+  parseEndTime,
 } from "./helpers";
 
 interface WizardState {
-  step: "title" | "prize" | "winners" | "time" | "require";
+  step: "title" | "prize" | "winners" | "time" | "time_custom" | "require";
   /** The group chat where the raffle will be posted */
   targetChatId: number;
   targetChatTitle: string;
@@ -198,6 +199,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleTitleStep(ctx, state, text);
     case "prize":
       return await handlePrizeStep(ctx, state, text);
+    case "time_custom":
+      return await handleCustomTimeStep(ctx, state, text);
     case "require":
       return await handleRequireText(ctx, state, text);
     default:
@@ -309,6 +312,8 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
     .text("6 hours", "wiz_time_6h")
     .text("1 day", "wiz_time_1d")
     .row()
+    .text("⏱ Custom time", "wiz_time_custom")
+    .row()
     .text("No time limit", "wiz_time_none");
 
   await ctx.editMessageText(
@@ -330,6 +335,23 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
   }
 
   const timeValue = data.replace("wiz_time_", "");
+
+  if (timeValue === "custom") {
+    state.step = "time_custom";
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `⏱ <b>Custom Time Limit</b>\n\n` +
+        `Type a duration like:\n` +
+        `• <code>45m</code> — 45 minutes\n` +
+        `• <code>3h</code> — 3 hours\n` +
+        `• <code>12h</code> — 12 hours\n` +
+        `• <code>2d</code> — 2 days\n` +
+        `• <code>2025-12-31 23:59</code> — specific date/time (UTC)\n\n` +
+        `<i>Or type /cancel to stop.</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
   if (timeValue === "none") {
     state.endsAt = null;
@@ -395,6 +417,43 @@ export async function handleRequireCallback(ctx: Context): Promise<void> {
       { parse_mode: "HTML" }
     );
   }
+}
+
+async function handleCustomTimeStep(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const parsed = parseEndTime(text);
+  if (!parsed) {
+    await ctx.reply(
+      `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
+        `Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>, or <code>2025-12-31 23:59</code>`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  state.endsAt = parsed
+    .toISOString()
+    .replace("T", " ")
+    .replace("Z", "")
+    .split(".")[0];
+
+  state.step = "require";
+
+  const keyboard = new InlineKeyboard()
+    .text("No requirement", "wiz_require_none")
+    .row()
+    .text("Yes — I'll type the group ID", "wiz_require_yes");
+
+  await ctx.reply(
+    `✅ Time limit: <b>${escapeHtml(text)}</b>\n\n` +
+      `Step 5 of 5: Require members to be in <b>another group</b> to enter?\n\n` +
+      `<i>This blocks anyone who isn't a member of a specific group.</i>`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+  return true;
 }
 
 async function handleRequireText(

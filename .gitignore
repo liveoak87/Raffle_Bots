@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+{
+  "name": "telegram-raffle-bot",
+  "version": "1.0.0",
+  "description": "A Telegram bot for running raffles in group chats",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["telegram", "bot", "raffle", "giveaway"],
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.21.1",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^20.11.16",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

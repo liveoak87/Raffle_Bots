@@ -1,5 +1,6 @@
 import type { Context } from "grammy";
-import type { Raffle } from "./types";
+import type { Raffle, RaffleWinner } from "./types";
+import { parsePrizes } from "./types";
 import { getEntryCount } from "./database";
 
 export function escapeHtml(text: string): string {
@@ -20,6 +21,8 @@ export function getUserDisplayName(
 export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string {
   const count = entryCount ?? getEntryCount(raffle.id);
   const maxStr = raffle.max_entries ? `/${raffle.max_entries}` : "";
+  const prizes = parsePrizes(raffle);
+  const hasMultiplePrizes = prizes.length > 1;
 
   let msg = `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n`;
 
@@ -27,13 +30,26 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
     msg += `${escapeHtml(raffle.description)}\n\n`;
   }
 
-  msg += `🎁 <b>Prize:</b> ${escapeHtml(raffle.prize)}\n`;
+  if (hasMultiplePrizes) {
+    msg += `🎁 <b>Prizes:</b>\n`;
+    prizes.forEach((p, i) => {
+      const label = getPositionLabel(i + 1);
+      msg += `  ${label} ${escapeHtml(p)}\n`;
+    });
+  } else {
+    msg += `🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}\n`;
+  }
+
   msg += `👥 <b>Entries:</b> ${count}${maxStr}\n`;
   msg += `🏆 <b>Winners:</b> ${raffle.max_winners}\n`;
 
   if (raffle.ends_at) {
     const endsDate = new Date(raffle.ends_at + "Z");
     msg += `⏰ <b>Ends:</b> ${endsDate.toUTCString()}\n`;
+  }
+
+  if (raffle.required_chat_title) {
+    msg += `📋 <b>Requirement:</b> Must be a member of <b>${escapeHtml(raffle.required_chat_title)}</b>\n`;
   }
 
   msg += `\n<i>Created by ${escapeHtml(raffle.creator_name)}</i>`;
@@ -51,18 +67,32 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
 
 export function formatWinnersMessage(
   raffle: Raffle,
-  winners: Array<{ user_id: number; user_display_name: string }>
+  winners: RaffleWinner[]
 ): string {
+  const prizes = parsePrizes(raffle);
+  const hasMultiplePrizes = prizes.length > 1;
+
   let msg = `🎉 <b>Raffle Drawn: ${escapeHtml(raffle.title)}</b>\n\n`;
-  msg += `🎁 <b>Prize:</b> ${escapeHtml(raffle.prize)}\n\n`;
 
   if (winners.length === 0) {
     msg += `No entries were received. No winners selected.`;
   } else {
     msg += `🏆 <b>Winner${winners.length > 1 ? "s" : ""}:</b>\n`;
     winners.forEach((w, i) => {
-      msg += `  ${i + 1}. <a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>\n`;
+      const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
+      if (hasMultiplePrizes) {
+        const label = getPositionLabel(i + 1);
+        msg += `  ${label} ${mention}\n`;
+        msg += `      🎁 ${escapeHtml(w.prize)}\n`;
+      } else {
+        msg += `  ${i + 1}. ${mention}\n`;
+      }
     });
+
+    if (!hasMultiplePrizes) {
+      msg += `\n🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}`;
+    }
+
     msg += `\nCongratulations! 🥳`;
   }
 
@@ -78,6 +108,29 @@ export async function isGroupAdmin(
     return (
       chatMember.status === "administrator" ||
       chatMember.status === "creator"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if a user is a member of a specific chat.
+ * Returns true if the user is a member, admin, creator, or restricted (but still a member).
+ * Returns false if left, kicked, or not found.
+ */
+export async function isUserInChat(
+  ctx: Context,
+  chatId: number,
+  userId: number
+): Promise<boolean> {
+  try {
+    const member = await ctx.api.getChatMember(chatId, userId);
+    return (
+      member.status === "member" ||
+      member.status === "administrator" ||
+      member.status === "creator" ||
+      member.status === "restricted"
     );
   } catch {
     return false;
@@ -109,4 +162,17 @@ export function parseEndTime(input: string): Date | null {
   }
 
   return null;
+}
+
+function getPositionLabel(position: number): string {
+  switch (position) {
+    case 1:
+      return "🥇";
+    case 2:
+      return "🥈";
+    case 3:
+      return "🥉";
+    default:
+      return `${position}.`;
+  }
 }

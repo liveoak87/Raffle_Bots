@@ -5,6 +5,7 @@ import type {
   RaffleWinner,
   CreateRaffleInput,
 } from "./types";
+import { getPrizeForPosition } from "./types";
 
 let db: Database.Database;
 
@@ -23,11 +24,14 @@ export function initDatabase(dbPath: string): Database.Database {
       title TEXT NOT NULL,
       description TEXT NOT NULL DEFAULT '',
       prize TEXT NOT NULL,
+      prizes TEXT,
       max_entries INTEGER,
       max_winners INTEGER NOT NULL DEFAULT 1,
       ends_at TEXT,
       status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed', 'drawn')),
       message_id INTEGER,
+      required_chat_id INTEGER,
+      required_chat_title TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       drawn_at TEXT
     );
@@ -49,6 +53,8 @@ export function initDatabase(dbPath: string): Database.Database {
       user_id INTEGER NOT NULL,
       user_name TEXT NOT NULL DEFAULT '',
       user_display_name TEXT NOT NULL,
+      prize TEXT NOT NULL DEFAULT '',
+      position INTEGER NOT NULL DEFAULT 0,
       selected_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE
     );
@@ -59,7 +65,40 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_user_id ON raffle_entries(user_id);
   `);
 
+  // Run migrations for existing databases
+  migrateDatabase();
+
   return db;
+}
+
+function migrateDatabase(): void {
+  const tableInfo = (table: string) =>
+    getDb()
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+
+  const raffleColumns = tableInfo("raffles").map((c) => c.name);
+  const winnerColumns = tableInfo("raffle_winners").map((c) => c.name);
+
+  if (!raffleColumns.includes("prizes")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN prizes TEXT");
+  }
+  if (!raffleColumns.includes("required_chat_id")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN required_chat_id INTEGER");
+  }
+  if (!raffleColumns.includes("required_chat_title")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN required_chat_title TEXT");
+  }
+  if (!winnerColumns.includes("prize")) {
+    getDb().exec(
+      "ALTER TABLE raffle_winners ADD COLUMN prize TEXT NOT NULL DEFAULT ''"
+    );
+  }
+  if (!winnerColumns.includes("position")) {
+    getDb().exec(
+      "ALTER TABLE raffle_winners ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
+    );
+  }
 }
 
 export function getDb(): Database.Database {
@@ -73,8 +112,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, max_entries, max_winners, ends_at)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @max_entries, @max_winners, @ends_at)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, required_chat_id, required_chat_title)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @required_chat_id, @required_chat_title)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -205,6 +244,34 @@ export function hasUserEntered(raffleId: number, userId: number): boolean {
   return row.count > 0;
 }
 
+// --- Bulk insert entries (for rerun) ---
+
+export function bulkAddEntries(
+  raffleId: number,
+  entries: Array<{ user_id: number; user_name: string; user_display_name: string }>
+): number {
+  const stmt = getDb().prepare(`
+    INSERT OR IGNORE INTO raffle_entries (raffle_id, user_id, user_name, user_display_name)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  let added = 0;
+  const insertAll = getDb().transaction(() => {
+    for (const entry of entries) {
+      const result = stmt.run(
+        raffleId,
+        entry.user_id,
+        entry.user_name,
+        entry.user_display_name
+      );
+      if (result.changes > 0) added++;
+    }
+  });
+
+  insertAll();
+  return added;
+}
+
 // --- Winners ---
 
 export function selectWinners(raffleId: number): RaffleWinner[] {
@@ -218,17 +285,21 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
   const selected = cryptoShuffle(entries).slice(0, numWinners);
 
   const insertStmt = getDb().prepare(`
-    INSERT INTO raffle_winners (raffle_id, user_id, user_name, user_display_name)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO raffle_winners (raffle_id, user_id, user_name, user_display_name, prize, position)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
 
   const insertAll = getDb().transaction(() => {
-    for (const entry of selected) {
+    for (let i = 0; i < selected.length; i++) {
+      const entry = selected[i];
+      const prize = getPrizeForPosition(raffle, i);
       insertStmt.run(
         raffleId,
         entry.user_id,
         entry.user_name,
-        entry.user_display_name
+        entry.user_display_name,
+        prize,
+        i + 1
       );
     }
     markRaffleDrawn(raffleId);
@@ -241,7 +312,9 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
 
 export function getWinnersForRaffle(raffleId: number): RaffleWinner[] {
   return getDb()
-    .prepare("SELECT * FROM raffle_winners WHERE raffle_id = ?")
+    .prepare(
+      "SELECT * FROM raffle_winners WHERE raffle_id = ? ORDER BY position ASC"
+    )
     .all(raffleId) as RaffleWinner[];
 }
 

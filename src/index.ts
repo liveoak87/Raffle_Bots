@@ -11,11 +11,14 @@ import {
   handleCancelRaffle,
   handleMyEntries,
   handleRaffleHistory,
+  handleExportEntries,
+  handleRerun,
   handleEnterCallback,
   handleLeaveCallback,
   handleEntriesCallback,
 } from "./commands";
-import { formatWinnersMessage } from "./helpers";
+import { formatWinnersMessage, escapeHtml } from "./helpers";
+import { parsePrizes } from "./types";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -42,6 +45,8 @@ bot.command("draw", handleDraw);
 bot.command("cancelraffle", handleCancelRaffle);
 bot.command("myentries", handleMyEntries);
 bot.command("rafflehistory", handleRaffleHistory);
+bot.command("exportentries", handleExportEntries);
+bot.command("rerun", handleRerun);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -64,7 +69,7 @@ async function checkExpiredRaffles(): Promise<void> {
         try {
           await bot.api.sendMessage(
             raffle.chat_id,
-            `🎟 <b>${raffle.title}</b>\n\n⏰ Raffle ended. No entries were received.`,
+            `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. No entries were received.`,
             { parse_mode: "HTML" }
           );
         } catch {
@@ -88,16 +93,32 @@ async function checkExpiredRaffles(): Promise<void> {
         try {
           const updatedRaffle = db.getRaffleById(raffle.id);
           if (updatedRaffle) {
-            let text = `🎟 <b>${updatedRaffle.title}</b>\n\n`;
-            text += `🎁 <b>Prize:</b> ${updatedRaffle.prize}\n`;
+            const prizes = parsePrizes(updatedRaffle);
+            let text = `🎟 <b>${escapeHtml(updatedRaffle.title)}</b>\n\n`;
+
+            if (prizes.length > 1) {
+              text += `🎁 <b>Prizes:</b>\n`;
+              prizes.forEach((p, i) => {
+                const label = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
+                text += `  ${label} ${escapeHtml(p)}\n`;
+              });
+            } else {
+              text += `🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}\n`;
+            }
+
             text += `👥 <b>Entries:</b> ${entryCount}\n`;
             text += `\n🎉 This raffle has ended!`;
 
             const winners = db.getWinnersForRaffle(raffle.id);
             if (winners.length > 0) {
               text += `\n\n🏆 <b>Winners:</b>\n`;
-              winners.forEach((w, i) => {
-                text += `  ${i + 1}. <a href="tg://user?id=${w.user_id}">${w.user_display_name}</a>\n`;
+              winners.forEach((w) => {
+                const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
+                if (w.prize) {
+                  text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
+                } else {
+                  text += `  • ${mention}\n`;
+                }
               });
             }
 
@@ -133,6 +154,8 @@ async function main(): Promise<void> {
     { command: "cancelraffle", description: "Cancel a raffle" },
     { command: "myentries", description: "See your active entries" },
     { command: "rafflehistory", description: "View past raffles" },
+    { command: "exportentries", description: "Export participant list" },
+    { command: "rerun", description: "Re-run a raffle with same participants" },
     { command: "help", description: "Show help message" },
   ]);
 

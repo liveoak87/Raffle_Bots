@@ -855,11 +855,32 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
  * (and sponsor info) with the full results.
  */
 export async function notifyWinnersAndCreator(
-  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown> },
-  raffle: { id: number; title: string; creator_id: number; creator_name: string; sponsor_name: string | null },
+  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown>; getChat: (chatId: number) => Promise<{ title?: string }> },
+  raffle: { id: number; chat_id: number; title: string; creator_id: number; creator_name: string; sponsor_name: string | null },
   winners: Array<{ user_id: number; user_display_name: string; prize: string; position: number }>
 ): Promise<void> {
   const title = escapeHtml(raffle.title);
+
+  // Get group title for the "won in" message
+  let groupTitle = "the group";
+  try {
+    const chat = await api.getChat(raffle.chat_id);
+    if (chat.title) groupTitle = chat.title;
+  } catch {}
+
+  // Build sponsor contact line for winner DMs
+  let contactLine: string;
+  if (raffle.sponsor_name) {
+    const sponsor = raffle.sponsor_name.trim();
+    if (sponsor.startsWith("@")) {
+      const username = sponsor.replace(/^@/, "");
+      contactLine = `\n\n💎 <b>Sponsor:</b> <a href="https://t.me/${escapeHtml(username)}">${escapeHtml(sponsor)}</a>\nContact them to claim your prize!`;
+    } else {
+      contactLine = `\n\n💎 <b>Sponsor:</b> ${escapeHtml(sponsor)}`;
+    }
+  } else {
+    contactLine = `\n\n📍 Won in <b>${escapeHtml(groupTitle)}</b>`;
+  }
 
   // DM each winner
   for (const w of winners) {
@@ -869,7 +890,7 @@ export async function notifyWinnersAndCreator(
       if (w.prize) {
         winnerMsg += `\n🎁 <b>Your prize:</b> ${escapeHtml(w.prize)}`;
       }
-      winnerMsg += `\n\nThe raffle organizer will be in touch.`;
+      winnerMsg += contactLine;
       await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
     } catch {
       // Winner may not have started the bot

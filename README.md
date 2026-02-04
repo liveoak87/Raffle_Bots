@@ -27,7 +27,49 @@ A Telegram bot for running raffles and giveaways in group chats. Features inline
 2. Send `/newbot` and follow the prompts
 3. Copy the bot token
 
-### 2. Install & Configure
+### 2a. Run with Docker (Recommended for Unraid / Servers)
+
+```bash
+git clone https://github.com/liveoak87/redbeardpeptides.git
+cd redbeardpeptides
+
+# Create your .env file
+cp .env.example .env
+# Edit .env and set BOT_TOKEN=your_token_here
+
+# Start the bot
+docker compose up -d --build
+```
+
+To view logs: `docker compose logs -f`
+To stop: `docker compose down`
+To restart after updates: `docker compose up -d --build`
+
+#### Unraid Setup (via terminal)
+
+1. Open the Unraid terminal (top-right corner of the Unraid web UI)
+2. Run the commands above
+3. The database is stored in the `./data/` folder — set `DATA_RETENTION_HOURS=24` in `.env` to auto-purge
+
+#### Unraid Setup (via Docker UI)
+
+1. Open the Unraid terminal and build the image:
+   ```bash
+   cd /mnt/user/appdata
+   git clone https://github.com/liveoak87/redbeardpeptides.git raffle-bot
+   cd raffle-bot
+   docker build -t raffle-bot .
+   ```
+2. In the Unraid web UI, go to **Docker** → **Add Container**
+3. Fill in:
+   - **Name:** `raffle-bot`
+   - **Repository:** `raffle-bot`
+   - **Add variable** `BOT_TOKEN` → your token from BotFather
+   - **Add variable** `DATA_RETENTION_HOURS` → `24`
+   - **Add path** Container: `/data` → Host: `/mnt/user/appdata/raffle-bot/data`
+4. Click **Apply**
+
+### 2b. Run without Docker
 
 ```bash
 # Install dependencies
@@ -36,20 +78,13 @@ npm install
 # Copy the example env file and add your bot token
 cp .env.example .env
 # Edit .env and set BOT_TOKEN=your_token_here
-```
-
-### 3. Run
-
-```bash
-# Development (with auto-reload)
-npm run dev
 
 # Production
 npm run build
 npm start
 ```
 
-### 4. Add to a Group
+### 3. Add to a Group
 
 1. Add the bot to your Telegram group
 2. Make the bot an admin (so it can read messages and manage posts)

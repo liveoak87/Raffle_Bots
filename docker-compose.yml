@@ -1,0 +1,11 @@
+services:
+  raffle-bot:
+    build: .
+    container_name: raffle-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DATABASE_PATH=/data/raffle.db
+      - DATA_RETENTION_HOURS=${DATA_RETENTION_HOURS:-24}
+    volumes:
+      - ./data:/data

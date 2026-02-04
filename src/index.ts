@@ -29,9 +29,22 @@ if (!BOT_TOKEN) {
 
 const DB_PATH = process.env.DATABASE_PATH || "./raffle.db";
 
+// Data retention: hours to keep completed raffle data (0 = keep forever)
+const DATA_RETENTION_HOURS = parseInt(
+  process.env.DATA_RETENTION_HOURS || "0",
+  10
+);
+
 // Initialize database
 initDatabase(DB_PATH);
 console.log(`Database initialized at ${DB_PATH}`);
+if (DATA_RETENTION_HOURS > 0) {
+  console.log(
+    `Data retention: completed raffle data will be purged after ${DATA_RETENTION_HOURS} hours`
+  );
+} else {
+  console.log(`Data retention: disabled (data kept indefinitely)`);
+}
 
 // Create bot
 const bot = new Bot(BOT_TOKEN);
@@ -139,6 +152,21 @@ async function checkExpiredRaffles(): Promise<void> {
   }
 }
 
+// --- Auto-purge completed raffle data ---
+const PURGE_CHECK_INTERVAL = 60 * 60 * 1000; // check every hour
+
+function purgeOldData(): void {
+  if (DATA_RETENTION_HOURS <= 0) return;
+  try {
+    const purged = db.purgeExpiredData(DATA_RETENTION_HOURS);
+    if (purged > 0) {
+      console.log(`Data retention: purged ${purged} completed raffle(s)`);
+    }
+  } catch (err) {
+    console.error("Error purging old data:", err);
+  }
+}
+
 // --- Error handling ---
 bot.catch((err) => {
   console.error("Bot error:", err);
@@ -161,6 +189,10 @@ async function main(): Promise<void> {
 
   // Start expiry checker
   setInterval(checkExpiredRaffles, EXPIRY_CHECK_INTERVAL);
+
+  // Start data retention purge (run once at startup, then hourly)
+  purgeOldData();
+  setInterval(purgeOldData, PURGE_CHECK_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
   await bot.start();

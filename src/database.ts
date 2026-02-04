@@ -328,6 +328,38 @@ export function getExpiredOpenRaffles(): Raffle[] {
     .all() as Raffle[];
 }
 
+// --- Data retention / auto-purge ---
+
+/**
+ * Delete all raffles (and their entries + winners via CASCADE) that have been
+ * completed (drawn or closed) for longer than `retentionHours`.
+ * Returns the number of raffles purged.
+ */
+export function purgeExpiredData(retentionHours: number): number {
+  // Delete drawn raffles older than retention period
+  const drawnResult = getDb()
+    .prepare(
+      `DELETE FROM raffles
+       WHERE status = 'drawn'
+         AND drawn_at IS NOT NULL
+         AND drawn_at <= datetime('now', ? || ' hours')`
+    )
+    .run(`-${retentionHours}`);
+
+  // Delete closed (cancelled) raffles older than retention period
+  // Closed raffles don't have drawn_at, so use created_at as reference
+  const closedResult = getDb()
+    .prepare(
+      `DELETE FROM raffles
+       WHERE status = 'closed'
+         AND created_at <= datetime('now', ? || ' hours')`
+    )
+    .run(`-${retentionHours}`);
+
+  const total = drawnResult.changes + closedResult.changes;
+  return total;
+}
+
 // --- Utility ---
 
 function cryptoShuffle<T>(array: T[]): T[] {

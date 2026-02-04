@@ -160,6 +160,26 @@ If a raffle needs to be re-done (technical issue, rule change, etc.), use `/reru
 
 This copies all entries from raffle #5 into a new raffle that's ready to draw.
 
+## Data Retention / Auto-Purge
+
+By default the bot keeps all raffle data forever. If you don't want participant data sitting on your server, set `DATA_RETENTION_HOURS` in your `.env` file:
+
+```env
+# Delete all completed raffle data after 24 hours
+DATA_RETENTION_HOURS=24
+```
+
+Once a raffle is **drawn** or **cancelled**, the clock starts. After the configured number of hours, the raffle and all its entries, usernames, user IDs, and winner records are permanently deleted from the database.
+
+| Value | Meaning |
+|-------|---------|
+| `0` | Keep everything forever (default) |
+| `24` | Delete 24 hours after completion |
+| `72` | Delete 3 days after completion |
+| `168` | Delete 1 week after completion |
+
+The purge runs once at startup and then every hour. Open raffles are never touched — only drawn or cancelled ones.
+
 ## How It Works
 
 1. An admin creates a raffle with `/newraffle`

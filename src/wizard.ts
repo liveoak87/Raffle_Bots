@@ -29,8 +29,8 @@ interface WizardState {
 // Active wizards keyed by `userId` (one wizard per user at a time)
 const wizards = new Map<number, WizardState>();
 
-// Clean up stale wizards older than 10 minutes
-const WIZARD_TIMEOUT = 10 * 60 * 1000;
+// Clean up stale wizards older than 30 minutes of inactivity
+const WIZARD_TIMEOUT = 30 * 60 * 1000;
 
 function cleanStaleWizards(): void {
   const now = Date.now();
@@ -43,7 +43,12 @@ function cleanStaleWizards(): void {
 
 export function getActiveWizard(userId: number): WizardState | undefined {
   cleanStaleWizards();
-  return wizards.get(userId);
+  const state = wizards.get(userId);
+  if (state) {
+    // Reset inactivity timer on each interaction
+    state.createdAt = Date.now();
+  }
+  return state;
 }
 
 export function cancelWizard(userId: number): void {

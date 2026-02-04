@@ -19,7 +19,7 @@ import {
   handleEntriesCallback,
   notifyWinnersAndCreator,
 } from "./commands";
-import { formatWinnersMessage, escapeHtml, getForwardedChat } from "./helpers";
+import { formatWinnersMessage, escapeHtml } from "./helpers";
 import { parsePrizes } from "./types";
 import {
   handleWizardMessage,
@@ -115,27 +115,6 @@ bot.on("message:text", async (ctx) => {
   if (!state) return;
 
   await handleWizardMessage(ctx);
-});
-
-// --- Handle forwarded messages in DMs (for getting group IDs) ---
-bot.on("message", async (ctx) => {
-  if (!ctx.from) return;
-  if (ctx.chat.type !== "private") return;
-
-  const forwardChat = getForwardedChat(ctx.message);
-  if (!forwardChat) return;
-
-  // If user has an active wizard, the wizard handler already dealt with it
-  const state = getActiveWizard(ctx.from.id);
-  if (state) return;
-
-  await ctx.reply(
-    `📋 <b>Forwarded Message Info</b>\n\n` +
-      `<b>Group:</b> ${escapeHtml(forwardChat.title)}\n` +
-      `<b>Chat ID:</b> <code>${forwardChat.id}</code>\n\n` +
-      `You can use this ID for the "require membership" feature when creating a raffle.`,
-    { parse_mode: "HTML" }
-  );
 });
 
 // --- Auto-draw expired raffles ---

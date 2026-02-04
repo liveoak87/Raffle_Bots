@@ -220,29 +220,6 @@ export function formatCountdown(target: Date): string {
   return parts.join(" ") + " remaining";
 }
 
-/**
- * Extract chat info from a forwarded message.
- * Works with both legacy forward_from_chat and newer forward_origin fields.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function getForwardedChat(message: any): { id: number; title: string } | null {
-  // Check forward_origin (Bot API 7.0+)
-  const origin = message?.forward_origin;
-  if (origin) {
-    if (origin.type === "channel" && origin.chat) {
-      return { id: origin.chat.id, title: origin.chat.title || "Unknown Group" };
-    }
-    if (origin.type === "chat" && origin.sender_chat) {
-      return { id: origin.sender_chat.id, title: origin.sender_chat.title || "Unknown Group" };
-    }
-  }
-  // Check legacy forward_from_chat
-  if (message?.forward_from_chat) {
-    return { id: message.forward_from_chat.id, title: message.forward_from_chat.title || "Unknown Group" };
-  }
-  return null;
-}
-
 function getPositionLabel(position: number): string {
   switch (position) {
     case 1:

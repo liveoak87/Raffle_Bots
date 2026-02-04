@@ -7,7 +7,6 @@ import {
   escapeHtml,
   isGroupAdmin,
   parseEndTime,
-  getForwardedChat,
 } from "./helpers";
 
 interface WizardState {
@@ -183,28 +182,11 @@ export async function handleStartDeepLink(
 
 /** Handle a text message in the bot's DMs during the wizard */
 export async function handleWizardMessage(ctx: Context): Promise<boolean> {
-  if (!ctx.from || !ctx.message) return false;
+  if (!ctx.from || !ctx.message?.text) return false;
 
   const state = getActiveWizard(ctx.from.id);
   if (!state) return false;
 
-  // Check for forwarded messages during require step
-  if (state.step === "require") {
-    const forwardChat = getForwardedChat(ctx.message);
-    if (forwardChat) {
-      state.requiredChatId = forwardChat.id;
-      state.requiredChatTitle = forwardChat.title;
-      await ctx.reply(
-        `✅ Detected group: <b>${escapeHtml(forwardChat.title)}</b>\nChat ID: <code>${forwardChat.id}</code>`,
-        { parse_mode: "HTML" }
-      );
-      await promptSponsorStep(ctx, state);
-      return true;
-    }
-  }
-
-  // Need text for other steps
-  if (!ctx.message.text) return false;
   const text = ctx.message.text.trim();
 
   // Allow cancellation at any step
@@ -436,10 +418,10 @@ export async function handleRequireCallback(ctx: Context): Promise<void> {
     await promptSponsorStep(ctx, state);
   } else if (data === "wiz_require_yes") {
     await ctx.editMessageText(
-      `📋 <b>Forward a message</b> from the target group here and I'll detect it automatically.\n\n` +
-        `Or type the <b>group ID</b> and <b>name</b> manually:\n` +
-        `<code>-1001234567890 VIP Members Club</code>\n\n` +
-        `💡 Use <code>/groupid</code> in the target group to get its ID.\n\n` +
+      `Type the group's <b>@username</b> or <b>chat ID</b>:\n\n` +
+        `• <code>@VIPGroup</code>\n` +
+        `• <code>-1001234567890</code>\n\n` +
+        `💡 Use <code>/groupid</code> in the target group to find its ID.\n\n` +
         `<i>Type <code>skip</code> to skip.</i>`,
       { parse_mode: "HTML" }
     );
@@ -495,20 +477,65 @@ async function handleRequireText(
     return true;
   }
 
-  const match = text.match(/^(-?\d+)\s+(.+)$/);
-  if (!match) {
-    await ctx.reply(
-      `<b>Forward a message</b> from the target group, or type the ID and name:\n` +
-        `<code>-1001234567890 VIP Group</code>\n\n` +
-        `Or type <code>skip</code> to skip.`,
-      { parse_mode: "HTML" }
-    );
+  // Handle @username — resolve via Telegram API
+  if (text.startsWith("@")) {
+    try {
+      const chat = await ctx.api.getChat(text);
+      if ("id" in chat) {
+        const title = ("title" in chat && chat.title) ? chat.title : text;
+        state.requiredChatId = chat.id;
+        state.requiredChatTitle = title;
+        await ctx.reply(
+          `✅ Found: <b>${escapeHtml(title)}</b>`,
+          { parse_mode: "HTML" }
+        );
+        await promptSponsorStep(ctx, state);
+        return true;
+      }
+    } catch {
+      await ctx.reply(
+        `Could not find <b>${escapeHtml(text)}</b>. Make sure the username is correct and the group is public.\n\n` +
+          `Or type <code>skip</code> to skip.`,
+        { parse_mode: "HTML" }
+      );
+      return true;
+    }
+  }
+
+  // Handle bare numeric ID or "ID name" format
+  const matchWithName = text.match(/^(-?\d+)\s+(.+)$/);
+  const matchBareId = text.match(/^(-?\d+)$/);
+
+  if (matchWithName) {
+    state.requiredChatId = parseInt(matchWithName[1], 10);
+    state.requiredChatTitle = matchWithName[2].trim();
+    await promptSponsorStep(ctx, state);
     return true;
   }
 
-  state.requiredChatId = parseInt(match[1], 10);
-  state.requiredChatTitle = match[2].trim();
-  await promptSponsorStep(ctx, state);
+  if (matchBareId) {
+    const chatId = parseInt(matchBareId[1], 10);
+    let title = `Group ${chatId}`;
+    try {
+      const chat = await ctx.api.getChat(chatId);
+      if ("title" in chat && chat.title) title = chat.title;
+    } catch {
+      // Can't resolve — use generic name
+    }
+    state.requiredChatId = chatId;
+    state.requiredChatTitle = title;
+    await ctx.reply(
+      `✅ Set: <b>${escapeHtml(title)}</b>`,
+      { parse_mode: "HTML" }
+    );
+    await promptSponsorStep(ctx, state);
+    return true;
+  }
+
+  await ctx.reply(
+    `Type a <b>@username</b> or <b>chat ID</b>.\n\nOr type <code>skip</code> to skip.`,
+    { parse_mode: "HTML" }
+  );
   return true;
 }
 

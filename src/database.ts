@@ -32,6 +32,7 @@ export function initDatabase(dbPath: string): Database.Database {
       message_id INTEGER,
       required_chat_id INTEGER,
       required_chat_title TEXT,
+      sponsor_name TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       drawn_at TEXT
     );
@@ -89,6 +90,9 @@ function migrateDatabase(): void {
   if (!raffleColumns.includes("required_chat_title")) {
     getDb().exec("ALTER TABLE raffles ADD COLUMN required_chat_title TEXT");
   }
+  if (!raffleColumns.includes("sponsor_name")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN sponsor_name TEXT");
+  }
   if (!winnerColumns.includes("prize")) {
     getDb().exec(
       "ALTER TABLE raffle_winners ADD COLUMN prize TEXT NOT NULL DEFAULT ''"
@@ -112,8 +116,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, required_chat_id, required_chat_title)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @required_chat_id, @required_chat_title)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, required_chat_id, required_chat_title, sponsor_name)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @required_chat_id, @required_chat_title, @sponsor_name)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;

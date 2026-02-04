@@ -17,6 +17,8 @@ export interface Raffle {
   required_chat_id: number | null;
   /** Display title for the required chat */
   required_chat_title: string | null;
+  /** Name of the raffle sponsor (displayed on raffle post) */
+  sponsor_name: string | null;
   created_at: string;
   drawn_at: string | null;
 }
@@ -55,6 +57,7 @@ export interface CreateRaffleInput {
   ends_at: string | null;
   required_chat_id: number | null;
   required_chat_title: string | null;
+  sponsor_name: string | null;
 }
 
 /** Parsed list of prizes from the prizes JSON field */

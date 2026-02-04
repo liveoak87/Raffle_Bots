@@ -78,6 +78,24 @@ export async function handleHelp(ctx: Context): Promise<void> {
     { parse_mode: "HTML" });
 }
 
+// /groupid - Show the current group's chat ID
+export async function handleGroupId(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat to get its ID.");
+    return;
+  }
+
+  const chatTitle = ctx.chat.title || "this group";
+
+  await replyPrivately(ctx,
+    `📋 <b>Group Info</b>\n\n` +
+      `<b>Name:</b> ${escapeHtml(chatTitle)}\n` +
+      `<b>Chat ID:</b> <code>${ctx.chat.id}</code>\n\n` +
+      `Use this ID for the "require membership" feature:\n` +
+      `<code>${ctx.chat.id} ${escapeHtml(chatTitle)}</code>`,
+    { parse_mode: "HTML" });
+}
+
 // /newraffle - Create a raffle
 export async function handleNewRaffle(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {
@@ -117,6 +135,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   let description = "";
   let requiredChatId: number | null = null;
   let requiredChatTitle: string | null = null;
+  let sponsorName: string | null = null;
 
   for (let i = 1; i < parts.length; i++) {
     const part = parts[i];
@@ -127,6 +146,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     const endsMatch = part.match(/^ends?\s*:\s*(.+)$/i);
     const prizesMatch = part.match(/^prizes?\s*:\s*(.+)$/i);
     const requireMatch = part.match(/^require\s*:\s*(-?\d+)\s+(.+)$/i);
+    const sponsorMatch = part.match(/^sponsor\s*:\s*(.+)$/i);
 
     if (winnersMatch) {
       maxWinners = Math.max(1, Math.min(50, parseInt(winnersMatch[1], 10)));
@@ -154,6 +174,8 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     } else if (requireMatch) {
       requiredChatId = parseInt(requireMatch[1], 10);
       requiredChatTitle = requireMatch[2].trim();
+    } else if (sponsorMatch) {
+      sponsorName = sponsorMatch[1].trim();
     } else if (!singlePrize) {
       // First unrecognized segment is the single prize
       singlePrize = part;
@@ -202,6 +224,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     ends_at: endsAt,
     required_chat_id: requiredChatId,
     required_chat_title: requiredChatTitle,
+    sponsor_name: sponsorName,
   });
 
   const keyboard = new InlineKeyboard()
@@ -333,6 +356,9 @@ export async function handleDraw(ctx: Context): Promise<void> {
   });
 
   await updateRafflePost(ctx, raffle.id);
+
+  // DM winners and the creator
+  await notifyWinnersAndCreator(ctx.api, raffle, winners);
 }
 
 // /cancelraffle - Cancel a raffle
@@ -640,6 +666,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
     ends_at: null,
     required_chat_id: sourceRaffle.required_chat_id,
     required_chat_title: sourceRaffle.required_chat_title,
+    sponsor_name: sourceRaffle.sponsor_name,
   });
 
   // Copy all entries from the source raffle
@@ -820,6 +847,57 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
     }
   } catch {
     // Message may have been deleted or too old to edit
+  }
+}
+
+/**
+ * DM each winner telling them what they won, and DM the raffle creator
+ * (and sponsor info) with the full results.
+ */
+export async function notifyWinnersAndCreator(
+  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown> },
+  raffle: { id: number; title: string; creator_id: number; creator_name: string; sponsor_name: string | null },
+  winners: Array<{ user_id: number; user_display_name: string; prize: string; position: number }>
+): Promise<void> {
+  const title = escapeHtml(raffle.title);
+
+  // DM each winner
+  for (const w of winners) {
+    try {
+      let winnerMsg = `🎉 <b>Congratulations!</b>\n\n`;
+      winnerMsg += `You won in the raffle <b>${title}</b>!`;
+      if (w.prize) {
+        winnerMsg += `\n🎁 <b>Your prize:</b> ${escapeHtml(w.prize)}`;
+      }
+      winnerMsg += `\n\nThe raffle organizer will be in touch.`;
+      await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
+    } catch {
+      // Winner may not have started the bot
+    }
+  }
+
+  // DM the creator with full results
+  try {
+    let creatorMsg = `🏆 <b>Raffle Results: ${title}</b>\n\n`;
+    if (winners.length === 0) {
+      creatorMsg += `No winners were selected (no entries).`;
+    } else {
+      creatorMsg += `<b>Winners:</b>\n`;
+      for (const w of winners) {
+        const name = escapeHtml(w.user_display_name);
+        if (w.prize) {
+          creatorMsg += `  ${w.position}. ${name} — ${escapeHtml(w.prize)}\n`;
+        } else {
+          creatorMsg += `  ${w.position}. ${name}\n`;
+        }
+      }
+    }
+    if (raffle.sponsor_name) {
+      creatorMsg += `\n💎 Sponsor: ${escapeHtml(raffle.sponsor_name)}`;
+    }
+    await api.sendMessage(raffle.creator_id, creatorMsg, { parse_mode: "HTML" });
+  } catch {
+    // Creator may not have started the bot
   }
 }
 

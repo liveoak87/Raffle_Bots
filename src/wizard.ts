@@ -10,7 +10,7 @@ import {
 } from "./helpers";
 
 interface WizardState {
-  step: "title" | "prize" | "winners" | "time" | "time_custom" | "require";
+  step: "title" | "prize" | "winners" | "time" | "time_custom" | "require" | "sponsor";
   /** The group chat where the raffle will be posted */
   targetChatId: number;
   targetChatTitle: string;
@@ -23,6 +23,7 @@ interface WizardState {
   endsAt?: string | null;
   requiredChatId?: number | null;
   requiredChatTitle?: string | null;
+  sponsorName?: string | null;
   createdAt: number;
 }
 
@@ -110,11 +111,17 @@ export async function startWizard(ctx: Context): Promise<void> {
       `https://t.me/${botInfo.username}?start=newraffle_${groupChatId}`
     );
 
-    await ctx.reply(
+    const fallback = await ctx.reply(
       `I need to set up the raffle in a private message so the group stays clean.\n\n` +
         `Tap the button below to start a DM with me, then come back and try /newraffle again.`,
       { reply_markup: keyboard }
     );
+    // Auto-delete after 15 seconds
+    setTimeout(async () => {
+      try {
+        await ctx.api.deleteMessage(groupChatId, fallback.message_id);
+      } catch {}
+    }, 15000);
   }
 }
 
@@ -201,6 +208,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleCustomTimeStep(ctx, state, text);
     case "require":
       return await handleRequireText(ctx, state, text);
+    case "sponsor":
+      return await handleSponsorText(ctx, state, text);
     default:
       return false;
   }
@@ -385,7 +394,7 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
 
   await ctx.editMessageText(
     `✅ Time limit: <b>${timeDisplay}</b>\n\n` +
-      `Step 5 of 5: Require members to be in <b>another group</b> to enter?\n\n` +
+      `Step 5 of 6: Require members to be in <b>another group</b> to enter?\n\n` +
       `<i>This blocks anyone who isn't a member of a specific group.</i>`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
@@ -406,7 +415,7 @@ export async function handleRequireCallback(ctx: Context): Promise<void> {
   if (data === "wiz_require_none") {
     state.requiredChatId = null;
     state.requiredChatTitle = null;
-    await createRaffleFromWizard(ctx, state);
+    await promptSponsorStep(ctx, state);
   } else if (data === "wiz_require_yes") {
     await ctx.editMessageText(
       `Send the <b>group ID</b> and <b>name</b> like this:\n\n` +
@@ -447,7 +456,7 @@ async function handleCustomTimeStep(
 
   await ctx.reply(
     `✅ Time limit: <b>${escapeHtml(text)}</b>\n\n` +
-      `Step 5 of 5: Require members to be in <b>another group</b> to enter?\n\n` +
+      `Step 5 of 6: Require members to be in <b>another group</b> to enter?\n\n` +
       `<i>This blocks anyone who isn't a member of a specific group.</i>`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
@@ -462,14 +471,16 @@ async function handleRequireText(
   if (text.toLowerCase() === "skip") {
     state.requiredChatId = null;
     state.requiredChatTitle = null;
-    await createRaffleFromWizard(ctx, state);
+    await promptSponsorStep(ctx, state);
     return true;
   }
 
   const match = text.match(/^(-?\d+)\s+(.+)$/);
   if (!match) {
     await ctx.reply(
-      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\nOr type <code>skip</code> to skip.`,
+      `Please send the group ID and name like:\n<code>-1001234567890 VIP Group</code>\n\n` +
+        `💡 Use <code>/groupid</code> in the target group to get its ID.\n\n` +
+        `Or type <code>skip</code> to skip.`,
       { parse_mode: "HTML" }
     );
     return true;
@@ -477,6 +488,65 @@ async function handleRequireText(
 
   state.requiredChatId = parseInt(match[1], 10);
   state.requiredChatTitle = match[2].trim();
+  await promptSponsorStep(ctx, state);
+  return true;
+}
+
+async function promptSponsorStep(
+  ctx: Context,
+  state: WizardState
+): Promise<void> {
+  state.step = "sponsor";
+
+  const keyboard = new InlineKeyboard()
+    .text("No sponsor", "wiz_sponsor_none")
+    .row()
+    .text("Yes — I'll type the name", "wiz_sponsor_yes");
+
+  await ctx.reply(
+    `Step 6 of 6: Add a <b>sponsor</b> to this raffle?\n\n` +
+      `<i>The sponsor's name will be displayed on the raffle post.</i>`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
+export async function handleSponsorCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state || state.step !== "sponsor") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  if (data === "wiz_sponsor_none") {
+    state.sponsorName = null;
+    await createRaffleFromWizard(ctx, state);
+  } else if (data === "wiz_sponsor_yes") {
+    await ctx.editMessageText(
+      `Type the <b>sponsor name</b>:\n\n` +
+        `Examples:\n` +
+        `• <code>RedBeard Peptides</code>\n` +
+        `• <code>@SponsorUsername</code>\n\n` +
+        `<i>Or type <code>skip</code> to skip.</i>`,
+      { parse_mode: "HTML" }
+    );
+  }
+}
+
+async function handleSponsorText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.sponsorName = null;
+  } else {
+    state.sponsorName = text;
+  }
   await createRaffleFromWizard(ctx, state);
   return true;
 }
@@ -509,6 +579,7 @@ async function createRaffleFromWizard(
     ends_at: state.endsAt || null,
     required_chat_id: state.requiredChatId || null,
     required_chat_title: state.requiredChatTitle || null,
+    sponsor_name: state.sponsorName || null,
   });
 
   cancelWizard(state.userId);

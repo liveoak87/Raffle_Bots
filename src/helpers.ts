@@ -52,6 +52,10 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
     msg += `📋 <b>Requirement:</b> Must be a member of <b>${escapeHtml(raffle.required_chat_title)}</b>\n`;
   }
 
+  if (raffle.sponsor_name) {
+    msg += `💎 <b>Sponsored by:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
+  }
+
   msg += `\n<i>Created by ${escapeHtml(raffle.creator_name)}</i>`;
 
   if (raffle.status === "open") {

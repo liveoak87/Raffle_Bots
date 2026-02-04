@@ -7,6 +7,7 @@ import {
   getUserDisplayName,
   formatRaffleMessage,
   formatWinnersMessage,
+  formatCountdown,
   isGroupAdmin,
   isUserInChat,
   parseEndTime,
@@ -257,7 +258,7 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
       msg += `   📋 Requires: ${escapeHtml(raffle.required_chat_title)}\n`;
     }
     if (raffle.ends_at) {
-      msg += `   ⏰ Ends: ${new Date(raffle.ends_at + "Z").toUTCString()}\n`;
+      msg += `   ⏰ Ends: ${formatCountdown(new Date(raffle.ends_at + "Z"))}\n`;
     }
     msg += `\n`;
   }

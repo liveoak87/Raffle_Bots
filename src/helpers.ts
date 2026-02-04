@@ -45,7 +45,7 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
 
   if (raffle.ends_at) {
     const endsDate = new Date(raffle.ends_at + "Z");
-    msg += `⏰ <b>Ends:</b> ${endsDate.toUTCString()}\n`;
+    msg += `⏰ <b>Ends:</b> ${formatCountdown(endsDate)}\n`;
   }
 
   if (raffle.required_chat_title) {
@@ -162,6 +162,30 @@ export function parseEndTime(input: string): Date | null {
   }
 
   return null;
+}
+
+export function formatCountdown(target: Date): string {
+  const now = new Date();
+  const diffMs = target.getTime() - now.getTime();
+
+  if (diffMs <= 0) {
+    return "Ended";
+  }
+
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const totalHours = Math.floor(totalMinutes / 60);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  const minutes = totalMinutes % 60;
+
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0 && days === 0) parts.push(`${minutes}m`);
+
+  if (parts.length === 0) return "< 1 minute";
+
+  return parts.join(" ") + " remaining";
 }
 
 function getPositionLabel(position: number): string {

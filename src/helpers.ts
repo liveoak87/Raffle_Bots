@@ -48,10 +48,6 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
     msg += `⏰ <b>Ends:</b> ${formatCountdown(endsDate)}\n`;
   }
 
-  if (raffle.required_chat_title) {
-    msg += `📋 <b>Requirement:</b> Must be a member of <b>${escapeHtml(raffle.required_chat_title)}</b>\n`;
-  }
-
   if (raffle.sponsor_name) {
     msg += `💎 <b>Sponsored by:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
   }
@@ -112,29 +108,6 @@ export async function isGroupAdmin(
     return (
       chatMember.status === "administrator" ||
       chatMember.status === "creator"
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Check if a user is a member of a specific chat.
- * Returns true if the user is a member, admin, creator, or restricted (but still a member).
- * Returns false if left, kicked, or not found.
- */
-export async function isUserInChat(
-  ctx: Context,
-  chatId: number,
-  userId: number
-): Promise<boolean> {
-  try {
-    const member = await ctx.api.getChatMember(chatId, userId);
-    return (
-      member.status === "member" ||
-      member.status === "administrator" ||
-      member.status === "creator" ||
-      member.status === "restricted"
     );
   } catch {
     return false;

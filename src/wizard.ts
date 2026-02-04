@@ -10,7 +10,7 @@ import {
 } from "./helpers";
 
 interface WizardState {
-  step: "title" | "prize" | "winners" | "time" | "time_custom" | "require" | "sponsor";
+  step: "title" | "prize" | "winners" | "time" | "time_custom" | "sponsor";
   /** The group chat where the raffle will be posted */
   targetChatId: number;
   targetChatTitle: string;
@@ -21,8 +21,6 @@ interface WizardState {
   prizes?: string[];
   maxWinners?: number;
   endsAt?: string | null;
-  requiredChatId?: number | null;
-  requiredChatTitle?: string | null;
   sponsorName?: string | null;
   createdAt: number;
 }
@@ -76,7 +74,7 @@ export async function startWizard(ctx: Context): Promise<void> {
     const dmMsg = await ctx.api.sendMessage(
       userId,
       `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-        `Step 1 of 5: What's the <b>title</b> of your raffle?\n\n` +
+        `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
         `<i>Just type it and send. Or /cancel to stop.</i>`,
       { parse_mode: "HTML" }
     );
@@ -172,7 +170,7 @@ export async function handleStartDeepLink(
 
   await ctx.reply(
     `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-      `Step 1 of 5: What's the <b>title</b> of your raffle?\n\n` +
+      `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
       `<i>Just type it and send. Or /cancel to stop.</i>`,
     { parse_mode: "HTML" }
   );
@@ -206,8 +204,6 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handlePrizeStep(ctx, state, text);
     case "time_custom":
       return await handleCustomTimeStep(ctx, state, text);
-    case "require":
-      return await handleRequireText(ctx, state, text);
     case "sponsor":
       return await handleSponsorText(ctx, state, text);
     default:
@@ -225,7 +221,7 @@ async function handleTitleStep(
 
   await ctx.reply(
     `✅ Title: <b>${escapeHtml(text)}</b>\n\n` +
-      `Step 2 of 5: What's the <b>prize</b>?\n\n` +
+      `Step 2 of 4: What's the <b>prize</b>?\n\n` +
       `Send one prize, or <b>multiple prizes separated by commas</b> for different winner positions.\n\n` +
       `Examples:\n` +
       `• <code>$50 Gift Card</code>\n` +
@@ -286,7 +282,7 @@ async function handlePrizeStep(
 
   await ctx.reply(
     `✅ Prizes:\n${prizeDisplay}\n\n` +
-      `Step 3 of 5: How many <b>winners</b>?`,
+      `Step 3 of 4: How many <b>winners</b>?`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
   return true;
@@ -325,7 +321,7 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
 
   await ctx.editMessageText(
     `✅ Winners: <b>${num}</b>\n\n` +
-      `Step 4 of 5: Set a <b>time limit</b>?\n\n` +
+      `Step 4 of 4: Set a <b>time limit</b>?\n\n` +
       `The raffle will auto-draw when time runs out.`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
@@ -381,51 +377,8 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
       .split(".")[0];
   }
 
-  state.step = "require";
-
   await ctx.answerCallbackQuery();
-
-  const timeDisplay = timeValue === "none" ? "No limit (manual draw)" : timeValue;
-
-  const keyboard = new InlineKeyboard()
-    .text("No requirement", "wiz_require_none")
-    .row()
-    .text("Yes — I'll type the group ID", "wiz_require_yes");
-
-  await ctx.editMessageText(
-    `✅ Time limit: <b>${timeDisplay}</b>\n\n` +
-      `Step 5 of 6: Require members to be in <b>another group</b> to enter?\n\n` +
-      `<i>This blocks anyone who isn't a member of a specific group.</i>`,
-    { parse_mode: "HTML", reply_markup: keyboard }
-  );
-}
-
-export async function handleRequireCallback(ctx: Context): Promise<void> {
-  const data = ctx.callbackQuery?.data;
-  if (!data || !ctx.from) return;
-
-  const state = getActiveWizard(ctx.from.id);
-  if (!state || state.step !== "require") {
-    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
-    return;
-  }
-
-  await ctx.answerCallbackQuery();
-
-  if (data === "wiz_require_none") {
-    state.requiredChatId = null;
-    state.requiredChatTitle = null;
-    await promptSponsorStep(ctx, state);
-  } else if (data === "wiz_require_yes") {
-    await ctx.editMessageText(
-      `Type the group's <b>@username</b> or <b>chat ID</b>:\n\n` +
-        `• <code>@VIPGroup</code>\n` +
-        `• <code>-1001234567890</code>\n\n` +
-        `💡 Use <code>/groupid</code> in the target group to find its ID.\n\n` +
-        `<i>Type <code>skip</code> to skip.</i>`,
-      { parse_mode: "HTML" }
-    );
-  }
+  await promptSponsorStep(ctx, state);
 }
 
 async function handleCustomTimeStep(
@@ -449,93 +402,11 @@ async function handleCustomTimeStep(
     .replace("Z", "")
     .split(".")[0];
 
-  state.step = "require";
-
-  const keyboard = new InlineKeyboard()
-    .text("No requirement", "wiz_require_none")
-    .row()
-    .text("Yes — I'll type the group ID", "wiz_require_yes");
-
   await ctx.reply(
-    `✅ Time limit: <b>${escapeHtml(text)}</b>\n\n` +
-      `Step 5 of 6: Require members to be in <b>another group</b> to enter?\n\n` +
-      `<i>This blocks anyone who isn't a member of a specific group.</i>`,
-    { parse_mode: "HTML", reply_markup: keyboard }
-  );
-  return true;
-}
-
-async function handleRequireText(
-  ctx: Context,
-  state: WizardState,
-  text: string
-): Promise<boolean> {
-  if (text.toLowerCase() === "skip") {
-    state.requiredChatId = null;
-    state.requiredChatTitle = null;
-    await promptSponsorStep(ctx, state);
-    return true;
-  }
-
-  // Handle @username — resolve via Telegram API
-  if (text.startsWith("@")) {
-    try {
-      const chat = await ctx.api.getChat(text);
-      if ("id" in chat) {
-        const title = ("title" in chat && chat.title) ? chat.title : text;
-        state.requiredChatId = chat.id;
-        state.requiredChatTitle = title;
-        await ctx.reply(
-          `✅ Found: <b>${escapeHtml(title)}</b>`,
-          { parse_mode: "HTML" }
-        );
-        await promptSponsorStep(ctx, state);
-        return true;
-      }
-    } catch {
-      await ctx.reply(
-        `Could not find <b>${escapeHtml(text)}</b>. Make sure the username is correct and the group is public.\n\n` +
-          `Or type <code>skip</code> to skip.`,
-        { parse_mode: "HTML" }
-      );
-      return true;
-    }
-  }
-
-  // Handle bare numeric ID or "ID name" format
-  const matchWithName = text.match(/^(-?\d+)\s+(.+)$/);
-  const matchBareId = text.match(/^(-?\d+)$/);
-
-  if (matchWithName) {
-    state.requiredChatId = parseInt(matchWithName[1], 10);
-    state.requiredChatTitle = matchWithName[2].trim();
-    await promptSponsorStep(ctx, state);
-    return true;
-  }
-
-  if (matchBareId) {
-    const chatId = parseInt(matchBareId[1], 10);
-    let title = `Group ${chatId}`;
-    try {
-      const chat = await ctx.api.getChat(chatId);
-      if ("title" in chat && chat.title) title = chat.title;
-    } catch {
-      // Can't resolve — use generic name
-    }
-    state.requiredChatId = chatId;
-    state.requiredChatTitle = title;
-    await ctx.reply(
-      `✅ Set: <b>${escapeHtml(title)}</b>`,
-      { parse_mode: "HTML" }
-    );
-    await promptSponsorStep(ctx, state);
-    return true;
-  }
-
-  await ctx.reply(
-    `Type a <b>@username</b> or <b>chat ID</b>.\n\nOr type <code>skip</code> to skip.`,
+    `✅ Time limit: <b>${escapeHtml(text)}</b>`,
     { parse_mode: "HTML" }
   );
+  await promptSponsorStep(ctx, state);
   return true;
 }
 
@@ -551,7 +422,7 @@ async function promptSponsorStep(
     .text("Yes — I'll type the name", "wiz_sponsor_yes");
 
   await ctx.reply(
-    `Step 6 of 6: Add a <b>sponsor</b> to this raffle?\n\n` +
+    `Add a <b>sponsor</b> to this raffle?\n\n` +
       `<i>The sponsor's name will be displayed on the raffle post.</i>`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
@@ -624,8 +495,8 @@ async function createRaffleFromWizard(
     max_entries: null,
     max_winners: state.maxWinners || 1,
     ends_at: state.endsAt || null,
-    required_chat_id: state.requiredChatId || null,
-    required_chat_title: state.requiredChatTitle || null,
+    required_chat_id: null,
+    required_chat_title: null,
     sponsor_name: state.sponsorName || null,
   });
 

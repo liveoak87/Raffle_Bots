@@ -5,7 +5,6 @@ import * as db from "./database";
 import {
   handleStart,
   handleHelp,
-  handleGroupId,
   handleNewRaffle,
   handleListRaffles,
   handleDraw,
@@ -25,7 +24,6 @@ import {
   handleWizardMessage,
   handleWinnersCallback,
   handleTimeCallback,
-  handleRequireCallback,
   handleSponsorCallback,
   handleStartDeepLink,
   getActiveWizard,
@@ -80,7 +78,6 @@ bot.use(async (ctx, next) => {
 // --- Register commands ---
 bot.command("start", handleStart);
 bot.command("help", handleHelp);
-bot.command("groupid", handleGroupId);
 bot.command("newraffle", handleNewRaffle);
 bot.command("raffles", handleListRaffles);
 bot.command("draw", handleDraw);
@@ -98,7 +95,6 @@ bot.callbackQuery(/^entries_\d+$/, handleEntriesCallback);
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
 bot.callbackQuery(/^wiz_time_/, handleTimeCallback);
-bot.callbackQuery(/^wiz_require_/, handleRequireCallback);
 bot.callbackQuery(/^wiz_sponsor_/, handleSponsorCallback);
 
 // --- Handle text messages (for wizard responses in DMs) ---
@@ -230,7 +226,6 @@ async function main(): Promise<void> {
   // Set bot commands for the menu
   await bot.api.setMyCommands([
     { command: "newraffle", description: "Create a new raffle" },
-    { command: "groupid", description: "Show this group's chat ID" },
     { command: "raffles", description: "List open raffles" },
     { command: "draw", description: "Draw winners for a raffle" },
     { command: "cancelraffle", description: "Cancel a raffle" },

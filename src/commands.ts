@@ -9,7 +9,6 @@ import {
   formatWinnersMessage,
   formatCountdown,
   isGroupAdmin,
-  isUserInChat,
   parseEndTime,
   replyPrivately,
 } from "./helpers";
@@ -55,8 +54,6 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `<code>/newraffle Title | Prize | winners:N | max:N | ends:30m</code>\n\n` +
       `<b>Multiple prizes (one per winner position):</b>\n` +
       `<code>/newraffle Title | prizes: $100, $50, $25 | ends:1d</code>\n\n` +
-      `<b>Require group membership:</b>\n` +
-      `<code>/newraffle Title | Prize | require:-1001234567890 GroupName</code>\n\n` +
       `<b>Parameters:</b>\n` +
       `• <b>Title</b> - Name of the raffle (required)\n` +
       `• <b>Prize</b> - Single prize (or use prizes: for multiple)\n` +
@@ -64,7 +61,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• <b>winners:N</b> - Number of winners (default: 1, auto-set from prizes count)\n` +
       `• <b>max:N</b> - Maximum entries (optional)\n` +
       `• <b>ends:TIME</b> - Auto-close time (30m, 2h, 1d)\n` +
-      `• <b>require:CHAT_ID GroupName</b> - Require membership in another group\n\n` +
+      `• <b>sponsor:Name</b> - Add a sponsor to the raffle\n\n` +
       `<b>Time formats:</b> 30m, 2h, 1d, or YYYY-MM-DD HH:MM\n\n` +
       `<b>Management:</b>\n` +
       `/draw [id] - Draw winners (admin only)\n` +
@@ -75,24 +72,6 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `/rafflehistory - View recent raffle history\n` +
       `/myentries - See your active entries\n\n` +
       `<b>Note:</b> Only group admins can create raffles and draw winners.`,
-    { parse_mode: "HTML" });
-}
-
-// /groupid - Show the current group's chat ID
-export async function handleGroupId(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat to get its ID.");
-    return;
-  }
-
-  const chatTitle = ctx.chat.title || "this group";
-
-  await replyPrivately(ctx,
-    `📋 <b>Group Info</b>\n\n` +
-      `<b>Name:</b> ${escapeHtml(chatTitle)}\n` +
-      `<b>Chat ID:</b> <code>${ctx.chat.id}</code>\n\n` +
-      `Use this ID for the "require membership" feature:\n` +
-      `<code>${ctx.chat.id} ${escapeHtml(chatTitle)}</code>`,
     { parse_mode: "HTML" });
 }
 
@@ -133,8 +112,6 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   let maxEntries: number | null = null;
   let endsAt: string | null = null;
   let description = "";
-  let requiredChatId: number | null = null;
-  let requiredChatTitle: string | null = null;
   let sponsorName: string | null = null;
 
   for (let i = 1; i < parts.length; i++) {
@@ -145,7 +122,6 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     const maxMatch = partLower.match(/^max\s*:\s*(\d+)$/);
     const endsMatch = part.match(/^ends?\s*:\s*(.+)$/i);
     const prizesMatch = part.match(/^prizes?\s*:\s*(.+)$/i);
-    const requireMatch = part.match(/^require\s*:\s*(-?\d+)\s+(.+)$/i);
     const sponsorMatch = part.match(/^sponsor\s*:\s*(.+)$/i);
 
     if (winnersMatch) {
@@ -171,9 +147,6 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
         await replyPrivately(ctx, "Please provide at least one prize.");
         return;
       }
-    } else if (requireMatch) {
-      requiredChatId = parseInt(requireMatch[1], 10);
-      requiredChatTitle = requireMatch[2].trim();
     } else if (sponsorMatch) {
       sponsorName = sponsorMatch[1].trim();
     } else if (!singlePrize) {
@@ -222,8 +195,8 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     max_entries: maxEntries,
     max_winners: maxWinners,
     ends_at: endsAt,
-    required_chat_id: requiredChatId,
-    required_chat_title: requiredChatTitle,
+    required_chat_id: null,
+    required_chat_title: null,
     sponsor_name: sponsorName,
   });
 
@@ -267,9 +240,6 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
       msg += `   🎁 ${prizes.length} prizes | 👥 ${count}${maxStr} entries\n`;
     } else {
       msg += `   🎁 ${escapeHtml(prizes[0])} | 👥 ${count}${maxStr} entries\n`;
-    }
-    if (raffle.required_chat_title) {
-      msg += `   📋 Requires: ${escapeHtml(raffle.required_chat_title)}\n`;
     }
     if (raffle.ends_at) {
       msg += `   ⏰ Ends: ${formatCountdown(new Date(raffle.ends_at + "Z"))}\n`;
@@ -707,21 +677,6 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
   if (isNaN(raffleId)) return;
 
   const userId = ctx.from!.id;
-
-  // Check required group membership
-  const raffle = db.getRaffleById(raffleId);
-  if (raffle && raffle.required_chat_id) {
-    const isMember = await isUserInChat(ctx, raffle.required_chat_id, userId);
-    if (!isMember) {
-      const groupName = raffle.required_chat_title || "the required group";
-      await ctx.answerCallbackQuery({
-        text: `You must be a member of ${groupName} to enter this raffle.`,
-        show_alert: true,
-      });
-      return;
-    }
-  }
-
   const userName = ctx.from!.username || "";
   const displayName = getUserDisplayName(
     ctx.from!.first_name,

@@ -193,6 +193,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handlePrizeStep(ctx, state, text);
     case "time_custom":
       return await handleCustomTimeStep(ctx, state, text);
+    case "options_image":
+      return await handleOptionsImageText(ctx, state, text);
     case "options_sponsor":
       return await handleOptionsSponsorText(ctx, state, text);
     case "options_scheduled":
@@ -544,6 +546,25 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
       await createRaffleFromWizard(ctx, state);
       break;
   }
+}
+
+async function handleOptionsImageText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.imageFileId = null;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  // User typed text but we need a photo
+  await ctx.reply(
+    `Please send a <b>photo</b>, or type <code>skip</code> to continue without an image.`,
+    { parse_mode: "HTML" }
+  );
+  return true;
 }
 
 async function handleOptionsSponsorText(

@@ -31,8 +31,6 @@ import {
   formatWinnersMessage,
   escapeHtml,
   getUserDisplayName,
-  sleep,
-  performWheelSpin,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -49,7 +47,7 @@ import {
   getActiveEditWizard,
   startEditWizard,
 } from "./wizard";
-import { sendBanner } from "./banners";
+import { sendBanner, sendWheelSpin } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -201,60 +199,19 @@ async function checkExpiredRaffles(): Promise<void> {
         const staleness = Date.now() - expiredAt.getTime();
         const isRecent = staleness < 2 * 60 * 1000;
 
-        let announced = false;
-
         if (isRecent && entryNames.length >= 2) {
-          try {
-            const spinMsgId = await performWheelSpin(
-              bot.api,
-              raffle.chat_id,
-              entryNames,
-              raffle.title,
-              lang
-            );
-            await sleep(1000);
-            try {
-              await bot.api.editMessageText(
-                raffle.chat_id,
-                spinMsgId,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            } catch {
-              await bot.api.sendMessage(
-                raffle.chat_id,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            }
-            announced = true;
-          } catch {
-            // Wheel spin failed, try direct announcement
-            try {
-              await bot.api.sendMessage(
-                raffle.chat_id,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-              announced = true;
-            } catch (err) {
-              console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
-            }
-          }
-        } else {
-          try {
-            await bot.api.sendMessage(
-              raffle.chat_id,
-              formatWinnersMessage(raffle, winners, lang),
-              { parse_mode: "HTML" }
-            );
-            announced = true;
-          } catch (err) {
-            console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
-          }
+          await sendWheelSpin(bot.api, raffle.chat_id);
         }
 
-        if (!announced) {
+        // Announce winners
+        try {
+          await bot.api.sendMessage(
+            raffle.chat_id,
+            formatWinnersMessage(raffle, winners, lang),
+            { parse_mode: "HTML" }
+          );
+        } catch (err) {
+          console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
           continue; // Leave as "open" so it retries next check
         }
 

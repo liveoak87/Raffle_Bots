@@ -11,12 +11,10 @@ import {
   isGroupAdmin,
   parseEndTime,
   replyPrivately,
-  sleep,
-  performWheelSpin,
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendBanner } from "./banners";
+import { sendBanner, sendWheelSpin } from "./banners";
 
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
@@ -358,44 +356,15 @@ export async function handleDraw(ctx: Context): Promise<void> {
 
   await sendBanner(ctx.api, ctx.chat!.id, "drawn", raffle.image_file_id);
 
-  // Wheel spin animation (only if 2+ entries for suspense)
+  // Wheel spin GIF animation (2+ entries for suspense)
   if (entryNames.length >= 2) {
-    try {
-      const spinMsgId = await performWheelSpin(
-        ctx.api,
-        ctx.chat!.id,
-        entryNames,
-        raffle.title,
-        lang
-      );
-
-      await sleep(1000);
-
-      // Edit spin message into final winners announcement
-      try {
-        await ctx.api.editMessageText(
-          ctx.chat!.id,
-          spinMsgId,
-          formatWinnersMessage(raffle, winners, lang),
-          { parse_mode: "HTML" }
-        );
-      } catch {
-        // Fallback: send separate message
-        await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
-          parse_mode: "HTML",
-        });
-      }
-    } catch {
-      // Wheel spin failed, just announce winners directly
-      await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
-        parse_mode: "HTML",
-      });
-    }
-  } else {
-    await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
-      parse_mode: "HTML",
-    });
+    await sendWheelSpin(ctx.api, ctx.chat!.id);
   }
+
+  // Announce winners
+  await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
+    parse_mode: "HTML",
+  });
 
   // Mark as drawn after successful announcement
   db.markRaffleDrawn(raffle.id);
@@ -1266,49 +1235,19 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
 
         await sendBanner(ctx.api, raffle.chat_id, "drawn", raffle.image_file_id);
 
-        // Wheel spin animation
+        // Wheel spin GIF animation
         if (entryNames.length >= 2) {
-          try {
-            const spinMsgId = await performWheelSpin(
-              ctx.api,
-              raffle.chat_id,
-              entryNames,
-              raffle.title,
-              lang
-            );
-            await sleep(1000);
-            try {
-              await ctx.api.editMessageText(
-                raffle.chat_id,
-                spinMsgId,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            } catch {
-              await ctx.api.sendMessage(
-                raffle.chat_id,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            }
-          } catch {
-            try {
-              await ctx.api.sendMessage(
-                raffle.chat_id,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            } catch {}
-          }
-        } else {
-          try {
-            await ctx.api.sendMessage(
-              raffle.chat_id,
-              formatWinnersMessage(raffle, winners, lang),
-              { parse_mode: "HTML" }
-            );
-          } catch {}
+          await sendWheelSpin(ctx.api, raffle.chat_id);
         }
+
+        // Announce winners
+        try {
+          await ctx.api.sendMessage(
+            raffle.chat_id,
+            formatWinnersMessage(raffle, winners, lang),
+            { parse_mode: "HTML" }
+          );
+        } catch {}
 
         db.markRaffleDrawn(raffleId);
         await updateRafflePost(ctx, raffleId);

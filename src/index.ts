@@ -23,6 +23,7 @@ import {
   handleRecurring,
   handleEditRaffle,
   handleLanguage,
+  handleStats,
   notifyWinnersAndCreator,
 } from "./commands";
 import {
@@ -113,6 +114,7 @@ bot.command("usetemplate", handleUseTemplate);
 bot.command("recurring", handleRecurring);
 bot.command("editraffle", handleEditRaffle);
 bot.command("language", handleLanguage);
+bot.command("stats", handleStats);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);

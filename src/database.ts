@@ -593,6 +593,49 @@ export function getSupportedLanguages(): string[] {
   return ["en", "es", "pt", "ru", "fr", "de"];
 }
 
+// --- Bot stats ---
+
+export interface BotStats {
+  totalGroups: number;
+  totalCreators: number;
+  totalParticipants: number;
+  totalRaffles: number;
+  activeRaffles: number;
+  drawnRaffles: number;
+  totalEntries: number;
+  totalWinners: number;
+  rafflesLast7Days: number;
+  entriesLast7Days: number;
+}
+
+export function getBotStats(): BotStats {
+  const d = getDb();
+
+  const totalGroups = (d.prepare("SELECT COUNT(DISTINCT chat_id) as c FROM raffles").get() as { c: number }).c;
+  const totalCreators = (d.prepare("SELECT COUNT(DISTINCT creator_id) as c FROM raffles").get() as { c: number }).c;
+  const totalParticipants = (d.prepare("SELECT COUNT(DISTINCT user_id) as c FROM raffle_entries").get() as { c: number }).c;
+  const totalRaffles = (d.prepare("SELECT COUNT(*) as c FROM raffles").get() as { c: number }).c;
+  const activeRaffles = (d.prepare("SELECT COUNT(*) as c FROM raffles WHERE status = 'open'").get() as { c: number }).c;
+  const drawnRaffles = (d.prepare("SELECT COUNT(*) as c FROM raffles WHERE status = 'drawn'").get() as { c: number }).c;
+  const totalEntries = (d.prepare("SELECT COUNT(*) as c FROM raffle_entries").get() as { c: number }).c;
+  const totalWinners = (d.prepare("SELECT COUNT(*) as c FROM raffle_winners").get() as { c: number }).c;
+  const rafflesLast7Days = (d.prepare("SELECT COUNT(*) as c FROM raffles WHERE created_at >= datetime('now', '-7 days')").get() as { c: number }).c;
+  const entriesLast7Days = (d.prepare("SELECT COUNT(*) as c FROM raffle_entries WHERE entered_at >= datetime('now', '-7 days')").get() as { c: number }).c;
+
+  return {
+    totalGroups,
+    totalCreators,
+    totalParticipants,
+    totalRaffles,
+    activeRaffles,
+    drawnRaffles,
+    totalEntries,
+    totalWinners,
+    rafflesLast7Days,
+    entriesLast7Days,
+  };
+}
+
 // --- Utility ---
 
 function cryptoShuffle<T>(array: T[]): T[] {

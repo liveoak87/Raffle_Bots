@@ -1508,5 +1508,46 @@ export async function notifyWinnersAndCreator(
   }
 }
 
+// /stats - Bot-wide statistics (owner only)
+export async function handleStats(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) {
+    // Silently ignore — don't reveal the command exists
+    return;
+  }
+
+  const stats = db.getBotStats();
+
+  let msg = `📊 <b>Bot Statistics</b>\n\n`;
+
+  msg += `<b>Usage:</b>\n`;
+  msg += `  👥 Groups: <b>${stats.totalGroups}</b>\n`;
+  msg += `  🧑 Unique creators: <b>${stats.totalCreators}</b>\n`;
+  msg += `  🎟 Unique participants: <b>${stats.totalParticipants}</b>\n\n`;
+
+  msg += `<b>Raffles:</b>\n`;
+  msg += `  📋 Total: <b>${stats.totalRaffles}</b>\n`;
+  msg += `  🟢 Active: <b>${stats.activeRaffles}</b>\n`;
+  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n\n`;
+
+  msg += `<b>Entries:</b>\n`;
+  msg += `  📝 Total entries: <b>${stats.totalEntries}</b>\n`;
+  msg += `  🏆 Total winners: <b>${stats.totalWinners}</b>\n\n`;
+
+  msg += `<b>Last 7 days:</b>\n`;
+  msg += `  📋 Raffles created: <b>${stats.rafflesLast7Days}</b>\n`;
+  msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
+
+  // Send as DM to the owner
+  try {
+    await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML" });
+  } catch {
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  }
+}
+
 // Re-export for use in index.ts auto-draw
 export { updateRafflePost };

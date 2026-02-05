@@ -90,6 +90,12 @@ export function initDatabase(dbPath: string): Database.Database {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS banner_cache (
+      banner_type TEXT PRIMARY KEY,
+      file_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
@@ -634,6 +640,24 @@ export function getBotStats(): BotStats {
     rafflesLast7Days,
     entriesLast7Days,
   };
+}
+
+// --- Banner cache ---
+
+export function getCachedBannerFileId(bannerType: string): string | null {
+  const d = getDb();
+  const row = d
+    .prepare("SELECT file_id FROM banner_cache WHERE banner_type = ?")
+    .get(bannerType) as { file_id: string } | undefined;
+  return row?.file_id ?? null;
+}
+
+export function setCachedBannerFileId(bannerType: string, fileId: string): void {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO banner_cache (banner_type, file_id) VALUES (?, ?)
+     ON CONFLICT(banner_type) DO UPDATE SET file_id = ?, updated_at = datetime('now')`
+  ).run(bannerType, fileId, fileId);
 }
 
 // --- Utility ---

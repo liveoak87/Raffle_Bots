@@ -16,6 +16,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
+import { sendBanner } from "./banners";
 
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
@@ -228,6 +229,9 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
+
+  await sendBanner(ctx.api, ctx.chat.id, "open");
+
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
@@ -352,6 +356,8 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const entryNames = entries.map((e) => e.user_display_name);
   const winners = db.selectWinners(raffle.id);
 
+  await sendBanner(ctx.api, ctx.chat!.id, "drawn", raffle.image_file_id);
+
   // Wheel spin animation (only if 2+ entries for suspense)
   if (entryNames.length >= 2) {
     try {
@@ -449,6 +455,8 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   }
 
   db.closeRaffle(raffleId);
+
+  await sendBanner(ctx.api, ctx.chat!.id, "closed", raffle.image_file_id);
 
   await replyPrivately(ctx,
     `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
@@ -721,6 +729,9 @@ export async function handleRerun(ctx: Context): Promise<void> {
   );
 
   const rerunLang = db.getChatLanguage(ctx.chat.id);
+
+  await sendBanner(ctx.api, ctx.chat.id, "open", newRaffle.image_file_id);
+
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
     .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
@@ -1019,6 +1030,9 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
+
+  await sendBanner(ctx.api, ctx.chat.id, "open");
+
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
@@ -1249,6 +1263,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         const entries = db.getEntriesForRaffle(raffleId);
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffleId);
+
+        await sendBanner(ctx.api, raffle.chat_id, "drawn", raffle.image_file_id);
 
         // Wheel spin animation
         if (entryNames.length >= 2) {

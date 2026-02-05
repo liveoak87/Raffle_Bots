@@ -10,6 +10,7 @@ import {
   formatCountdown,
 } from "./helpers";
 import { t } from "./i18n";
+import { sendBanner } from "./banners";
 
 interface WizardState {
   step:
@@ -627,14 +628,8 @@ async function createRaffleFromWizard(
 
   cancelWizard(state.userId);
 
-  // If the raffle has an image, send it first as a banner
-  if (raffle.image_file_id) {
-    try {
-      await ctx.api.sendPhoto(state.targetChatId, raffle.image_file_id);
-    } catch {
-      // Image send failed — continue without it
-    }
-  }
+  // Send branded banner (or custom image if one was uploaded)
+  await sendBanner(ctx.api, state.targetChatId, "open", raffle.image_file_id);
 
   const lang = db.getChatLanguage(state.targetChatId);
   const keyboard = new InlineKeyboard()

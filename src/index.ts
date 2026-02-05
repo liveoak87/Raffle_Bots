@@ -49,6 +49,7 @@ import {
   getActiveEditWizard,
   startEditWizard,
 } from "./wizard";
+import { sendBanner } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -192,6 +193,8 @@ async function checkExpiredRaffles(): Promise<void> {
         const entries = db.getEntriesForRaffle(raffle.id);
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
+
+        await sendBanner(bot.api, raffle.chat_id, "drawn", raffle.image_file_id);
 
         // Only show wheel spin if raffle expired recently (within 2 minutes)
         const expiredAt = new Date(raffle.ends_at + "Z");
@@ -446,6 +449,9 @@ async function checkRecurringTemplates(): Promise<void> {
 
       try {
         const recLang = db.getChatLanguage(template.chat_id);
+
+        await sendBanner(bot.api, template.chat_id, "open");
+
         const keyboard = new InlineKeyboard()
           .text(`🎟 ${t(recLang, "btn.enter")}`, `enter_${raffle.id}`)
           .text(`❌ ${t(recLang, "btn.leave")}`, `leave_${raffle.id}`)

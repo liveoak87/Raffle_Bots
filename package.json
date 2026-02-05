@@ -9,12 +9,18 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["telegram", "bot", "raffle", "giveaway"],
+  "keywords": [
+    "telegram",
+    "bot",
+    "raffle",
+    "giveaway"
+  ],
   "license": "MIT",
   "dependencies": {
-    "grammy": "^1.21.1",
     "better-sqlite3": "^11.3.0",
-    "dotenv": "^16.4.5"
+    "canvas": "^3.2.1",
+    "dotenv": "^16.4.5",
+    "grammy": "^1.21.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.8",

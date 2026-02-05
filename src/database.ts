@@ -340,6 +340,10 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
   const raffle = getRaffleById(raffleId);
   if (!raffle) return [];
 
+  // Check if winners were already selected (e.g. from a previous failed announcement)
+  const existing = getWinnersForRaffle(raffleId);
+  if (existing.length > 0) return existing;
+
   const entries = getEntriesForRaffle(raffleId);
   if (entries.length === 0) return [];
 
@@ -364,7 +368,6 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
         i + 1
       );
     }
-    markRaffleDrawn(raffleId);
   });
 
   insertAll();

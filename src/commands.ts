@@ -391,6 +391,9 @@ export async function handleDraw(ctx: Context): Promise<void> {
     });
   }
 
+  // Mark as drawn after successful announcement
+  db.markRaffleDrawn(raffle.id);
+
   await updateRafflePost(ctx, raffle.id);
 
   // DM winners and the creator
@@ -1293,6 +1296,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
           } catch {}
         }
 
+        db.markRaffleDrawn(raffleId);
         await updateRafflePost(ctx, raffleId);
         await notifyWinnersAndCreator(ctx.api, raffle, winners);
       }

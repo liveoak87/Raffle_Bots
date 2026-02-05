@@ -176,15 +176,16 @@ async function checkExpiredRaffles(): Promise<void> {
       const lang = db.getChatLanguage(raffle.chat_id);
 
       if (entryCount === 0) {
-        db.markRaffleDrawn(raffle.id);
         try {
           await bot.api.sendMessage(
             raffle.chat_id,
             `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. ${t(lang, "winner.no_entries")}`,
             { parse_mode: "HTML" }
           );
-        } catch {
-          // Chat may no longer be accessible
+          db.markRaffleDrawn(raffle.id);
+        } catch (err) {
+          console.error(`Failed to announce empty raffle ${raffle.id}, will retry:`, err);
+          continue; // Leave as "open" so it retries next check
         }
       } else {
         const entries = db.getEntriesForRaffle(raffle.id);
@@ -192,10 +193,11 @@ async function checkExpiredRaffles(): Promise<void> {
         const winners = db.selectWinners(raffle.id);
 
         // Only show wheel spin if raffle expired recently (within 2 minutes)
-        // Stale expired raffles (e.g. from before a restart) skip the animation
         const expiredAt = new Date(raffle.ends_at + "Z");
         const staleness = Date.now() - expiredAt.getTime();
-        const isRecent = staleness < 2 * 60 * 1000; // 2 minutes
+        const isRecent = staleness < 2 * 60 * 1000;
+
+        let announced = false;
 
         if (isRecent && entryNames.length >= 2) {
           try {
@@ -221,14 +223,19 @@ async function checkExpiredRaffles(): Promise<void> {
                 { parse_mode: "HTML" }
               );
             }
+            announced = true;
           } catch {
+            // Wheel spin failed, try direct announcement
             try {
               await bot.api.sendMessage(
                 raffle.chat_id,
                 formatWinnersMessage(raffle, winners),
                 { parse_mode: "HTML" }
               );
-            } catch {}
+              announced = true;
+            } catch (err) {
+              console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
+            }
           }
         } else {
           try {
@@ -237,10 +244,18 @@ async function checkExpiredRaffles(): Promise<void> {
               formatWinnersMessage(raffle, winners),
               { parse_mode: "HTML" }
             );
-          } catch {
-            // Chat may no longer be accessible
+            announced = true;
+          } catch (err) {
+            console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
           }
         }
+
+        if (!announced) {
+          continue; // Leave as "open" so it retries next check
+        }
+
+        // Mark as drawn only after successful announcement
+        db.markRaffleDrawn(raffle.id);
 
         // DM winners and creator
         await notifyWinnersAndCreator(bot.api, raffle, winners);

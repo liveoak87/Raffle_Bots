@@ -64,6 +64,15 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
     msg += `💎 <b>${t(lang, "raffle.sponsored_by")}:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
   }
 
+  // Entry requirements
+  const reqs: string[] = [];
+  if (raffle.require_username) reqs.push("username required");
+  if (raffle.min_account_age_days > 0) reqs.push(`account ${raffle.min_account_age_days}d+ old`);
+  if (raffle.winner_cooldown > 0) reqs.push(`recent winners excluded`);
+  if (reqs.length > 0) {
+    msg += `🛡 <b>Requirements:</b> ${reqs.join(" · ")}\n`;
+  }
+
   msg += `\n<i>${t(lang, "raffle.created_by")} ${escapeHtml(raffle.creator_name)}</i>`;
 
   if (raffle.status === "open") {

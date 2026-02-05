@@ -22,7 +22,9 @@ interface WizardState {
     | "options"
     | "options_sponsor"
     | "options_image"
-    | "options_scheduled";
+    | "options_scheduled"
+    | "options_minage"
+    | "options_cooldown";
   targetChatId: number;
   targetChatTitle: string;
   dmChatId: number;
@@ -36,6 +38,9 @@ interface WizardState {
   imageFileId?: string | null;
   startsAt?: string | null;
   autoPin?: boolean;
+  minAccountAgeDays?: number;
+  requireUsername?: boolean;
+  winnerCooldown?: number;
   createdAt: number;
 }
 
@@ -244,6 +249,10 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleOptionsSponsorText(ctx, state, text);
     case "options_scheduled":
       return await handleOptionsScheduledText(ctx, state, text);
+    case "options_minage":
+      return await handleOptionsMinAgeText(ctx, state, text);
+    case "options_cooldown":
+      return await handleOptionsCooldownText(ctx, state, text);
     default:
       return false;
   }
@@ -483,6 +492,17 @@ function buildOptionsText(state: WizardState): string {
 
   msg += `📌 <b>Auto-pin:</b> ${state.autoPin ? "On ✅" : "Off"}\n`;
 
+  // Entry requirements
+  if (state.requireUsername) {
+    msg += `📛 <b>Require username:</b> Yes ✅\n`;
+  }
+  if (state.minAccountAgeDays && state.minAccountAgeDays > 0) {
+    msg += `📅 <b>Min account age:</b> ${state.minAccountAgeDays} day${state.minAccountAgeDays > 1 ? "s" : ""} ✅\n`;
+  }
+  if (state.winnerCooldown && state.winnerCooldown > 0) {
+    msg += `🛡 <b>Winner cooldown:</b> Last ${state.winnerCooldown} raffle${state.winnerCooldown > 1 ? "s" : ""} ✅\n`;
+  }
+
   return msg;
 }
 
@@ -510,6 +530,20 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
   kb.text(
     state.autoPin ? "📌 Pin: On" : "📌 Pin: Off",
     "wiz_opt_pin"
+  );
+  kb.row();
+  kb.text(
+    state.requireUsername ? "📛 Username: Required" : "📛 Username: Off",
+    "wiz_opt_requser"
+  );
+  kb.text(
+    state.minAccountAgeDays ? `📅 Age: ${state.minAccountAgeDays}d` : "📅 Min Age: Off",
+    "wiz_opt_minage"
+  );
+  kb.row();
+  kb.text(
+    state.winnerCooldown ? `🛡 Cooldown: ${state.winnerCooldown}` : "🛡 Cooldown: Off",
+    "wiz_opt_cooldown"
   );
   kb.row();
   kb.text("✅ Create Raffle", "wiz_opt_create");
@@ -587,6 +621,35 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
       );
       break;
 
+    case "wiz_opt_requser":
+      state.requireUsername = !state.requireUsername;
+      await ctx.editMessageText(buildOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildOptionsKeyboard(state),
+      });
+      break;
+
+    case "wiz_opt_minage":
+      state.step = "options_minage";
+      await ctx.editMessageText(
+        `📅 How many <b>days old</b> must a Telegram account be to enter?\n\n` +
+          `Type a number (e.g. <code>7</code>, <code>30</code>, <code>90</code>)\n\n` +
+          `<i>Type <code>0</code> or <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "wiz_opt_cooldown":
+      state.step = "options_cooldown";
+      await ctx.editMessageText(
+        `🛡 <b>Winner Cooldown</b> — prevent recent winners from entering.\n\n` +
+          `How many past raffles should a winner sit out?\n` +
+          `Type a number (e.g. <code>1</code>, <code>3</code>, <code>5</code>)\n\n` +
+          `<i>Type <code>0</code> or <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
     case "wiz_opt_create":
       await createRaffleFromWizard(ctx, state);
       break;
@@ -657,6 +720,50 @@ async function handleOptionsScheduledText(
   return true;
 }
 
+async function handleOptionsMinAgeText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text === "0") {
+    state.minAccountAgeDays = 0;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const days = parseInt(text, 10);
+  if (isNaN(days) || days < 0 || days > 3650) {
+    await ctx.reply("Enter a number between 0 and 3650 (10 years max).");
+    return true;
+  }
+
+  state.minAccountAgeDays = days;
+  await sendOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleOptionsCooldownText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text === "0") {
+    state.winnerCooldown = 0;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const count = parseInt(text, 10);
+  if (isNaN(count) || count < 0 || count > 100) {
+    await ctx.reply("Enter a number between 0 and 100.");
+    return true;
+  }
+
+  state.winnerCooldown = count;
+  await sendOptionsScreen(ctx, state);
+  return true;
+}
+
 // --- Create the raffle and post it to the group ---
 
 async function createRaffleFromWizard(
@@ -690,6 +797,9 @@ async function createRaffleFromWizard(
     anonymous: state.anonymous ? 1 : 0,
     image_file_id: state.imageFileId || null,
     auto_pin: state.autoPin ? 1 : 0,
+    min_account_age_days: state.minAccountAgeDays || 0,
+    require_username: state.requireUsername ? 1 : 0,
+    winner_cooldown: state.winnerCooldown || 0,
   });
 
   cancelWizard(state.userId);

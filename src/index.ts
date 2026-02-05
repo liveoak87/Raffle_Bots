@@ -26,6 +26,7 @@ import {
   handleEditRaffle,
   handleLanguage,
   handleStats,
+  handleGroupStats,
   notifyWinnersAndCreator,
 } from "./commands";
 import {
@@ -121,6 +122,7 @@ bot.command("recurring", handleRecurring);
 bot.command("editraffle", handleEditRaffle);
 bot.command("language", handleLanguage);
 bot.command("stats", handleStats);
+bot.command("groupstats", handleGroupStats);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -294,6 +296,8 @@ const COUNTDOWN_FAST_THRESHOLD = 30_000; // 30 seconds
 
 let fastTickerActive = false;
 let fastTickerInterval: ReturnType<typeof setInterval> | null = null;
+const ENDING_SOON_THRESHOLD = 5 * 60 * 1000; // 5 minutes
+const endingSoonSent = new Set<number>(); // raffle IDs that already got a reminder
 
 async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   if (!raffle.message_id) return;
@@ -330,6 +334,28 @@ async function refreshCountdowns(): Promise<void> {
     for (const raffle of raffles) {
       const endsAt = new Date(raffle.ends_at + "Z");
       const remaining = endsAt.getTime() - Date.now();
+
+      // Send "ending soon" reminder when <= 5 minutes remain
+      if (
+        remaining > 0 &&
+        remaining <= ENDING_SOON_THRESHOLD &&
+        !endingSoonSent.has(raffle.id)
+      ) {
+        endingSoonSent.add(raffle.id);
+        const entryCount = db.getEntryCount(raffle.id);
+        const lang = db.getChatLanguage(raffle.chat_id);
+        const mins = Math.ceil(remaining / 60_000);
+        try {
+          await bot.api.sendMessage(
+            raffle.chat_id,
+            `⏰ <b>${escapeHtml(raffle.title)}</b> ends in ${mins} minute${mins > 1 ? "s" : ""}! ` +
+              `${entryCount} entr${entryCount === 1 ? "y" : "ies"} so far — ${t(lang, "raffle.enter_cta")}`,
+            { parse_mode: "HTML" }
+          );
+        } catch {
+          // Couldn't send reminder — not critical
+        }
+      }
 
       if (remaining > COUNTDOWN_FAST_THRESHOLD) {
         // Normal refresh — update once per minute
@@ -427,6 +453,9 @@ async function checkRecurringTemplates(): Promise<void> {
         anonymous: template.anonymous,
         image_file_id: null,
         auto_pin: 0,
+        min_account_age_days: 0,
+        require_username: 0,
+        winner_cooldown: 0,
       });
 
       try {
@@ -525,6 +554,7 @@ async function main(): Promise<void> {
     { command: "exportentries", description: "Export participant list" },
     { command: "myentries", description: "See your active entries" },
     { command: "rafflehistory", description: "View past raffles" },
+    { command: "groupstats", description: "View group raffle stats" },
     { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help" },
   ]);

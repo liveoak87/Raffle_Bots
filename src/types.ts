@@ -27,6 +27,12 @@ export interface Raffle {
   image_file_id: string | null;
   /** Whether to auto-pin the raffle message in the group */
   auto_pin: number;
+  /** Minimum Telegram account age in days (0 = no restriction) */
+  min_account_age_days: number;
+  /** Whether a Telegram username is required to enter (0 = no, 1 = yes) */
+  require_username: number;
+  /** Exclude users who won within the last N raffles in this chat (0 = disabled) */
+  winner_cooldown: number;
   created_at: string;
   drawn_at: string | null;
 }
@@ -70,6 +76,9 @@ export interface CreateRaffleInput {
   anonymous: number;
   image_file_id: string | null;
   auto_pin: number;
+  min_account_age_days: number;
+  require_username: number;
+  winner_cooldown: number;
 }
 
 export interface RaffleTemplate {

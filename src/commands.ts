@@ -16,6 +16,44 @@ import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendBanner, sendWheelSpin } from "./banners";
 
+/**
+ * Estimate a Telegram account's age in days based on user ID ranges.
+ * Telegram IDs are roughly sequential; this uses known reference points.
+ * Returns null if unable to estimate (very old accounts).
+ */
+function estimateAccountAgeDays(userId: number): number | null {
+  // Known approximate reference points (userId → Unix timestamp)
+  const refs: Array<[number, number]> = [
+    [1_000_000_000, new Date("2020-06-01").getTime()],
+    [2_000_000_000, new Date("2021-05-01").getTime()],
+    [5_000_000_000, new Date("2022-06-01").getTime()],
+    [6_000_000_000, new Date("2023-01-01").getTime()],
+    [7_000_000_000, new Date("2024-01-01").getTime()],
+    [8_000_000_000, new Date("2025-01-01").getTime()],
+  ];
+
+  // Very old accounts (pre-2020) — can't estimate well, assume old enough
+  if (userId < refs[0][0]) return null;
+
+  // Find surrounding reference points and interpolate
+  for (let i = 0; i < refs.length - 1; i++) {
+    if (userId >= refs[i][0] && userId < refs[i + 1][0]) {
+      const fraction =
+        (userId - refs[i][0]) / (refs[i + 1][0] - refs[i][0]);
+      const estimatedMs =
+        refs[i][1] + fraction * (refs[i + 1][1] - refs[i][1]);
+      return Math.floor((Date.now() - estimatedMs) / 86_400_000);
+    }
+  }
+
+  // Beyond last reference — extrapolate from last two points
+  const last = refs[refs.length - 1];
+  const prev = refs[refs.length - 2];
+  const rate = (last[1] - prev[1]) / (last[0] - prev[0]);
+  const estimatedMs = last[1] + (userId - last[0]) * rate;
+  return Math.max(0, Math.floor((Date.now() - estimatedMs) / 86_400_000));
+}
+
 /** Format a duration in ms to a human-readable string like "2h 30m" */
 function formatDurationHuman(ms: number): string {
   const totalMinutes = Math.round(ms / 60000);
@@ -225,6 +263,9 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     anonymous: 0,
     image_file_id: null,
     auto_pin: 0,
+    min_account_age_days: 0,
+    require_username: 0,
+    winner_cooldown: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -805,6 +846,9 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       anonymous: sourceRaffle.anonymous,
       image_file_id: sourceRaffle.image_file_id,
       auto_pin: sourceRaffle.auto_pin,
+      min_account_age_days: sourceRaffle.min_account_age_days,
+      require_username: sourceRaffle.require_username,
+      winner_cooldown: sourceRaffle.winner_cooldown,
     });
 
     // Copy all entries from the source raffle
@@ -1041,6 +1085,9 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       anonymous: tmpl.anonymous,
       image_file_id: null,
       auto_pin: 0,
+      min_account_age_days: 0,
+      require_username: 0,
+      winner_cooldown: 0,
     });
 
     const lang = db.getChatLanguage(chatId);
@@ -1446,6 +1493,9 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     anonymous: template.anonymous,
     image_file_id: null,
     auto_pin: 0,
+    min_account_age_days: 0,
+    require_username: 0,
+    winner_cooldown: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -1659,6 +1709,43 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
     ctx.from!.first_name,
     ctx.from!.last_name
   );
+
+  // --- Entry verification checks ---
+  const raffle = db.getRaffleById(raffleId);
+  if (raffle) {
+    // Require username check
+    if (raffle.require_username && !ctx.from!.username) {
+      await ctx.answerCallbackQuery({
+        text: "⚠️ You need a Telegram username to enter this raffle. Set one in Settings → Username.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    // Account age check (estimated from user ID)
+    if (raffle.min_account_age_days > 0) {
+      const estimatedAge = estimateAccountAgeDays(userId);
+      if (estimatedAge !== null && estimatedAge < raffle.min_account_age_days) {
+        await ctx.answerCallbackQuery({
+          text: `⚠️ Your account must be at least ${raffle.min_account_age_days} day${raffle.min_account_age_days > 1 ? "s" : ""} old to enter.`,
+          show_alert: true,
+        });
+        return;
+      }
+    }
+
+    // Winner cooldown check
+    if (raffle.winner_cooldown > 0) {
+      const recentWin = db.getRecentWin(raffle.chat_id, userId, raffle.winner_cooldown);
+      if (recentWin) {
+        await ctx.answerCallbackQuery({
+          text: `⚠️ Recent winners can't enter yet. You won "${recentWin}" recently. Try again after more raffles complete!`,
+          show_alert: true,
+        });
+        return;
+      }
+    }
+  }
 
   const result = db.addEntry(raffleId, userId, userName, displayName);
   const chatId = ctx.callbackQuery?.message?.chat?.id;
@@ -1946,6 +2033,55 @@ export async function handleStats(ctx: Context): Promise<void> {
   } catch {
     await ctx.reply(msg, { parse_mode: "HTML" });
   }
+}
+
+// /groupstats — Show raffle stats for this group (admin only)
+export async function handleGroupStats(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    return; // silently ignore for non-admins
+  }
+
+  const stats = db.getGroupStats(ctx.chat.id);
+
+  let msg = `📊 <b>Group Raffle Stats</b>\n\n`;
+
+  msg += `<b>Overview:</b>\n`;
+  msg += `  📋 Total raffles: <b>${stats.totalRaffles}</b>\n`;
+  msg += `  🟢 Active: <b>${stats.activeRaffles}</b>\n`;
+  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n`;
+  msg += `  👥 Unique participants: <b>${stats.uniqueParticipants}</b>\n`;
+  msg += `  📊 Avg entries/raffle: <b>${stats.avgEntriesPerRaffle}</b>\n\n`;
+
+  msg += `<b>Totals:</b>\n`;
+  msg += `  📝 Entries: <b>${stats.totalEntries}</b>\n`;
+  msg += `  🏆 Winners: <b>${stats.totalWinners}</b>\n\n`;
+
+  msg += `<b>Last 7 days:</b>\n`;
+  msg += `  📋 Raffles: <b>${stats.rafflesLast7Days}</b>\n`;
+  msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
+
+  if (stats.topParticipants.length > 0) {
+    msg += `\n<b>🔥 Most Active:</b>\n`;
+    stats.topParticipants.forEach((p, i) => {
+      msg += `  ${i + 1}. ${escapeHtml(p.name)} — ${p.count} entries\n`;
+    });
+  }
+
+  if (stats.topWinners.length > 0) {
+    msg += `\n<b>🏆 Top Winners:</b>\n`;
+    stats.topWinners.forEach((w, i) => {
+      msg += `  ${i + 1}. ${escapeHtml(w.name)} — ${w.count} win${w.count > 1 ? "s" : ""}\n`;
+    });
+  }
+
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // Re-export for use in index.ts auto-draw

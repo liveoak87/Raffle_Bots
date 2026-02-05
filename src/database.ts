@@ -156,6 +156,21 @@ function migrateDatabase(): void {
       "ALTER TABLE raffles ADD COLUMN auto_pin INTEGER NOT NULL DEFAULT 0"
     );
   }
+  if (!raffleColumns.includes("min_account_age_days")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN min_account_age_days INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("require_username")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN require_username INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("winner_cooldown")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN winner_cooldown INTEGER NOT NULL DEFAULT 0"
+    );
+  }
 }
 
 export function getDb(): Database.Database {
@@ -169,8 +184,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -509,6 +524,128 @@ export function updateNextRunAt(
     .run(nextRunAt, templateId);
 }
 
+// --- Winner cooldown check ---
+
+/**
+ * Check if a user has won any raffle in this chat within the last N raffles.
+ * Returns the raffle title they won if found, or null.
+ */
+export function getRecentWin(
+  chatId: number,
+  userId: number,
+  lookbackCount: number
+): string | null {
+  if (lookbackCount <= 0) return null;
+
+  const row = getDb()
+    .prepare(
+      `SELECT r.title FROM raffle_winners w
+       JOIN raffles r ON w.raffle_id = r.id
+       WHERE r.chat_id = ? AND w.user_id = ?
+         AND r.status = 'drawn'
+         AND r.id IN (
+           SELECT id FROM raffles
+           WHERE chat_id = ? AND status = 'drawn'
+           ORDER BY drawn_at DESC LIMIT ?
+         )
+       LIMIT 1`
+    )
+    .get(chatId, userId, chatId, lookbackCount) as
+    | { title: string }
+    | undefined;
+
+  return row?.title ?? null;
+}
+
+// --- Group stats ---
+
+export interface GroupStats {
+  totalRaffles: number;
+  activeRaffles: number;
+  drawnRaffles: number;
+  totalEntries: number;
+  totalWinners: number;
+  uniqueParticipants: number;
+  rafflesLast7Days: number;
+  entriesLast7Days: number;
+  avgEntriesPerRaffle: number;
+  topParticipants: Array<{ name: string; count: number }>;
+  topWinners: Array<{ name: string; count: number }>;
+}
+
+export function getGroupStats(chatId: number): GroupStats {
+  const d = getDb();
+
+  const totalRaffles = (
+    d.prepare("SELECT COUNT(*) as c FROM raffles WHERE chat_id = ?").get(chatId) as { c: number }
+  ).c;
+  const activeRaffles = (
+    d.prepare("SELECT COUNT(*) as c FROM raffles WHERE chat_id = ? AND status = 'open'").get(chatId) as { c: number }
+  ).c;
+  const drawnRaffles = (
+    d.prepare("SELECT COUNT(*) as c FROM raffles WHERE chat_id = ? AND status = 'drawn'").get(chatId) as { c: number }
+  ).c;
+  const totalEntries = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffle_entries e JOIN raffles r ON e.raffle_id = r.id WHERE r.chat_id = ?"
+    ).get(chatId) as { c: number }
+  ).c;
+  const totalWinners = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffle_winners w JOIN raffles r ON w.raffle_id = r.id WHERE r.chat_id = ?"
+    ).get(chatId) as { c: number }
+  ).c;
+  const uniqueParticipants = (
+    d.prepare(
+      "SELECT COUNT(DISTINCT e.user_id) as c FROM raffle_entries e JOIN raffles r ON e.raffle_id = r.id WHERE r.chat_id = ?"
+    ).get(chatId) as { c: number }
+  ).c;
+  const rafflesLast7Days = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffles WHERE chat_id = ? AND created_at >= datetime('now', '-7 days')"
+    ).get(chatId) as { c: number }
+  ).c;
+  const entriesLast7Days = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffle_entries e JOIN raffles r ON e.raffle_id = r.id WHERE r.chat_id = ? AND e.entered_at >= datetime('now', '-7 days')"
+    ).get(chatId) as { c: number }
+  ).c;
+
+  const avgEntriesPerRaffle = totalRaffles > 0 ? Math.round(totalEntries / totalRaffles) : 0;
+
+  const topParticipants = d
+    .prepare(
+      `SELECT e.user_display_name as name, COUNT(*) as count
+       FROM raffle_entries e JOIN raffles r ON e.raffle_id = r.id
+       WHERE r.chat_id = ?
+       GROUP BY e.user_id ORDER BY count DESC LIMIT 5`
+    )
+    .all(chatId) as Array<{ name: string; count: number }>;
+
+  const topWinners = d
+    .prepare(
+      `SELECT w.user_display_name as name, COUNT(*) as count
+       FROM raffle_winners w JOIN raffles r ON w.raffle_id = r.id
+       WHERE r.chat_id = ?
+       GROUP BY w.user_id ORDER BY count DESC LIMIT 5`
+    )
+    .all(chatId) as Array<{ name: string; count: number }>;
+
+  return {
+    totalRaffles,
+    activeRaffles,
+    drawnRaffles,
+    totalEntries,
+    totalWinners,
+    uniqueParticipants,
+    rafflesLast7Days,
+    entriesLast7Days,
+    avgEntriesPerRaffle,
+    topParticipants,
+    topWinners,
+  };
+}
+
 // --- Data retention / auto-purge ---
 
 /**
@@ -572,6 +709,10 @@ export function updateRaffleFields(
     "description",
     "anonymous",
     "auto_pin",
+    "min_account_age_days",
+    "require_username",
+    "winner_cooldown",
+    "image_file_id",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];

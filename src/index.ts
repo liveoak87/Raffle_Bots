@@ -175,8 +175,13 @@ async function checkExpiredRaffles(): Promise<void> {
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
 
-        // Wheel spin animation
-        if (entryNames.length >= 2) {
+        // Only show wheel spin if raffle expired recently (within 2 minutes)
+        // Stale expired raffles (e.g. from before a restart) skip the animation
+        const expiredAt = new Date(raffle.ends_at + "Z");
+        const staleness = Date.now() - expiredAt.getTime();
+        const isRecent = staleness < 2 * 60 * 1000; // 2 minutes
+
+        if (isRecent && entryNames.length >= 2) {
           try {
             const spinMsgId = await performWheelSpin(
               bot.api,

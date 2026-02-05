@@ -246,12 +246,12 @@ export async function performWheelSpin(
   raffleTitle: string,
   lang: string = "en"
 ): Promise<number> {
-  const title = escapeHtml(raffleTitle);
+  const safeTitle = escapeHtml(raffleTitle);
 
   // Send initial spinning message
   const spinMsg = await api.sendMessage(
     chatId,
-    `🎰 <b>${t(lang, "spin.drawing", { title: raffleTitle })}</b>\n\n` +
+    `🎰 <b>${t(lang, "spin.drawing", { title: safeTitle })}</b>\n\n` +
       `🔄 ${t(lang, "spin.spinning")}`,
     { parse_mode: "HTML" }
   );
@@ -277,7 +277,7 @@ export async function performWheelSpin(
       await api.editMessageText(
         chatId,
         msgId,
-        `🎰 <b>${t(lang, "spin.drawing", { title: raffleTitle })}</b>\n\n` +
+        `🎰 <b>${t(lang, "spin.drawing", { title: safeTitle })}</b>\n\n` +
           `${progress}\n\n` +
           `🎯 <b>${escapeHtml(displayName)}</b>`,
         { parse_mode: "HTML" }

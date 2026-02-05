@@ -354,26 +354,33 @@ export async function handleDraw(ctx: Context): Promise<void> {
 
   // Wheel spin animation (only if 2+ entries for suspense)
   if (entryNames.length >= 2) {
-    const spinMsgId = await performWheelSpin(
-      ctx.api,
-      ctx.chat!.id,
-      entryNames,
-      raffle.title,
-      lang
-    );
-
-    await sleep(1000);
-
-    // Edit spin message into final winners announcement
     try {
-      await ctx.api.editMessageText(
+      const spinMsgId = await performWheelSpin(
+        ctx.api,
         ctx.chat!.id,
-        spinMsgId,
-        formatWinnersMessage(raffle, winners),
-        { parse_mode: "HTML" }
+        entryNames,
+        raffle.title,
+        lang
       );
+
+      await sleep(1000);
+
+      // Edit spin message into final winners announcement
+      try {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          spinMsgId,
+          formatWinnersMessage(raffle, winners),
+          { parse_mode: "HTML" }
+        );
+      } catch {
+        // Fallback: send separate message
+        await ctx.reply(formatWinnersMessage(raffle, winners), {
+          parse_mode: "HTML",
+        });
+      }
     } catch {
-      // Fallback: send separate message
+      // Wheel spin failed, just announce winners directly
       await ctx.reply(formatWinnersMessage(raffle, winners), {
         parse_mode: "HTML",
       });

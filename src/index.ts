@@ -48,6 +48,11 @@ import {
   handleEditTextMessage,
   getActiveEditWizard,
   startEditWizard,
+  getActiveTemplateWizard,
+  handleTemplateWizardMessage,
+  handleTmplWinnersCallback,
+  handleTmplTimeCallback,
+  handleTmplOptionsCallback,
 } from "./wizard";
 import { sendBanner, sendWheelSpin } from "./banners";
 
@@ -136,6 +141,11 @@ bot.callbackQuery(/^rerun_/, handleRerunCallback);
 // --- Template hub callback queries ---
 bot.callbackQuery(/^tmpl_/, handleTemplateCallback);
 
+// --- Template wizard callback queries ---
+bot.callbackQuery(/^twiz_winners_\d+$/, handleTmplWinnersCallback);
+bot.callbackQuery(/^twiz_time_/, handleTmplTimeCallback);
+bot.callbackQuery(/^twiz_opt_/, handleTmplOptionsCallback);
+
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {
   if (!ctx.from) return;
@@ -149,6 +159,13 @@ bot.on("message:text", async (ctx) => {
   const editState = getActiveEditWizard(ctx.from.id);
   if (editState && editState.editingField) {
     await handleEditTextMessage(ctx);
+    return;
+  }
+
+  // Check if user has an active template wizard
+  const tmplState = getActiveTemplateWizard(ctx.from.id);
+  if (tmplState) {
+    await handleTemplateWizardMessage(ctx);
     return;
   }
 

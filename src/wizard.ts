@@ -1204,3 +1204,546 @@ async function updateRafflePostById(
     );
   } catch {}
 }
+
+// ===================================================================
+// TEMPLATE WIZARD — DM-based step-by-step template creation
+// ===================================================================
+
+interface TemplateWizardState {
+  step:
+    | "name"
+    | "title"
+    | "prize"
+    | "winners"
+    | "time"
+    | "time_custom"
+    | "options"
+    | "options_sponsor"
+    | "options_recurring";
+  targetChatId: number;
+  targetChatTitle: string;
+  dmChatId: number;
+  userId: number;
+  name?: string;
+  title?: string;
+  prizes?: string[];
+  maxWinners?: number;
+  durationMinutes?: number | null;
+  sponsorName?: string | null;
+  anonymous?: boolean;
+  recurringMinutes?: number | null;
+  createdAt: number;
+}
+
+const templateWizards = new Map<number, TemplateWizardState>();
+
+function cleanStaleTemplateWizards(): void {
+  const now = Date.now();
+  for (const [key, state] of templateWizards) {
+    if (now - state.createdAt > WIZARD_TIMEOUT) {
+      templateWizards.delete(key);
+    }
+  }
+}
+
+export function getActiveTemplateWizard(
+  userId: number
+): TemplateWizardState | undefined {
+  cleanStaleTemplateWizards();
+  const state = templateWizards.get(userId);
+  if (state) {
+    state.createdAt = Date.now();
+  }
+  return state;
+}
+
+export function cancelTemplateWizard(userId: number): void {
+  templateWizards.delete(userId);
+}
+
+/** Start the template creation wizard via DM */
+export async function startTemplateWizard(
+  api: {
+    sendMessage: (
+      chatId: number,
+      text: string,
+      opts?: Record<string, unknown>
+    ) => Promise<{ chat: { id: number }; message_id: number }>;
+    getMe: () => Promise<{ username?: string }>;
+  },
+  userId: number,
+  groupChatId: number,
+  groupTitle: string
+): Promise<boolean> {
+  try {
+    const dmMsg = await api.sendMessage(
+      userId,
+      `📋 <b>Create a Template</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
+        `Step 1 of 5: What's the <b>template name</b>?\n\n` +
+        `<i>This is a short name to recall it later (e.g. "Weekly" or "Daily Prize").\nType /cancel to stop.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    templateWizards.set(userId, {
+      step: "name",
+      targetChatId: groupChatId,
+      targetChatTitle: groupTitle,
+      dmChatId: dmMsg.chat.id,
+      userId,
+      createdAt: Date.now(),
+    });
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Handle a text message in the template wizard */
+export async function handleTemplateWizardMessage(
+  ctx: Context
+): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.text) return false;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state) return false;
+
+  const text = ctx.message.text.trim();
+
+  if (text.toLowerCase() === "/cancel") {
+    cancelTemplateWizard(ctx.from.id);
+    await ctx.reply("Template creation cancelled.");
+    return true;
+  }
+
+  if (text.startsWith("/")) return false;
+
+  switch (state.step) {
+    case "name":
+      return await handleTmplNameStep(ctx, state, text);
+    case "title":
+      return await handleTmplTitleStep(ctx, state, text);
+    case "prize":
+      return await handleTmplPrizeStep(ctx, state, text);
+    case "time_custom":
+      return await handleTmplCustomTimeStep(ctx, state, text);
+    case "options_sponsor":
+      return await handleTmplSponsorText(ctx, state, text);
+    case "options_recurring":
+      return await handleTmplRecurringText(ctx, state, text);
+    default:
+      return false;
+  }
+}
+
+async function handleTmplNameStep(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  // Check if name already exists
+  const existing = db.getTemplateByName(state.targetChatId, text);
+  if (existing) {
+    await ctx.reply(
+      `A template named "<b>${escapeHtml(text)}</b>" already exists. Choose a different name:`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  state.name = text;
+  state.step = "title";
+
+  await ctx.reply(
+    `✅ Name: <b>${escapeHtml(text)}</b>\n\n` +
+      `Step 2 of 5: What's the <b>raffle title</b>?\n\n` +
+      `<i>This is what appears on the raffle post.</i>`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
+async function handleTmplTitleStep(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  state.title = text;
+  state.step = "prize";
+
+  await ctx.reply(
+    `✅ Title: <b>${escapeHtml(text)}</b>\n\n` +
+      `Step 3 of 5: What's the <b>prize</b>?\n\n` +
+      `Send one prize, or <b>multiple prizes separated by commas</b>.\n\n` +
+      `Examples:\n` +
+      `• <code>$50 Gift Card</code>\n` +
+      `• <code>$100, $50, $25</code>`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
+async function handleTmplPrizeStep(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const prizes = text
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  if (prizes.length === 0) {
+    await ctx.reply("Please enter at least one prize.");
+    return true;
+  }
+
+  state.prizes = prizes;
+  state.step = "winners";
+
+  const keyboard = new InlineKeyboard();
+
+  if (prizes.length > 1) {
+    keyboard
+      .text(`${prizes.length} (match prizes)`, `twiz_winners_${prizes.length}`)
+      .row();
+    const options = [1, 2, 3, 5, 10].filter((n) => n !== prizes.length);
+    for (const n of options.slice(0, 4)) {
+      keyboard.text(`${n}`, `twiz_winners_${n}`);
+    }
+  } else {
+    keyboard
+      .text("1", "twiz_winners_1")
+      .text("2", "twiz_winners_2")
+      .text("3", "twiz_winners_3")
+      .text("5", "twiz_winners_5")
+      .text("10", "twiz_winners_10");
+  }
+
+  let prizeDisplay: string;
+  if (prizes.length > 1) {
+    prizeDisplay = prizes
+      .map((p, i) => {
+        const label =
+          i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
+        return `${label} ${escapeHtml(p)}`;
+      })
+      .join("\n");
+  } else {
+    prizeDisplay = `🎁 ${escapeHtml(prizes[0])}`;
+  }
+
+  await ctx.reply(
+    `✅ Prizes:\n${prizeDisplay}\n\n` +
+      `Step 4 of 5: How many <b>winners</b>?`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+  return true;
+}
+
+export async function handleTmplWinnersCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state || state.step !== "winners") {
+    await ctx.answerCallbackQuery({
+      text: "This wizard has expired.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const num = parseInt(data.replace("twiz_winners_", ""), 10);
+  if (isNaN(num) || num < 1) return;
+
+  state.maxWinners = num;
+  state.step = "time";
+
+  await ctx.answerCallbackQuery();
+
+  const keyboard = new InlineKeyboard()
+    .text("15 min", "twiz_time_15m")
+    .text("30 min", "twiz_time_30m")
+    .text("1 hour", "twiz_time_1h")
+    .row()
+    .text("2 hours", "twiz_time_2h")
+    .text("6 hours", "twiz_time_6h")
+    .text("1 day", "twiz_time_1d")
+    .row()
+    .text("⏱ Custom time", "twiz_time_custom")
+    .row()
+    .text("No time limit", "twiz_time_none");
+
+  await ctx.editMessageText(
+    `✅ Winners: <b>${num}</b>\n\n` +
+      `Step 5 of 5: Set a <b>default duration</b>?\n\n` +
+      `Each raffle created from this template will run for this long.`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
+export async function handleTmplTimeCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state || state.step !== "time") {
+    await ctx.answerCallbackQuery({
+      text: "This wizard has expired.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const timeValue = data.replace("twiz_time_", "");
+
+  if (timeValue === "custom") {
+    state.step = "time_custom";
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `⏱ <b>Custom Duration</b>\n\n` +
+        `Type a duration like:\n` +
+        `• <code>45m</code> — 45 minutes\n` +
+        `• <code>3h</code> — 3 hours\n` +
+        `• <code>12h</code> — 12 hours\n` +
+        `• <code>2d</code> — 2 days`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (timeValue === "none") {
+    state.durationMinutes = null;
+  } else {
+    switch (timeValue) {
+      case "15m": state.durationMinutes = 15; break;
+      case "30m": state.durationMinutes = 30; break;
+      case "1h": state.durationMinutes = 60; break;
+      case "2h": state.durationMinutes = 120; break;
+      case "6h": state.durationMinutes = 360; break;
+      case "1d": state.durationMinutes = 1440; break;
+    }
+  }
+
+  await ctx.answerCallbackQuery();
+  await sendTmplOptionsScreen(ctx, state);
+}
+
+async function handleTmplCustomTimeStep(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const parsed = parseEndTime(text);
+  if (!parsed) {
+    await ctx.reply(
+      `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
+        `Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  // Convert absolute date back to duration in minutes
+  const durationMs = parsed.getTime() - Date.now();
+  state.durationMinutes = Math.round(durationMs / 60000);
+
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+// --- Template options screen ---
+
+function buildTmplOptionsText(state: TemplateWizardState): string {
+  let msg = `⚙️ <b>Template Options</b> — tap to change, then Create:\n\n`;
+
+  const sponsor = state.sponsorName
+    ? `${escapeHtml(state.sponsorName)} ✅`
+    : "None";
+  msg += `💎 <b>Sponsor:</b> ${sponsor}\n`;
+  msg += `👁 <b>Hidden entries:</b> ${state.anonymous ? "On ✅" : "Off"}\n`;
+
+  if (state.recurringMinutes) {
+    const hours = Math.floor(state.recurringMinutes / 60);
+    const mins = state.recurringMinutes % 60;
+    const parts: string[] = [];
+    if (hours > 0) parts.push(`${hours}h`);
+    if (mins > 0) parts.push(`${mins}m`);
+    msg += `🔄 <b>Recurring:</b> every ${parts.join(" ")} ✅\n`;
+  } else {
+    msg += `🔄 <b>Recurring:</b> Off\n`;
+  }
+
+  return msg;
+}
+
+function buildTmplOptionsKeyboard(state: TemplateWizardState): InlineKeyboard {
+  const kb = new InlineKeyboard();
+
+  kb.text(
+    state.sponsorName ? "💎 Change Sponsor" : "💎 Set Sponsor",
+    "twiz_opt_sponsor"
+  );
+  kb.text(
+    state.anonymous ? "👁 Entries: Hidden" : "👁 Entries: Visible",
+    "twiz_opt_anon"
+  );
+  kb.row();
+  kb.text(
+    state.recurringMinutes ? "🔄 Change Recurring" : "🔄 Set Recurring",
+    "twiz_opt_recurring"
+  );
+  kb.row();
+  kb.text("✅ Create Template", "twiz_opt_create");
+
+  return kb;
+}
+
+async function sendTmplOptionsScreen(
+  ctx: Context,
+  state: TemplateWizardState
+): Promise<void> {
+  state.step = "options";
+  await ctx.reply(buildTmplOptionsText(state), {
+    parse_mode: "HTML",
+    reply_markup: buildTmplOptionsKeyboard(state),
+  });
+}
+
+export async function handleTmplOptionsCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state || !state.step.startsWith("options")) {
+    await ctx.answerCallbackQuery({
+      text: "This wizard has expired.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  switch (data) {
+    case "twiz_opt_sponsor":
+      state.step = "options_sponsor";
+      await ctx.editMessageText(
+        `💎 Type the <b>sponsor name</b>:\n\n` +
+          `Examples: <code>RedBeard Peptides</code> or <code>@SponsorUsername</code>\n\n` +
+          `<i>Type <code>skip</code> to remove sponsor.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_anon":
+      state.anonymous = !state.anonymous;
+      await ctx.editMessageText(buildTmplOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildTmplOptionsKeyboard(state),
+      });
+      break;
+
+    case "twiz_opt_recurring":
+      state.step = "options_recurring";
+      await ctx.editMessageText(
+        `🔄 <b>Recurring Interval</b>\n\n` +
+          `How often should this template auto-create a new raffle?\n\n` +
+          `Type a duration like: <code>6h</code>, <code>12h</code>, <code>1d</code>, <code>7d</code>\n\n` +
+          `<i>Type <code>skip</code> to disable recurring.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_create":
+      await createTemplateFromWizard(ctx, state);
+      break;
+  }
+}
+
+async function handleTmplSponsorText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.sponsorName = null;
+  } else {
+    state.sponsorName = text;
+  }
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplRecurringText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.recurringMinutes = null;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const parsed = parseEndTime(text);
+  if (!parsed) {
+    await ctx.reply(
+      `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
+        `Use formats like: <code>6h</code>, <code>12h</code>, <code>1d</code>, <code>7d</code>`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  const durationMs = parsed.getTime() - Date.now();
+  state.recurringMinutes = Math.round(durationMs / 60000);
+
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function createTemplateFromWizard(
+  ctx: Context,
+  state: TemplateWizardState
+): Promise<void> {
+  const prizes = state.prizes || ["Prize"];
+  const singlePrize = prizes[0];
+  const prizesJson = prizes.length > 1 ? JSON.stringify(prizes) : null;
+
+  try {
+    db.createTemplate({
+      chat_id: state.targetChatId,
+      creator_id: state.userId,
+      name: state.name || "Template",
+      title: state.title || state.name || "Raffle",
+      prize: singlePrize,
+      prizes: prizesJson,
+      max_entries: null,
+      max_winners: state.maxWinners || 1,
+      duration_minutes: state.durationMinutes || null,
+      sponsor_name: state.sponsorName || null,
+      anonymous: state.anonymous ? 1 : 0,
+      recurring_interval_minutes: state.recurringMinutes || null,
+    });
+
+    cancelTemplateWizard(state.userId);
+
+    await ctx.reply(
+      `✅ Template <b>${escapeHtml(state.name || "Template")}</b> saved!\n\n` +
+        `Use /templates in <b>${escapeHtml(state.targetChatTitle)}</b> to manage it.`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err: unknown) {
+    const sqliteErr = err as { code?: string };
+    if (sqliteErr.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      await ctx.reply(
+        `A template named "${escapeHtml(state.name || "")}" already exists in that chat. Choose a different name or delete the existing one first.`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      throw err;
+    }
+  }
+}

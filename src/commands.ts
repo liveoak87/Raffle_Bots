@@ -12,7 +12,7 @@ import {
   parseEndTime,
   replyPrivately,
 } from "./helpers";
-import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
+import { startWizard, handleStartDeepLink, startEditWizard, startTemplateWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendBanner, sendWheelSpin } from "./banners";
 
@@ -958,25 +958,54 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // --- Show /savetemplate help ---
+  // --- Start template creation wizard ---
   if (data === "tmpl_create") {
     await ctx.answerCallbackQuery();
-    const keyboard = new InlineKeyboard().text("⬅️ Back", "tmpl_back");
-    await ctx.editMessageText(
-      `➕ <b>Create a Template</b>\n\n` +
-        `Close this menu, then type a command like this in the group chat:\n\n` +
-        `<b>Simple example:</b>\n` +
-        `<code>/savetemplate Weekly | Weekly Giveaway | $50 Gift Card</code>\n\n` +
-        `<b>With options:</b>\n` +
-        `<code>/savetemplate Daily | Daily Prize | $25 | winners:2 | ends:1d</code>\n\n` +
-        `<b>Available options:</b>\n` +
-        `• <code>winners:N</code> — number of winners\n` +
-        `• <code>ends:30m</code> / <code>ends:2h</code> / <code>ends:1d</code>\n` +
-        `• <code>sponsor:Name</code>\n` +
-        `• <code>anonymous:on</code>\n` +
-        `• <code>recurring:6h</code> — auto-repeat interval`,
-      { parse_mode: "HTML", reply_markup: keyboard }
+
+    // Delete the hub message
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+
+    // Get group title
+    let groupTitle = "the group";
+    try {
+      const chat = await ctx.api.getChat(chatId);
+      if ("title" in chat) groupTitle = chat.title || groupTitle;
+    } catch {}
+
+    // Start the DM wizard
+    const started = await startTemplateWizard(
+      ctx.api,
+      ctx.from.id,
+      chatId,
+      groupTitle
     );
+
+    if (started) {
+      const notice = await ctx.api.sendMessage(
+        chatId,
+        `📋 Check your DMs @${ctx.from.username || ctx.from.first_name} — template setup is there.`
+      );
+      setTimeout(async () => {
+        try {
+          await ctx.api.deleteMessage(chatId, notice.message_id);
+        } catch {}
+      }, 5000);
+    } else {
+      // Can't DM user — show fallback
+      const botInfo = await ctx.api.getMe();
+      const keyboard = new InlineKeyboard().url(
+        "Start a DM with me",
+        `https://t.me/${botInfo.username}?start=help`
+      );
+      await ctx.api.sendMessage(
+        chatId,
+        `I need to set up the template in a private message.\n\n` +
+          `Tap below to start a DM with me, then try again.`,
+        { reply_markup: keyboard }
+      );
+    }
     return;
   }
 

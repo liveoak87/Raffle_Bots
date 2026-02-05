@@ -2,6 +2,7 @@
  * Banner generation script for Red Beard Raffle Bot.
  * Generates 3 branded banner PNGs using node-canvas.
  *
+ * Prerequisites: npm install canvas (not a runtime dependency)
  * Usage: npx ts-node scripts/generate-banners.ts
  */
 

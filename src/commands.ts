@@ -964,14 +964,17 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const keyboard = new InlineKeyboard().text("⬅️ Back", "tmpl_back");
     await ctx.editMessageText(
       `➕ <b>Create a Template</b>\n\n` +
-        `Use this format in the group chat:\n\n` +
-        `<code>/savetemplate Name | Title | Prize | winners:N | ends:30m</code>\n\n` +
-        `<b>Options (add after prize):</b>\n` +
+        `Close this menu, then type a command like this in the group chat:\n\n` +
+        `<b>Simple example:</b>\n` +
+        `<code>/savetemplate Weekly | Weekly Giveaway | $50 Gift Card</code>\n\n` +
+        `<b>With options:</b>\n` +
+        `<code>/savetemplate Daily | Daily Prize | $25 | winners:2 | ends:1d</code>\n\n` +
+        `<b>Available options:</b>\n` +
         `• <code>winners:N</code> — number of winners\n` +
-        `• <code>ends:30m</code> / <code>ends:2h</code> / <code>ends:1d</code> — duration\n` +
-        `• <code>sponsor:Name</code> — sponsor display name\n` +
-        `• <code>anonymous:on</code> — hide entry list\n` +
-        `• <code>recurring:6h</code> — auto-create interval`,
+        `• <code>ends:30m</code> / <code>ends:2h</code> / <code>ends:1d</code>\n` +
+        `• <code>sponsor:Name</code>\n` +
+        `• <code>anonymous:on</code>\n` +
+        `• <code>recurring:6h</code> — auto-repeat interval`,
       { parse_mode: "HTML", reply_markup: keyboard }
     );
     return;
@@ -1236,14 +1239,7 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
   const args = text.replace(/^\/savetemplate(@\w+)?/i, "").trim();
 
   if (!args) {
-    await replyPrivately(ctx,
-      `<b>Save a raffle template</b>\n\n` +
-        `<code>/savetemplate Name | Title | Prize | winners:N | ends:30m</code>\n\n` +
-        `The first value is the template name (used to recall it later).\n` +
-        `Remaining values use the same format as /newraffle.\n\n` +
-        `Optional: <code>recurring:6h</code> to auto-create on a schedule.\n\n` +
-        `Use <code>/templates</code> to list saved templates.`,
-      { parse_mode: "HTML" });
+    await buildTemplateHub(ctx, ctx.chat.id, false);
     return;
   }
 

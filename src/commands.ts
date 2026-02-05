@@ -14,7 +14,7 @@ import {
   sleep,
   performWheelSpin,
 } from "./helpers";
-import { startWizard, handleStartDeepLink } from "./wizard";
+import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 
 // /start - Welcome message (works in private chat)
@@ -1119,162 +1119,55 @@ export async function handleEditRaffle(ctx: Context): Promise<void> {
     return;
   }
 
+  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  if (openRaffles.length === 0) {
+    await replyPrivately(ctx, "No open raffles to edit.");
+    return;
+  }
+
+  // Check if a specific raffle ID was provided
   const text = ctx.message?.text || "";
   const args = text.replace(/^\/editraffle(@\w+)?/i, "").trim();
+  const raffleId = parseInt(args, 10);
 
-  if (!args) {
-    const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
-    if (openRaffles.length === 0) {
-      await replyPrivately(ctx, "No open raffles to edit.");
+  if (!isNaN(raffleId)) {
+    const raffle = openRaffles.find((r) => r.id === raffleId);
+    if (raffle) {
+      await startEditWizard(ctx, raffle.id, ctx.chat.id);
       return;
     }
-    let msg = `<b>Which raffle do you want to edit?</b>\n\n`;
+  }
+
+  // If only one open raffle, edit it directly
+  if (openRaffles.length === 1) {
+    await startEditWizard(ctx, openRaffles[0].id, ctx.chat.id);
+    return;
+  }
+
+  // Multiple raffles — show selection in DM
+  try {
+    const kb = new InlineKeyboard();
     for (const r of openRaffles) {
-      msg += `/editraffle ${r.id} - ${escapeHtml(r.title)}\n`;
+      kb.text(`${escapeHtml(r.title)} (#${r.id})`, `edit_pick_${r.id}`).row();
     }
-    msg += `\n<b>Usage:</b>\n`;
-    msg += `<code>/editraffle ID field:value</code>\n\n`;
-    msg += `<b>Fields you can edit:</b>\n`;
-    msg += `• <code>title:New Title</code>\n`;
-    msg += `• <code>prize:New Prize</code>\n`;
-    msg += `• <code>ends:2h</code> (extend/change end time)\n`;
-    msg += `• <code>max:100</code> (max entries)\n`;
-    msg += `• <code>winners:3</code> (number of winners)\n`;
-    msg += `• <code>sponsor:@Name</code> (or <code>sponsor:none</code>)\n\n`;
-    msg += `<b>Example:</b> <code>/editraffle ${openRaffles[0].id} title:Big Giveaway | ends:6h</code>`;
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
-    return;
+
+    await ctx.api.sendMessage(
+      userId,
+      `✏️ <b>Which raffle do you want to edit?</b>`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+
+    const notice = await ctx.reply(
+      `✏️ Check your DMs @${ctx.from!.username || ctx.from!.first_name} — pick a raffle to edit.`
+    );
+    setTimeout(async () => {
+      try {
+        await ctx.api.deleteMessage(ctx.chat!.id, notice.message_id);
+      } catch {}
+    }, 5000);
+  } catch {
+    await replyPrivately(ctx, "Please start a DM with me first, then try /editraffle again.");
   }
-
-  // Parse: /editraffle ID [field:value | field:value ...]
-  const parts = args.split(/\s+/);
-  const raffleId = parseInt(parts[0], 10);
-
-  if (isNaN(raffleId)) {
-    await replyPrivately(ctx, "Please provide a valid raffle ID.");
-    return;
-  }
-
-  const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.chat_id !== ctx.chat.id) {
-    await replyPrivately(ctx, "Raffle not found in this chat.");
-    return;
-  }
-
-  if (raffle.status !== "open") {
-    await replyPrivately(ctx, "Only open raffles can be edited.");
-    return;
-  }
-
-  // If just the ID, show current settings
-  const editPart = args.slice(parts[0].length).trim();
-  if (!editPart) {
-    const count = db.getEntryCount(raffleId);
-    const maxStr = raffle.max_entries ? `${raffle.max_entries}` : "No limit";
-    let msg = `<b>Raffle #${raffle.id}: ${escapeHtml(raffle.title)}</b>\n\n`;
-    msg += `🎁 Prize: ${escapeHtml(raffle.prize)}\n`;
-    msg += `🏆 Winners: ${raffle.max_winners}\n`;
-    msg += `👥 Entries: ${count} (max: ${maxStr})\n`;
-    if (raffle.ends_at) {
-      msg += `⏰ Ends: ${formatCountdown(new Date(raffle.ends_at + "Z"))}\n`;
-    }
-    if (raffle.sponsor_name) {
-      msg += `💎 Sponsor: ${escapeHtml(raffle.sponsor_name)}\n`;
-    }
-    msg += `\n<b>To edit:</b> <code>/editraffle ${raffle.id} field:value</code>`;
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
-    return;
-  }
-
-  // Parse field:value pairs (pipe-separated)
-  const fieldParts = editPart.split("|").map((p) => p.trim());
-  const updates: Record<string, unknown> = {};
-  const changes: string[] = [];
-
-  for (const fp of fieldParts) {
-    const titleMatch = fp.match(/^title\s*:\s*(.+)$/i);
-    const prizeMatch = fp.match(/^prize\s*:\s*(.+)$/i);
-    const endsMatch = fp.match(/^ends?\s*:\s*(.+)$/i);
-    const maxMatch = fp.match(/^max\s*:\s*(\d+|none)$/i);
-    const winnersMatch = fp.match(/^winners?\s*:\s*(\d+)$/i);
-    const sponsorMatch = fp.match(/^sponsor\s*:\s*(.+)$/i);
-
-    if (titleMatch) {
-      updates.title = titleMatch[1].trim();
-      changes.push(`Title → ${titleMatch[1].trim()}`);
-    } else if (prizeMatch) {
-      updates.prize = prizeMatch[1].trim();
-      changes.push(`Prize → ${prizeMatch[1].trim()}`);
-    } else if (endsMatch) {
-      const val = endsMatch[1].trim().toLowerCase();
-      if (val === "none" || val === "off") {
-        updates.ends_at = null;
-        changes.push("End time removed");
-      } else {
-        const parsed = parseEndTime(endsMatch[1].trim());
-        if (parsed) {
-          const endsAt = parsed
-            .toISOString()
-            .replace("T", " ")
-            .replace("Z", "")
-            .split(".")[0];
-          updates.ends_at = endsAt;
-          changes.push(`Ends → ${formatCountdown(parsed)}`);
-        } else {
-          await replyPrivately(ctx,
-            `Could not parse end time "${endsMatch[1]}". Use formats like: 30m, 2h, 1d`,
-          );
-          return;
-        }
-      }
-    } else if (maxMatch) {
-      const val = maxMatch[1].toLowerCase();
-      if (val === "none") {
-        updates.max_entries = null;
-        changes.push("Max entries removed");
-      } else {
-        updates.max_entries = Math.max(1, parseInt(val, 10));
-        changes.push(`Max entries → ${val}`);
-      }
-    } else if (winnersMatch) {
-      updates.max_winners = Math.max(
-        1,
-        Math.min(50, parseInt(winnersMatch[1], 10))
-      );
-      changes.push(`Winners → ${winnersMatch[1]}`);
-    } else if (sponsorMatch) {
-      const val = sponsorMatch[1].trim().toLowerCase();
-      if (val === "none" || val === "off") {
-        updates.sponsor_name = null;
-        changes.push("Sponsor removed");
-      } else {
-        updates.sponsor_name = sponsorMatch[1].trim();
-        changes.push(`Sponsor → ${sponsorMatch[1].trim()}`);
-      }
-    }
-  }
-
-  if (changes.length === 0) {
-    await replyPrivately(ctx,
-      `No valid changes found. Use format: <code>/editraffle ${raffleId} field:value</code>`,
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  const updated = db.updateRaffleFields(raffleId, updates);
-  if (!updated) {
-    await replyPrivately(ctx, "Failed to update the raffle.");
-    return;
-  }
-
-  // Refresh the raffle post in the group
-  await updateRafflePost(ctx, raffleId);
-
-  let msg = `✅ <b>Raffle #${raffleId} updated:</b>\n`;
-  for (const c of changes) {
-    msg += `• ${escapeHtml(c)}\n`;
-  }
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // /language - Set the bot language for this chat

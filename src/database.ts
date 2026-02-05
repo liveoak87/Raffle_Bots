@@ -546,6 +546,8 @@ export function updateRaffleFields(
     "ends_at",
     "sponsor_name",
     "description",
+    "anonymous",
+    "auto_pin",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];

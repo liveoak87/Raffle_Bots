@@ -44,6 +44,10 @@ import {
   handleOptionsCallback,
   handleStartDeepLink,
   getActiveWizard,
+  handleEditCallback,
+  handleEditTextMessage,
+  getActiveEditWizard,
+  startEditWizard,
 } from "./wizard";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -121,6 +125,9 @@ bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
 bot.callbackQuery(/^wiz_time_/, handleTimeCallback);
 bot.callbackQuery(/^wiz_opt_/, handleOptionsCallback);
 
+// --- Edit wizard callback queries ---
+bot.callbackQuery(/^edit_/, handleEditCallback);
+
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {
   if (!ctx.from) return;
@@ -130,7 +137,14 @@ bot.on("message:text", async (ctx) => {
   // Only process wizard messages in private chat (DMs)
   if (ctx.chat.type !== "private") return;
 
-  // Check if user has an active wizard
+  // Check if user has an active edit wizard first
+  const editState = getActiveEditWizard(ctx.from.id);
+  if (editState && editState.editingField) {
+    await handleEditTextMessage(ctx);
+    return;
+  }
+
+  // Check if user has an active creation wizard
   const state = getActiveWizard(ctx.from.id);
   if (!state) return;
 

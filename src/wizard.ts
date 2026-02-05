@@ -668,3 +668,523 @@ async function createRaffleFromWizard(
     { parse_mode: "HTML" }
   );
 }
+
+// ===================================================================
+// EDIT WIZARD — Interactive DM-based raffle editor
+// ===================================================================
+
+interface EditWizardState {
+  raffleId: number;
+  chatId: number;
+  dmChatId: number;
+  userId: number;
+  editingField: "title" | "prize" | "ends" | "max" | "sponsor" | null;
+  createdAt: number;
+}
+
+const editWizards = new Map<number, EditWizardState>();
+
+function cleanStaleEditWizards(): void {
+  const now = Date.now();
+  for (const [key, state] of editWizards) {
+    if (now - state.createdAt > WIZARD_TIMEOUT) {
+      editWizards.delete(key);
+    }
+  }
+}
+
+export function getActiveEditWizard(userId: number): EditWizardState | undefined {
+  cleanStaleEditWizards();
+  const state = editWizards.get(userId);
+  if (state) {
+    state.createdAt = Date.now();
+  }
+  return state;
+}
+
+export function cancelEditWizard(userId: number): void {
+  editWizards.delete(userId);
+}
+
+export async function startEditWizard(
+  ctx: Context,
+  raffleId: number,
+  chatId: number
+): Promise<void> {
+  const userId = ctx.from!.id;
+
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle) return;
+
+  try {
+    const state: EditWizardState = {
+      raffleId,
+      chatId,
+      dmChatId: 0,
+      userId,
+      editingField: null,
+      createdAt: Date.now(),
+    };
+
+    editWizards.set(userId, state);
+
+    const msg = await ctx.api.sendMessage(
+      userId,
+      buildEditScreenText(raffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
+    );
+
+    state.dmChatId = msg.chat.id;
+
+    // Notify in group
+    const notice = await ctx.reply(
+      `✏️ Check your DMs @${ctx.from!.username || ctx.from!.first_name} — editing raffle there.`
+    );
+    setTimeout(async () => {
+      try {
+        await ctx.api.deleteMessage(chatId, notice.message_id);
+      } catch {}
+    }, 5000);
+  } catch {
+    const botInfo = await ctx.api.getMe();
+    const keyboard = new InlineKeyboard().url(
+      "Start a DM with me",
+      `https://t.me/${botInfo.username}?start=editraffle_${raffleId}_${chatId}`
+    );
+    const fallback = await ctx.reply(
+      `I need to edit the raffle in a private message.\n\n` +
+        `Tap the button below to start a DM with me, then try /editraffle again.`,
+      { reply_markup: keyboard }
+    );
+    setTimeout(async () => {
+      try {
+        await ctx.api.deleteMessage(chatId, fallback.message_id);
+      } catch {}
+    }, 15000);
+  }
+}
+
+function buildEditScreenText(raffle: ReturnType<typeof db.getRaffleById>): string {
+  if (!raffle) return "Raffle not found.";
+
+  const count = db.getEntryCount(raffle.id);
+  const maxStr = raffle.max_entries ? `${raffle.max_entries}` : "No limit";
+
+  let msg = `✏️ <b>Editing: ${escapeHtml(raffle.title)}</b>\n\n`;
+  msg += `🎁 <b>Prize:</b> ${escapeHtml(raffle.prize)}\n`;
+  msg += `🏆 <b>Winners:</b> ${raffle.max_winners}\n`;
+  msg += `👥 <b>Entries:</b> ${count} (max: ${maxStr})\n`;
+
+  if (raffle.ends_at) {
+    const endsDate = new Date(raffle.ends_at + "Z");
+    msg += `⏰ <b>Ends:</b> ${formatCountdown(endsDate)}\n`;
+  } else {
+    msg += `⏰ <b>Ends:</b> No time limit\n`;
+  }
+
+  if (raffle.sponsor_name) {
+    msg += `💎 <b>Sponsor:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
+  } else {
+    msg += `💎 <b>Sponsor:</b> None\n`;
+  }
+
+  msg += `👁 <b>Hidden entries:</b> ${raffle.anonymous ? "On" : "Off"}\n`;
+  msg += `📌 <b>Auto-pin:</b> ${raffle.auto_pin ? "On" : "Off"}\n`;
+
+  msg += `\n<i>Tap a button to edit that field:</i>`;
+  return msg;
+}
+
+function buildEditScreenKeyboard(raffle: ReturnType<typeof db.getRaffleById>): InlineKeyboard {
+  if (!raffle) return new InlineKeyboard();
+
+  const kb = new InlineKeyboard();
+  kb.text("✏️ Title", "edit_title");
+  kb.text("🎁 Prize", "edit_prize");
+  kb.row();
+  kb.text("⏰ End Time", "edit_time");
+  kb.text("👥 Max Entries", "edit_max");
+  kb.row();
+  kb.text("🏆 Winners", "edit_winners");
+  kb.text("💎 Sponsor", "edit_sponsor");
+  kb.row();
+  kb.text(
+    raffle.anonymous ? "👁 Entries: Hidden" : "👁 Entries: Visible",
+    "edit_anon"
+  );
+  kb.text(
+    raffle.auto_pin ? "📌 Pin: On" : "📌 Pin: Off",
+    "edit_pin"
+  );
+  kb.row();
+  kb.text("✅ Done", "edit_done");
+
+  return kb;
+}
+
+async function refreshEditScreen(ctx: Context, state: EditWizardState): Promise<void> {
+  state.editingField = null;
+  const raffle = db.getRaffleById(state.raffleId);
+  if (!raffle) return;
+
+  try {
+    await ctx.editMessageText(
+      buildEditScreenText(raffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
+    );
+  } catch {
+    // If edit fails, send new message
+    await ctx.api.sendMessage(
+      state.dmChatId,
+      buildEditScreenText(raffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
+    );
+  }
+}
+
+export async function handleEditCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  // Handle raffle selection (before edit session exists)
+  if (data.startsWith("edit_pick_")) {
+    const raffleId = parseInt(data.replace("edit_pick_", ""), 10);
+    if (isNaN(raffleId)) return;
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.status !== "open") {
+      await ctx.answerCallbackQuery({ text: "This raffle is no longer editable.", show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+
+    // Create the edit wizard state
+    const editState: EditWizardState = {
+      raffleId,
+      chatId: raffle.chat_id,
+      dmChatId: ctx.chat!.id,
+      userId: ctx.from.id,
+      editingField: null,
+      createdAt: Date.now(),
+    };
+    editWizards.set(ctx.from.id, editState);
+
+    // Show the edit screen
+    await ctx.editMessageText(
+      buildEditScreenText(raffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
+    );
+    return;
+  }
+
+  const state = getActiveEditWizard(ctx.from.id);
+  if (!state) {
+    await ctx.answerCallbackQuery({ text: "This edit session has expired.", show_alert: true });
+    return;
+  }
+
+  const raffle = db.getRaffleById(state.raffleId);
+  if (!raffle || raffle.status !== "open") {
+    await ctx.answerCallbackQuery({ text: "This raffle is no longer editable.", show_alert: true });
+    cancelEditWizard(ctx.from.id);
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  if (data === "edit_title") {
+    state.editingField = "title";
+    await ctx.editMessageText(
+      `✏️ <b>Edit Title</b>\n\n` +
+        `Current: <b>${escapeHtml(raffle.title)}</b>\n\n` +
+        `Type the new title:`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_prize") {
+    state.editingField = "prize";
+    await ctx.editMessageText(
+      `🎁 <b>Edit Prize</b>\n\n` +
+        `Current: <b>${escapeHtml(raffle.prize)}</b>\n\n` +
+        `Type the new prize (separate multiple with commas):`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_sponsor") {
+    state.editingField = "sponsor";
+    await ctx.editMessageText(
+      `💎 <b>Edit Sponsor</b>\n\n` +
+        `Current: <b>${raffle.sponsor_name ? escapeHtml(raffle.sponsor_name) : "None"}</b>\n\n` +
+        `Type the sponsor name (or <code>none</code> to remove):`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_max") {
+    state.editingField = "max";
+    await ctx.editMessageText(
+      `👥 <b>Edit Max Entries</b>\n\n` +
+        `Current: <b>${raffle.max_entries || "No limit"}</b>\n\n` +
+        `Type a number (or <code>none</code> for no limit):`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_time") {
+    const kb = new InlineKeyboard()
+      .text("15 min", "edit_time_15m")
+      .text("30 min", "edit_time_30m")
+      .text("1 hour", "edit_time_1h")
+      .row()
+      .text("2 hours", "edit_time_2h")
+      .text("6 hours", "edit_time_6h")
+      .text("1 day", "edit_time_1d")
+      .row()
+      .text("⏱ Custom", "edit_time_custom")
+      .text("❌ No limit", "edit_time_none")
+      .row()
+      .text("⬅️ Back", "edit_back");
+
+    await ctx.editMessageText(
+      `⏰ <b>Edit End Time</b>\n\n` +
+        `Current: <b>${raffle.ends_at ? formatCountdown(new Date(raffle.ends_at + "Z")) : "No limit"}</b>\n\n` +
+        `Pick a new duration:`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+    return;
+  }
+
+  if (data.startsWith("edit_time_")) {
+    const timeValue = data.replace("edit_time_", "");
+
+    if (timeValue === "custom") {
+      state.editingField = "ends";
+      await ctx.editMessageText(
+        `⏱ <b>Custom End Time</b>\n\n` +
+          `Type a duration like: <code>45m</code>, <code>3h</code>, <code>12h</code>, <code>2d</code>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (timeValue === "none") {
+      db.updateRaffleFields(state.raffleId, { ends_at: null });
+    } else {
+      let ms = 0;
+      switch (timeValue) {
+        case "15m": ms = 15 * 60 * 1000; break;
+        case "30m": ms = 30 * 60 * 1000; break;
+        case "1h": ms = 60 * 60 * 1000; break;
+        case "2h": ms = 2 * 60 * 60 * 1000; break;
+        case "6h": ms = 6 * 60 * 60 * 1000; break;
+        case "1d": ms = 24 * 60 * 60 * 1000; break;
+      }
+      const endDate = new Date(Date.now() + ms);
+      const endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      db.updateRaffleFields(state.raffleId, { ends_at: endsAt });
+    }
+
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_winners") {
+    const kb = new InlineKeyboard()
+      .text("1", "edit_win_1")
+      .text("2", "edit_win_2")
+      .text("3", "edit_win_3")
+      .text("5", "edit_win_5")
+      .text("10", "edit_win_10")
+      .row()
+      .text("⬅️ Back", "edit_back");
+
+    await ctx.editMessageText(
+      `🏆 <b>Edit Winners Count</b>\n\n` +
+        `Current: <b>${raffle.max_winners}</b>\n\n` +
+        `Pick a new count:`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+    return;
+  }
+
+  if (data.startsWith("edit_win_")) {
+    const num = parseInt(data.replace("edit_win_", ""), 10);
+    if (!isNaN(num) && num >= 1) {
+      db.updateRaffleFields(state.raffleId, { max_winners: num });
+      await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    }
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_anon") {
+    db.updateRaffleFields(state.raffleId, { anonymous: raffle.anonymous ? 0 : 1 });
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_pin") {
+    db.updateRaffleFields(state.raffleId, { auto_pin: raffle.auto_pin ? 0 : 1 });
+    // Pin/unpin the message
+    if (!raffle.auto_pin && raffle.message_id) {
+      try {
+        await ctx.api.pinChatMessage(state.chatId, raffle.message_id, { disable_notification: true });
+      } catch {}
+    } else if (raffle.auto_pin && raffle.message_id) {
+      try {
+        await ctx.api.unpinChatMessage(state.chatId, raffle.message_id);
+      } catch {}
+    }
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_back") {
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_done") {
+    cancelEditWizard(ctx.from.id);
+    const updatedRaffle = db.getRaffleById(state.raffleId);
+    await ctx.editMessageText(
+      `✅ Done editing <b>${escapeHtml(updatedRaffle?.title || "raffle")}</b>. Changes are live!`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+}
+
+export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.text) return false;
+
+  const state = getActiveEditWizard(ctx.from.id);
+  if (!state || !state.editingField) return false;
+
+  const text = ctx.message.text.trim();
+
+  if (text.toLowerCase() === "/cancel") {
+    cancelEditWizard(ctx.from.id);
+    await ctx.reply("Edit session cancelled.");
+    return true;
+  }
+
+  if (text.startsWith("/")) return false;
+
+  const raffle = db.getRaffleById(state.raffleId);
+  if (!raffle || raffle.status !== "open") {
+    cancelEditWizard(ctx.from.id);
+    await ctx.reply("This raffle is no longer editable.");
+    return true;
+  }
+
+  switch (state.editingField) {
+    case "title":
+      db.updateRaffleFields(state.raffleId, { title: text });
+      break;
+
+    case "prize": {
+      const prizes = text.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+      if (prizes.length === 0) {
+        await ctx.reply("Please enter at least one prize.");
+        return true;
+      }
+      const updates: Record<string, unknown> = { prize: prizes[0] };
+      if (prizes.length > 1) {
+        updates.prizes = JSON.stringify(prizes);
+      } else {
+        updates.prizes = null;
+      }
+      db.updateRaffleFields(state.raffleId, updates);
+      break;
+    }
+
+    case "ends": {
+      const parsed = parseEndTime(text);
+      if (!parsed) {
+        await ctx.reply(
+          `Could not parse "<code>${escapeHtml(text)}</code>". Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>`,
+          { parse_mode: "HTML" }
+        );
+        return true;
+      }
+      const endsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      db.updateRaffleFields(state.raffleId, { ends_at: endsAt });
+      break;
+    }
+
+    case "max": {
+      if (text.toLowerCase() === "none") {
+        db.updateRaffleFields(state.raffleId, { max_entries: null });
+      } else {
+        const num = parseInt(text, 10);
+        if (isNaN(num) || num < 1) {
+          await ctx.reply("Please enter a number or <code>none</code>.", { parse_mode: "HTML" });
+          return true;
+        }
+        db.updateRaffleFields(state.raffleId, { max_entries: num });
+      }
+      break;
+    }
+
+    case "sponsor": {
+      if (text.toLowerCase() === "none") {
+        db.updateRaffleFields(state.raffleId, { sponsor_name: null });
+      } else {
+        db.updateRaffleFields(state.raffleId, { sponsor_name: text });
+      }
+      break;
+    }
+  }
+
+  // Update the live raffle post
+  await updateRafflePostById(ctx, state.raffleId, state.chatId);
+
+  // Show updated edit screen
+  state.editingField = null;
+  const updatedRaffle = db.getRaffleById(state.raffleId);
+  if (updatedRaffle) {
+    await ctx.reply(
+      buildEditScreenText(updatedRaffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(updatedRaffle) }
+    );
+  }
+
+  return true;
+}
+
+async function updateRafflePostById(
+  ctx: Context,
+  raffleId: number,
+  chatId: number
+): Promise<void> {
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || !raffle.message_id) return;
+
+  const count = db.getEntryCount(raffleId);
+  const lang = db.getChatLanguage(chatId);
+
+  const { t } = await import("./i18n");
+
+  const keyboard = new InlineKeyboard()
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+    .row()
+    .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+
+  try {
+    await ctx.api.editMessageText(
+      chatId,
+      raffle.message_id,
+      formatRaffleMessage(raffle, count),
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+  } catch {}
+}

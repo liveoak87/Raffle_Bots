@@ -520,7 +520,12 @@ async function main(): Promise<void> {
     { command: "draw", description: "Draw winners" },
     { command: "templates", description: "Manage raffle templates" },
     { command: "editraffle", description: "Edit an active raffle" },
+    { command: "cancelraffle", description: "Cancel a raffle" },
+    { command: "rerun", description: "Re-run a past raffle" },
+    { command: "exportentries", description: "Export participant list" },
     { command: "myentries", description: "See your active entries" },
+    { command: "rafflehistory", description: "View past raffles" },
+    { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help" },
   ]);
 

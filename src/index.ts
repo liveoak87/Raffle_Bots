@@ -34,6 +34,7 @@ import {
   performWheelSpin,
 } from "./helpers";
 import { parsePrizes } from "./types";
+import type { Raffle } from "./types";
 import { t } from "./i18n";
 import {
   handleWizardMessage,
@@ -284,35 +285,86 @@ async function checkExpiredRaffles(): Promise<void> {
 
 // --- Refresh countdowns on active raffle posts ---
 const COUNTDOWN_REFRESH_INTERVAL = 60_000; // 1 minute
+const COUNTDOWN_FAST_INTERVAL = 1_000; // 1 second for final 30s
+const COUNTDOWN_FAST_THRESHOLD = 30_000; // 30 seconds
+
+let fastTickerActive = false;
+let fastTickerInterval: ReturnType<typeof setInterval> | null = null;
+
+async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
+  if (!raffle.message_id) return;
+
+  const count = db.getEntryCount(raffle.id);
+  const lang = db.getChatLanguage(raffle.chat_id);
+
+  const keyboard = new InlineKeyboard()
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+    .row()
+    .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+
+  try {
+    await bot.api.editMessageText(
+      raffle.chat_id,
+      raffle.message_id,
+      formatRaffleMessage(raffle, count),
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+  } catch {
+    // Message unchanged or deleted — ignore
+  }
+}
 
 async function refreshCountdowns(): Promise<void> {
   try {
     const raffles = db.getOpenRafflesWithEndTime();
+    let hasUrgent = false;
+
     for (const raffle of raffles) {
-      if (!raffle.message_id) continue;
+      const endsAt = new Date(raffle.ends_at + "Z");
+      const remaining = endsAt.getTime() - Date.now();
 
-      const count = db.getEntryCount(raffle.id);
-      const lang = db.getChatLanguage(raffle.chat_id);
-
-      const keyboard = new InlineKeyboard()
-        .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-        .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-        .row()
-        .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
-
-      try {
-        await bot.api.editMessageText(
-          raffle.chat_id,
-          raffle.message_id,
-          formatRaffleMessage(raffle, count),
-          { parse_mode: "HTML", reply_markup: keyboard }
-        );
-      } catch {
-        // Message unchanged or deleted — ignore
+      if (remaining > COUNTDOWN_FAST_THRESHOLD) {
+        // Normal refresh — update once per minute
+        await refreshRaffleMessage(raffle);
+      } else if (remaining > 0) {
+        hasUrgent = true;
       }
+    }
+
+    // Start fast ticker if any raffles are in the final 30s
+    if (hasUrgent && !fastTickerActive) {
+      fastTickerActive = true;
+      fastTickerInterval = setInterval(refreshFinalCountdowns, COUNTDOWN_FAST_INTERVAL);
     }
   } catch (err) {
     console.error("Error refreshing countdowns:", err);
+  }
+}
+
+async function refreshFinalCountdowns(): Promise<void> {
+  try {
+    const raffles = db.getOpenRafflesWithEndTime();
+    let stillUrgent = false;
+
+    for (const raffle of raffles) {
+      const endsAt = new Date(raffle.ends_at + "Z");
+      const remaining = endsAt.getTime() - Date.now();
+
+      if (remaining > 0 && remaining <= COUNTDOWN_FAST_THRESHOLD) {
+        stillUrgent = true;
+        await refreshRaffleMessage(raffle);
+      }
+    }
+
+    // Stop fast ticker when no more urgent raffles
+    if (!stillUrgent && fastTickerInterval) {
+      clearInterval(fastTickerInterval);
+      fastTickerInterval = null;
+      fastTickerActive = false;
+    }
+  } catch (err) {
+    console.error("Error in fast countdown refresh:", err);
   }
 }
 

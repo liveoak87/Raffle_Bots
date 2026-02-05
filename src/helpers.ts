@@ -189,18 +189,23 @@ export function formatCountdown(target: Date): string {
     return "Ended";
   }
 
-  const totalMinutes = Math.floor(diffMs / 60000);
+  const totalSeconds = Math.floor(diffMs / 1000);
+  const totalMinutes = Math.floor(totalSeconds / 60);
   const totalHours = Math.floor(totalMinutes / 60);
   const days = Math.floor(totalHours / 24);
   const hours = totalHours % 24;
   const minutes = totalMinutes % 60;
+  const seconds = totalSeconds % 60;
+
+  // Under 1 minute: show seconds
+  if (totalMinutes === 0) {
+    return `${seconds}s remaining`;
+  }
 
   const parts: string[] = [];
   if (days > 0) parts.push(`${days}d`);
   if (hours > 0) parts.push(`${hours}h`);
   if (minutes > 0 && days === 0) parts.push(`${minutes}m`);
-
-  if (parts.length === 0) return "< 1 minute";
 
   return parts.join(" ") + " remaining";
 }

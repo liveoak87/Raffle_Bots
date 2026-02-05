@@ -390,6 +390,14 @@ export function getExpiredOpenRaffles(): Raffle[] {
     .all() as Raffle[];
 }
 
+export function getOpenRafflesWithEndTime(): Raffle[] {
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffles WHERE status = 'open' AND ends_at IS NOT NULL AND message_id IS NOT NULL AND ends_at > datetime('now')"
+    )
+    .all() as Raffle[];
+}
+
 // --- Templates ---
 
 export function createTemplate(input: {

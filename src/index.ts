@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Bot } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 import { initDatabase } from "./database";
 import * as db from "./database";
 import {
@@ -26,6 +26,7 @@ import {
   notifyWinnersAndCreator,
 } from "./commands";
 import {
+  formatRaffleMessage,
   formatWinnersMessage,
   escapeHtml,
   getUserDisplayName,
@@ -281,6 +282,40 @@ async function checkExpiredRaffles(): Promise<void> {
   }
 }
 
+// --- Refresh countdowns on active raffle posts ---
+const COUNTDOWN_REFRESH_INTERVAL = 60_000; // 1 minute
+
+async function refreshCountdowns(): Promise<void> {
+  try {
+    const raffles = db.getOpenRafflesWithEndTime();
+    for (const raffle of raffles) {
+      if (!raffle.message_id) continue;
+
+      const count = db.getEntryCount(raffle.id);
+      const lang = db.getChatLanguage(raffle.chat_id);
+
+      const keyboard = new InlineKeyboard()
+        .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+        .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+        .row()
+        .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+
+      try {
+        await bot.api.editMessageText(
+          raffle.chat_id,
+          raffle.message_id,
+          formatRaffleMessage(raffle, count),
+          { parse_mode: "HTML", reply_markup: keyboard }
+        );
+      } catch {
+        // Message unchanged or deleted — ignore
+      }
+    }
+  } catch (err) {
+    console.error("Error refreshing countdowns:", err);
+  }
+}
+
 // --- Auto-purge completed raffle data ---
 const PURGE_CHECK_INTERVAL = 60 * 60 * 1000; // check every hour
 
@@ -336,7 +371,6 @@ async function checkRecurringTemplates(): Promise<void> {
       });
 
       try {
-        const { InlineKeyboard } = await import("grammy");
         const recLang = db.getChatLanguage(template.chat_id);
         const keyboard = new InlineKeyboard()
           .text(`🎟 ${t(recLang, "btn.enter")}`, `enter_${raffle.id}`)
@@ -344,7 +378,6 @@ async function checkRecurringTemplates(): Promise<void> {
           .row()
           .text(`👥 ${t(recLang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-        const { formatRaffleMessage } = await import("./helpers");
         const msg = await bot.api.sendMessage(
           template.chat_id,
           formatRaffleMessage(raffle, 0),
@@ -439,6 +472,9 @@ async function main(): Promise<void> {
 
   // Start expiry checker
   setInterval(checkExpiredRaffles, EXPIRY_CHECK_INTERVAL);
+
+  // Start countdown refresh
+  setInterval(refreshCountdowns, COUNTDOWN_REFRESH_INTERVAL);
 
   // Start recurring template checker
   setInterval(checkRecurringTemplates, RECURRING_CHECK_INTERVAL);

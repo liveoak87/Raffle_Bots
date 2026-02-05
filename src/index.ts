@@ -347,6 +347,9 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
 async function refreshCountdowns(): Promise<void> {
   try {
     const raffles = db.getOpenRafflesWithEndTime();
+    if (raffles.length > 0) {
+      console.log(`Refreshing countdown for ${raffles.length} active raffle(s)`);
+    }
     let hasUrgent = false;
 
     for (const raffle of raffles) {
@@ -556,6 +559,7 @@ async function main(): Promise<void> {
 
   // Start countdown refresh
   setInterval(refreshCountdowns, COUNTDOWN_REFRESH_INTERVAL);
+  console.log("Countdown refresh active: every 60s, per-second in final 30s");
 
   // Start recurring template checker
   setInterval(checkRecurringTemplates, RECURRING_CHECK_INTERVAL);

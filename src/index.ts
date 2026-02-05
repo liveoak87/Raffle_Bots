@@ -517,19 +517,11 @@ async function main(): Promise<void> {
   await bot.api.setMyCommands([
     { command: "newraffle", description: "Create a new raffle" },
     { command: "raffles", description: "List open raffles" },
-    { command: "draw", description: "Draw winners for a raffle" },
-    { command: "cancelraffle", description: "Cancel a raffle" },
-    { command: "myentries", description: "See your active entries" },
-    { command: "rafflehistory", description: "View past raffles" },
-    { command: "exportentries", description: "Export participant list" },
-    { command: "rerun", description: "Re-run a raffle with same participants" },
-    { command: "savetemplate", description: "Save a reusable raffle template" },
-    { command: "templates", description: "List saved templates" },
-    { command: "usetemplate", description: "Create raffle from template" },
-    { command: "recurring", description: "Toggle recurring raffles" },
+    { command: "draw", description: "Draw winners" },
+    { command: "templates", description: "Manage raffle templates" },
     { command: "editraffle", description: "Edit an active raffle" },
-    { command: "language", description: "Set bot language" },
-    { command: "help", description: "Show help message" },
+    { command: "myentries", description: "See your active entries" },
+    { command: "help", description: "Show help" },
   ]);
 
   // Start expiry checker

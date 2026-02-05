@@ -125,6 +125,51 @@ export async function handleStartDeepLink(
   ctx: Context,
   payload: string
 ): Promise<boolean> {
+  // --- Template creation deep link: /start tmpl_CHATID ---
+  const tmplMatch = payload.match(/^tmpl_(-?\d+)$/);
+  if (tmplMatch) {
+    const groupChatId = parseInt(tmplMatch[1], 10);
+    const userId = ctx.from!.id;
+
+    try {
+      const member = await ctx.api.getChatMember(groupChatId, userId);
+      if (member.status !== "administrator" && member.status !== "creator") {
+        await ctx.reply("You must be an admin in that group to create templates.");
+        return true;
+      }
+    } catch {
+      await ctx.reply("I couldn't verify your admin status in that group.");
+      return true;
+    }
+
+    let groupTitle = "the group";
+    try {
+      const chat = await ctx.api.getChat(groupChatId);
+      if ("title" in chat) {
+        groupTitle = chat.title || groupTitle;
+      }
+    } catch {}
+
+    templateWizards.set(userId, {
+      step: "name",
+      targetChatId: groupChatId,
+      targetChatTitle: groupTitle,
+      dmChatId: ctx.chat!.id,
+      userId,
+      createdAt: Date.now(),
+    });
+
+    await ctx.reply(
+      `📋 <b>Create a Template</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
+        `Step 1 of 5: What's the <b>template name</b>?\n\n` +
+        `<i>This is a short name to recall it later (e.g. "Weekly" or "Daily Prize").\nType /cancel to stop.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    return true;
+  }
+
+  // --- Raffle creation deep link: /start newraffle_CHATID ---
   const match = payload.match(/^newraffle_(-?\d+)$/);
   if (!match) return false;
 

@@ -12,7 +12,7 @@ import {
   parseEndTime,
   replyPrivately,
 } from "./helpers";
-import { startWizard, handleStartDeepLink, startEditWizard, startTemplateWizard } from "./wizard";
+import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendBanner, sendWheelSpin } from "./banners";
 
@@ -45,19 +45,11 @@ export async function handleStart(ctx: Context): Promise<void> {
       `<b>Commands:</b>\n` +
       `/newraffle - Create a new raffle\n` +
       `/raffles - List open raffles\n` +
-      `/draw - Draw winners for a raffle\n` +
-      `/cancelraffle - Cancel a raffle\n` +
-      `/myentries - See your active entries\n` +
-      `/rafflehistory - View past raffles\n` +
-      `/exportentries - Export participant list\n` +
-      `/rerun - Re-run a raffle with same participants\n` +
-      `/savetemplate - Save a reusable template\n` +
-      `/templates - List saved templates\n` +
-      `/usetemplate - Create raffle from template\n` +
-      `/recurring - Toggle recurring raffles\n` +
+      `/draw - Draw winners\n` +
+      `/templates - Manage raffle templates\n` +
       `/editraffle - Edit an active raffle\n` +
-      `/language - Set bot language\n` +
-      `/help - Show this help message\n\n` +
+      `/myentries - See your active entries\n` +
+      `/help - Show detailed help\n\n` +
       `Add me to a group to get started!`,
     { parse_mode: "HTML" }
   );
@@ -90,17 +82,13 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• 💎 Sponsor\n` +
       `• 📌 Auto-pin raffle message\n\n` +
       `<b>Templates:</b>\n` +
-      `/savetemplate - Save a reusable raffle config\n` +
-      `/templates - List saved templates\n` +
-      `/usetemplate Name - Create raffle from template\n` +
-      `/deletetemplate Name - Delete a template\n` +
-      `/recurring Name on/off - Toggle recurring raffles\n\n` +
+      `/templates - Create, use, delete & manage templates\n\n` +
       `<b>Management:</b>\n` +
       `/draw [id] - Draw winners (admin only)\n` +
       `/editraffle [id] - Edit an active raffle (admin only)\n` +
       `/cancelraffle [id] - Cancel a raffle (admin only)\n` +
       `/exportentries [id] - Export all participants (admin only)\n` +
-      `/rerun [id] - Re-run a past raffle with same participants (admin only)\n` +
+      `/rerun [id] - Re-run a past raffle (admin only)\n` +
       `/language [code] - Set bot language (admin only)\n` +
       `/raffles - List open raffles in this chat\n` +
       `/rafflehistory - View recent raffle history\n` +
@@ -905,6 +893,10 @@ async function buildTemplateHub(
 ): Promise<void> {
   const templates = db.getTemplatesForChat(chatId);
 
+  // Get bot username for deep-link URL
+  const botInfo = await ctx.api.getMe();
+  const botUsername = botInfo.username || "bot";
+
   const keyboard = new InlineKeyboard();
   for (const tmpl of templates.slice(0, 10)) {
     let label = tmpl.name;
@@ -912,7 +904,8 @@ async function buildTemplateHub(
     keyboard.text(label, `tmpl_pick_${tmpl.id}`);
     keyboard.row();
   }
-  keyboard.text("➕ Create New", "tmpl_create");
+  // Deep-link URL button — opens DM and starts template wizard immediately
+  keyboard.url("➕ Create New", `https://t.me/${botUsername}?start=tmpl_${chatId}`);
   keyboard.row();
   keyboard.text("❌ Close", "tmpl_cancel");
 
@@ -958,56 +951,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // --- Start template creation wizard ---
-  if (data === "tmpl_create") {
-    await ctx.answerCallbackQuery();
-
-    // Delete the hub message
-    try {
-      await ctx.deleteMessage();
-    } catch {}
-
-    // Get group title
-    let groupTitle = "the group";
-    try {
-      const chat = await ctx.api.getChat(chatId);
-      if ("title" in chat) groupTitle = chat.title || groupTitle;
-    } catch {}
-
-    // Start the DM wizard
-    const started = await startTemplateWizard(
-      ctx.api,
-      ctx.from.id,
-      chatId,
-      groupTitle
-    );
-
-    if (started) {
-      const notice = await ctx.api.sendMessage(
-        chatId,
-        `📋 Check your DMs @${ctx.from.username || ctx.from.first_name} — template setup is there.`
-      );
-      setTimeout(async () => {
-        try {
-          await ctx.api.deleteMessage(chatId, notice.message_id);
-        } catch {}
-      }, 5000);
-    } else {
-      // Can't DM user — show fallback
-      const botInfo = await ctx.api.getMe();
-      const keyboard = new InlineKeyboard().url(
-        "Start a DM with me",
-        `https://t.me/${botInfo.username}?start=help`
-      );
-      await ctx.api.sendMessage(
-        chatId,
-        `I need to set up the template in a private message.\n\n` +
-          `Tap below to start a DM with me, then try again.`,
-        { reply_markup: keyboard }
-      );
-    }
-    return;
-  }
+  // tmpl_create is no longer a callback — it's now a URL deep-link button
 
   // --- Pick a template (action menu) ---
   if (data.startsWith("tmpl_pick_")) {

@@ -559,6 +559,77 @@ bot.on("inline_query", async (ctx) => {
   }
 });
 
+// --- Welcome DM when bot is added to a new group ---
+bot.on("my_chat_member", async (ctx) => {
+  const update = ctx.myChatMember;
+  if (!update) return;
+
+  const oldStatus = update.old_chat_member.status;
+  const newStatus = update.new_chat_member.status;
+
+  // Only trigger when bot was NOT in the group and is now a member/admin
+  const wasOut = oldStatus === "left" || oldStatus === "kicked";
+  const isIn = newStatus === "member" || newStatus === "administrator";
+  if (!wasOut || !isIn) return;
+
+  const addedBy = update.from;
+  if (!addedBy) return;
+
+  const chatTitle = "title" in update.chat ? update.chat.title || "your group" : "your group";
+
+  console.log(
+    `Bot added to group "${chatTitle}" (${update.chat.id}) by user ${addedBy.id} (${addedBy.first_name})`
+  );
+
+  // Build the welcome / feature overview message
+  const welcomeMsg =
+    `🎟 <b>Thanks for adding Raffle Bot to ${escapeHtml(chatTitle)}!</b>\n\n` +
+    `Here's everything I can do:\n\n` +
+    `<b>🎰 Raffle Creation</b>\n` +
+    `• Interactive wizard — step-by-step in your DMs\n` +
+    `• Quick inline: <code>/newraffle Title | Prize | ends:2h</code>\n` +
+    `• Multiple prizes per raffle (1st, 2nd, 3rd place)\n` +
+    `• Custom banner images per raffle\n` +
+    `• Delayed start & auto-close timers\n` +
+    `• Sponsor attribution on raffle posts\n\n` +
+    `<b>🏆 Drawing & Winners</b>\n` +
+    `• Animated wheel spin before revealing winners\n` +
+    `• Auto-draw when timer expires or max entries reached\n` +
+    `• Live countdown on raffle posts (per-second in final 30s)\n` +
+    `• 5-minute "ending soon" reminders\n` +
+    `• Winners & creator notified via DM\n\n` +
+    `<b>📋 Templates & Recurring</b>\n` +
+    `• Save raffle configs as reusable templates\n` +
+    `• One-tap template hub: /templates\n` +
+    `• Recurring raffles on a schedule (hourly, daily, weekly)\n\n` +
+    `<b>🛡 Entry Verification</b>\n` +
+    `• Require Telegram username\n` +
+    `• Minimum account age filter\n` +
+    `• Winner cooldown (exclude recent winners)\n\n` +
+    `<b>📊 Management Tools</b>\n` +
+    `• /editraffle — edit active raffles live\n` +
+    `• /rerun — re-run a past raffle with same participants\n` +
+    `• /exportentries — export participant list as CSV\n` +
+    `• /groupstats — view raffle stats for your group\n` +
+    `• /rafflehistory — browse past raffles\n\n` +
+    `<b>🌐 Multi-Language</b>\n` +
+    `• English, Español, Português, Русский, Français, Deutsch\n` +
+    `• Set with /language\n\n` +
+    `<b>🚀 Get started:</b> Type /newraffle in ${escapeHtml(chatTitle)} to create your first raffle!\n\n` +
+    `Questions or bugs? Use /bugreport to send feedback.`;
+
+  // Try to DM the person who added the bot
+  try {
+    await ctx.api.sendMessage(addedBy.id, welcomeMsg, { parse_mode: "HTML" });
+  } catch {
+    // User hasn't started a DM with the bot — can't message them.
+    // That's fine, they'll discover features via /help.
+    console.log(
+      `Could not DM user ${addedBy.id} (${addedBy.first_name}) — they haven't started the bot.`
+    );
+  }
+});
+
 // --- Error handling ---
 bot.catch((err) => {
   console.error("Bot error:", err);

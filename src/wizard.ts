@@ -2068,7 +2068,8 @@ async function sendBugReportToOwner(
     await ctx.reply(
       `✅ Bug report sent! Thank you for the feedback.`
     );
-  } catch {
+  } catch (err) {
+    console.error(`Failed to send bug report to owner (${ownerId}):`, err);
     await ctx.reply("Failed to send bug report. Please try again later.");
   }
 

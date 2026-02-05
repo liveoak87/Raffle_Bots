@@ -27,6 +27,7 @@ import {
   handleLanguage,
   handleStats,
   handleGroupStats,
+  handleBugReport,
   notifyWinnersAndCreator,
 } from "./commands";
 import {
@@ -54,6 +55,10 @@ import {
   handleTmplWinnersCallback,
   handleTmplTimeCallback,
   handleTmplOptionsCallback,
+  getActiveBugReport,
+  handleBugReportMessage,
+  handleBugReportPhoto,
+  handleBugReportSkip,
 } from "./wizard";
 import { sendBanner, sendWheelSpin } from "./banners";
 
@@ -123,6 +128,7 @@ bot.command("editraffle", handleEditRaffle);
 bot.command("language", handleLanguage);
 bot.command("stats", handleStats);
 bot.command("groupstats", handleGroupStats);
+bot.command("bugreport", handleBugReport);
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -142,6 +148,9 @@ bot.callbackQuery(/^rerun_/, handleRerunCallback);
 
 // --- Template hub callback queries ---
 bot.callbackQuery(/^tmpl_/, handleTemplateCallback);
+
+// --- Bug report callback ---
+bot.callbackQuery("bugreport_skip", handleBugReportSkip);
 
 // --- Template wizard callback queries ---
 bot.callbackQuery(/^twiz_winners_\d+$/, handleTmplWinnersCallback);
@@ -164,6 +173,13 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  // Check if user has an active bug report
+  const bugState = getActiveBugReport(ctx.from.id);
+  if (bugState) {
+    await handleBugReportMessage(ctx);
+    return;
+  }
+
   // Check if user has an active template wizard
   const tmplState = getActiveTemplateWizard(ctx.from.id);
   if (tmplState) {
@@ -178,11 +194,19 @@ bot.on("message:text", async (ctx) => {
   await handleWizardMessage(ctx);
 });
 
-// --- Handle photo messages (for wizard image upload in DMs) ---
+// --- Handle photo messages (for wizard image upload or bug report in DMs) ---
 bot.on("message:photo", async (ctx) => {
   if (!ctx.from) return;
   if (ctx.chat.type !== "private") return;
 
+  // Bug report screenshot
+  const bugState = getActiveBugReport(ctx.from.id);
+  if (bugState) {
+    await handleBugReportPhoto(ctx);
+    return;
+  }
+
+  // Raffle wizard image
   const state = getActiveWizard(ctx.from.id);
   if (!state) return;
 
@@ -219,7 +243,7 @@ async function checkExpiredRaffles(): Promise<void> {
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
 
-        await sendBanner(bot.api, raffle.chat_id, "drawn", raffle.image_file_id);
+        await sendBanner(bot.api, raffle.chat_id, "drawn");
 
         // Only show wheel spin if raffle expired recently (within 2 minutes)
         const expiredAt = new Date(raffle.ends_at + "Z");
@@ -555,6 +579,7 @@ async function main(): Promise<void> {
     { command: "myentries", description: "See your active entries" },
     { command: "rafflehistory", description: "View past raffles" },
     { command: "groupstats", description: "View group raffle stats" },
+    { command: "bugreport", description: "Report a bug" },
     { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help" },
   ]);

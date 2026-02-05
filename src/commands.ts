@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendBanner, sendWheelSpin } from "./banners";
+import { sendBanner, sendCustomImage, sendWheelSpin } from "./banners";
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -396,7 +396,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const entryNames = entries.map((e) => e.user_display_name);
   const winners = db.selectWinners(raffle.id);
 
-  await sendBanner(ctx.api, ctx.chat!.id, "drawn", raffle.image_file_id);
+  await sendBanner(ctx.api, ctx.chat!.id, "drawn");
 
   // Wheel spin GIF animation (2+ entries for suspense)
   if (entryNames.length >= 2) {
@@ -467,7 +467,7 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
 
   db.closeRaffle(raffleId);
 
-  await sendBanner(ctx.api, ctx.chat!.id, "closed", raffle.image_file_id);
+  await sendBanner(ctx.api, ctx.chat!.id, "closed");
 
   await replyPrivately(ctx,
     `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
@@ -863,7 +863,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
 
     const rerunLang = db.getChatLanguage(chatId);
 
-    await sendBanner(ctx.api, chatId, "open", newRaffle.image_file_id);
+    await sendBanner(ctx.api, chatId, "open");
 
     const raffleKeyboard = new InlineKeyboard()
       .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
@@ -882,6 +882,11 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     );
 
     db.updateRaffleMessageId(newRaffle.id, msg.message_id);
+
+    // Send custom image below the raffle post
+    if (newRaffle.image_file_id) {
+      await sendCustomImage(ctx.api, chatId, newRaffle.image_file_id);
+    }
   }
 }
 
@@ -1764,7 +1769,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffleId);
 
-        await sendBanner(ctx.api, raffle.chat_id, "drawn", raffle.image_file_id);
+        await sendBanner(ctx.api, raffle.chat_id, "drawn");
 
         // Wheel spin GIF animation
         if (entryNames.length >= 2) {
@@ -2082,6 +2087,46 @@ export async function handleGroupStats(ctx: Context): Promise<void> {
   }
 
   await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+}
+
+// /bugreport — Start a bug report (works anywhere)
+export async function handleBugReport(ctx: Context): Promise<void> {
+  if (!ctx.from) return;
+
+  const { startBugReport } = await import("./wizard");
+
+  const chatId = ctx.chat?.id || ctx.from.id;
+  let chatTitle = "Direct Message";
+  if (ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup")) {
+    try {
+      const chat = await ctx.api.getChat(chatId);
+      if ("title" in chat) chatTitle = chat.title || chatTitle;
+    } catch {}
+  }
+
+  const started = await startBugReport(ctx, chatId, chatTitle);
+  if (started) {
+    if (ctx.chat?.type !== "private") {
+      const notice = await ctx.reply(
+        `📋 Check your DMs @${ctx.from.username || ctx.from.first_name} — bug report form is there.`
+      );
+      setTimeout(async () => {
+        try {
+          await ctx.api.deleteMessage(chatId, notice.message_id);
+        } catch {}
+      }, 5000);
+    }
+  } else {
+    const botInfo = await ctx.api.getMe();
+    const kb = new InlineKeyboard().url(
+      "Start a DM with me",
+      `https://t.me/${botInfo.username}?start=help`
+    );
+    await ctx.reply(
+      `I need to collect your bug report in a DM.\n\nTap below to start a conversation with me, then try /bugreport again.`,
+      { reply_markup: kb }
+    );
+  }
 }
 
 // Re-export for use in index.ts auto-draw

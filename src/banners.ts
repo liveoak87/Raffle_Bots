@@ -20,8 +20,7 @@ function getAssetPath(filename: string): string {
 
 /**
  * Send a branded banner image to a chat.
- *
- * Priority: customImageFileId > cached file_id > local file upload.
+ * Always sends the branded banner (never overridden by custom images).
  * Returns the message_id of the sent photo, or null on failure.
  * Failures are non-fatal — the raffle still posts as text.
  */
@@ -37,20 +36,9 @@ export async function sendBanner(
     }>;
   },
   chatId: number,
-  bannerType: BannerType,
-  customImageFileId?: string | null
+  bannerType: BannerType
 ): Promise<number | null> {
-  // 1. Custom per-raffle image takes priority
-  if (customImageFileId) {
-    try {
-      const msg = await api.sendPhoto(chatId, customImageFileId);
-      return msg.message_id;
-    } catch {
-      // Custom image failed — fall through to default banner
-    }
-  }
-
-  // 2. Try cached Telegram file_id (fast, no re-upload)
+  // 1. Try cached Telegram file_id (fast, no re-upload)
   const cachedFileId = getCachedBannerFileId(bannerType);
   if (cachedFileId) {
     try {
@@ -61,7 +49,7 @@ export async function sendBanner(
     }
   }
 
-  // 3. Upload from local file and cache the resulting file_id
+  // 2. Upload from local file and cache the resulting file_id
   const filePath = getAssetPath(BANNER_FILES[bannerType]);
   try {
     const msg = await api.sendPhoto(chatId, new InputFile(filePath));
@@ -76,6 +64,30 @@ export async function sendBanner(
       `Failed to send ${bannerType} banner to chat ${chatId}:`,
       err
     );
+    return null;
+  }
+}
+
+/**
+ * Send a custom raffle image below the raffle post.
+ * Non-fatal — if it fails, the raffle is still fine.
+ */
+export async function sendCustomImage(
+  api: {
+    sendPhoto: (
+      chatId: number,
+      photo: string | InputFile,
+      opts?: Record<string, unknown>
+    ) => Promise<{ message_id: number }>;
+  },
+  chatId: number,
+  imageFileId: string
+): Promise<number | null> {
+  try {
+    const msg = await api.sendPhoto(chatId, imageFileId);
+    return msg.message_id;
+  } catch (err) {
+    console.error(`Failed to send custom image to chat ${chatId}:`, err);
     return null;
   }
 }

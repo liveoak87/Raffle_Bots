@@ -10,7 +10,7 @@ import {
   formatCountdown,
 } from "./helpers";
 import { t } from "./i18n";
-import { sendBanner } from "./banners";
+import { sendBanner, sendCustomImage } from "./banners";
 
 interface WizardState {
   step:
@@ -804,8 +804,8 @@ async function createRaffleFromWizard(
 
   cancelWizard(state.userId);
 
-  // Send branded banner (or custom image if one was uploaded)
-  await sendBanner(ctx.api, state.targetChatId, "open", raffle.image_file_id);
+  // Send branded banner
+  await sendBanner(ctx.api, state.targetChatId, "open");
 
   const lang = db.getChatLanguage(state.targetChatId);
   const keyboard = new InlineKeyboard()
@@ -834,6 +834,11 @@ async function createRaffleFromWizard(
     } catch {
       // Bot may not have pin permission
     }
+  }
+
+  // Send custom image below the raffle post
+  if (raffle.image_file_id) {
+    await sendCustomImage(ctx.api, state.targetChatId, raffle.image_file_id);
   }
 
   await ctx.reply(
@@ -1901,4 +1906,171 @@ async function createTemplateFromWizard(
       throw err;
     }
   }
+}
+
+// ===================================================================
+// BUG REPORT — DM-based bug report flow
+// ===================================================================
+
+interface BugReportState {
+  step: "description" | "screenshot";
+  userId: number;
+  userName: string;
+  fromChatId: number;
+  fromChatTitle: string;
+  description?: string;
+  createdAt: number;
+}
+
+const bugReports = new Map<number, BugReportState>();
+
+export function getActiveBugReport(userId: number): BugReportState | null {
+  const state = bugReports.get(userId);
+  if (!state) return null;
+  if (Date.now() - state.createdAt > WIZARD_TIMEOUT) {
+    bugReports.delete(userId);
+    return null;
+  }
+  return state;
+}
+
+function cancelBugReport(userId: number): void {
+  bugReports.delete(userId);
+}
+
+export async function startBugReport(
+  ctx: Context,
+  fromChatId: number,
+  fromChatTitle: string
+): Promise<boolean> {
+  const userId = ctx.from!.id;
+  const userName = ctx.from!.username
+    ? `@${ctx.from!.username}`
+    : getUserDisplayName(ctx.from!.first_name, ctx.from!.last_name);
+
+  try {
+    await ctx.api.sendMessage(
+      userId,
+      `🐛 <b>Bug Report</b>\n\n` +
+        `Describe the issue you encountered:\n\n` +
+        `<i>Be as specific as possible — what were you doing, what happened, what did you expect?\nType /cancel to stop.</i>`,
+      { parse_mode: "HTML" }
+    );
+
+    bugReports.set(userId, {
+      step: "description",
+      userId,
+      userName,
+      fromChatId,
+      fromChatTitle,
+      createdAt: Date.now(),
+    });
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function handleBugReportMessage(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.text) return false;
+
+  const state = getActiveBugReport(ctx.from.id);
+  if (!state) return false;
+
+  const text = ctx.message.text.trim();
+
+  if (text.toLowerCase() === "/cancel") {
+    cancelBugReport(ctx.from.id);
+    await ctx.reply("Bug report cancelled.");
+    return true;
+  }
+
+  if (text.startsWith("/")) return false;
+
+  if (state.step === "description") {
+    state.description = text;
+    state.step = "screenshot";
+
+    const kb = new InlineKeyboard()
+      .text("📷 Skip — Send Report", "bugreport_skip");
+
+    await ctx.reply(
+      `Got it. Want to attach a <b>screenshot</b>?\n\n` +
+        `Send a photo now, or tap below to skip and submit.`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+    return true;
+  }
+
+  return false;
+}
+
+export async function handleBugReportPhoto(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.photo) return false;
+
+  const state = getActiveBugReport(ctx.from.id);
+  if (!state || state.step !== "screenshot") return false;
+
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+
+  await sendBugReportToOwner(ctx, state, largest.file_id);
+  return true;
+}
+
+export async function handleBugReportSkip(ctx: Context): Promise<void> {
+  if (!ctx.from) return;
+
+  const state = getActiveBugReport(ctx.from.id);
+  if (!state) {
+    await ctx.answerCallbackQuery({ text: "No active bug report.", show_alert: true });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+  try { await ctx.deleteMessage(); } catch {}
+
+  await sendBugReportToOwner(ctx, state, null);
+}
+
+async function sendBugReportToOwner(
+  ctx: Context,
+  state: BugReportState,
+  photoFileId: string | null
+): Promise<void> {
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+
+  if (ownerId === 0) {
+    await ctx.reply("Bug report system is not configured. Sorry!");
+    cancelBugReport(state.userId);
+    return;
+  }
+
+  const reportText =
+    `🐛 <b>Bug Report</b>\n\n` +
+    `<b>From:</b> ${escapeHtml(state.userName)} (ID: <code>${state.userId}</code>)\n` +
+    `<b>Group:</b> ${escapeHtml(state.fromChatTitle)} (<code>${state.fromChatId}</code>)\n\n` +
+    `<b>Description:</b>\n${escapeHtml(state.description || "(no description)")}`;
+
+  try {
+    if (photoFileId) {
+      await ctx.api.sendPhoto(ownerId, photoFileId, {
+        caption: reportText,
+        parse_mode: "HTML",
+      });
+    } else {
+      await ctx.api.sendMessage(ownerId, reportText, {
+        parse_mode: "HTML",
+      });
+    }
+
+    await ctx.reply(
+      `✅ Bug report sent! Thank you for the feedback.`
+    );
+  } catch {
+    await ctx.reply("Failed to send bug report. Please try again later.");
+  }
+
+  cancelBugReport(state.userId);
 }

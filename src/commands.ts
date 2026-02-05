@@ -16,6 +16,19 @@ import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendBanner, sendWheelSpin } from "./banners";
 
+/** Format a duration in ms to a human-readable string like "2h 30m" */
+function formatDurationHuman(ms: number): string {
+  const totalMinutes = Math.round(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  return parts.length > 0 ? parts.join(" ") : "< 1m";
+}
+
 // /start - Welcome message (works in private chat)
 export async function handleStart(ctx: Context): Promise<void> {
   // Check for deep link payload (e.g., /start newraffle_-1001234567890)
@@ -677,6 +690,17 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       ? (JSON.parse(sourceRaffle.prizes) as string[]).map((p) => escapeHtml(p)).join(", ")
       : escapeHtml(sourceRaffle.prize);
 
+    // Calculate original duration for display
+    let timerLine = `⏰ <b>Timer:</b> No time limit\n`;
+    if (sourceRaffle.ends_at && sourceRaffle.created_at) {
+      const durationMs =
+        new Date(sourceRaffle.ends_at + "Z").getTime() -
+        new Date(sourceRaffle.created_at + "Z").getTime();
+      if (durationMs > 0) {
+        timerLine = `⏰ <b>Timer:</b> ${formatDurationHuman(durationMs)}\n`;
+      }
+    }
+
     await ctx.answerCallbackQuery();
 
     const keyboard = new InlineKeyboard()
@@ -689,6 +713,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
         `🎁 <b>Prize:</b> ${prizes}\n` +
         `🏆 <b>Winners:</b> ${sourceRaffle.max_winners}\n` +
         `👥 <b>Entries to copy:</b> ${entryCount}\n` +
+        timerLine +
         (sourceRaffle.sponsor_name ? `💎 <b>Sponsor:</b> ${escapeHtml(sourceRaffle.sponsor_name)}\n` : "") +
         `\n<i>A new open raffle will be created with all ${entryCount} participants pre-entered.</i>`,
       { parse_mode: "HTML", reply_markup: keyboard }
@@ -757,6 +782,22 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       ctx.from.last_name
     );
 
+    // Calculate ends_at using the same duration as the original raffle
+    let newEndsAt: string | null = null;
+    if (sourceRaffle.ends_at && sourceRaffle.created_at) {
+      const durationMs =
+        new Date(sourceRaffle.ends_at + "Z").getTime() -
+        new Date(sourceRaffle.created_at + "Z").getTime();
+      if (durationMs > 0) {
+        const newEnd = new Date(Date.now() + durationMs);
+        newEndsAt = newEnd
+          .toISOString()
+          .replace("T", " ")
+          .replace("Z", "")
+          .split(".")[0];
+      }
+    }
+
     // Create a new raffle with the same settings
     const newRaffle = db.createRaffle({
       chat_id: chatId,
@@ -768,14 +809,14 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       prizes: sourceRaffle.prizes,
       max_entries: null,
       max_winners: sourceRaffle.max_winners,
-      ends_at: null,
+      ends_at: newEndsAt,
       starts_at: null,
       required_chat_id: sourceRaffle.required_chat_id,
       required_chat_title: sourceRaffle.required_chat_title,
       sponsor_name: sourceRaffle.sponsor_name,
       anonymous: sourceRaffle.anonymous,
       image_file_id: sourceRaffle.image_file_id,
-      auto_pin: 0,
+      auto_pin: sourceRaffle.auto_pin,
     });
 
     // Copy all entries from the source raffle

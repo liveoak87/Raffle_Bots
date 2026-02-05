@@ -9,6 +9,7 @@ import {
   parseEndTime,
   formatCountdown,
 } from "./helpers";
+import { t } from "./i18n";
 
 interface WizardState {
   step:
@@ -635,15 +636,16 @@ async function createRaffleFromWizard(
     }
   }
 
+  const lang = db.getChatLanguage(state.targetChatId);
   const keyboard = new InlineKeyboard()
-    .text("🎟 Enter Raffle", `enter_${raffle.id}`)
-    .text("❌ Leave", `leave_${raffle.id}`)
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
-    .text(`👥 Entries (0)`, `entries_${raffle.id}`);
+    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
   const msg = await ctx.api.sendMessage(
     state.targetChatId,
-    formatRaffleMessage(raffle, 0),
+    formatRaffleMessage(raffle, 0, lang),
     {
       parse_mode: "HTML",
       reply_markup: keyboard,
@@ -1171,8 +1173,6 @@ async function updateRafflePostById(
   const count = db.getEntryCount(raffleId);
   const lang = db.getChatLanguage(chatId);
 
-  const { t } = await import("./i18n");
-
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
@@ -1183,7 +1183,7 @@ async function updateRafflePostById(
     await ctx.api.editMessageText(
       chatId,
       raffle.message_id,
-      formatRaffleMessage(raffle, count),
+      formatRaffleMessage(raffle, count, lang),
       { parse_mode: "HTML", reply_markup: keyboard }
     );
   } catch {}

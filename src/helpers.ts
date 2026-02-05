@@ -19,7 +19,7 @@ export function getUserDisplayName(
   return lastName ? `${firstName} ${lastName}` : firstName;
 }
 
-export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string {
+export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: string = "en"): string {
   const count = entryCount ?? getEntryCount(raffle.id);
   const maxStr = raffle.max_entries ? `/${raffle.max_entries}` : "";
   const prizes = parsePrizes(raffle);
@@ -32,46 +32,46 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
   }
 
   if (hasMultiplePrizes) {
-    msg += `🎁 <b>Prizes:</b>\n`;
+    msg += `🎁 <b>${t(lang, "raffle.prizes")}:</b>\n`;
     prizes.forEach((p, i) => {
       const label = getPositionLabel(i + 1);
       msg += `  ${label} ${escapeHtml(p)}\n`;
     });
   } else {
-    msg += `🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}\n`;
+    msg += `🎁 <b>${t(lang, "raffle.prize")}:</b> ${escapeHtml(prizes[0])}\n`;
   }
 
-  msg += `👥 <b>Entries:</b> ${count}${maxStr}\n`;
-  msg += `🏆 <b>Winners:</b> ${raffle.max_winners}\n`;
+  msg += `👥 <b>${t(lang, "raffle.entries")}:</b> ${count}${maxStr}\n`;
+  msg += `🏆 <b>${t(lang, "raffle.winners")}:</b> ${raffle.max_winners}\n`;
 
   if (raffle.ends_at) {
     const endsDate = new Date(raffle.ends_at + "Z");
-    msg += `⏰ <b>Ends:</b> ${formatCountdown(endsDate)}\n`;
+    msg += `⏰ <b>${t(lang, "raffle.ends")}:</b> ${formatCountdown(endsDate)}\n`;
   }
 
   if (raffle.starts_at) {
     const startsDate = new Date(raffle.starts_at + "Z");
     if (startsDate > new Date()) {
-      msg += `🕐 <b>Opens:</b> ${formatCountdown(startsDate).replace(" remaining", "")}\n`;
+      msg += `🕐 <b>${t(lang, "raffle.opens")}:</b> ${formatCountdown(startsDate).replace(" remaining", "")}\n`;
     }
   }
 
   if (raffle.anonymous) {
-    msg += `👁 <b>Entries:</b> Hidden until draw\n`;
+    msg += `👁 ${t(lang, "raffle.hidden_entries")}\n`;
   }
 
   if (raffle.sponsor_name) {
-    msg += `💎 <b>Sponsored by:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
+    msg += `💎 <b>${t(lang, "raffle.sponsored_by")}:</b> ${escapeHtml(raffle.sponsor_name)}\n`;
   }
 
-  msg += `\n<i>Created by ${escapeHtml(raffle.creator_name)}</i>`;
+  msg += `\n<i>${t(lang, "raffle.created_by")} ${escapeHtml(raffle.creator_name)}</i>`;
 
   if (raffle.status === "open") {
-    msg += `\n\n✅ Tap the button below to enter!`;
+    msg += `\n\n✅ ${t(lang, "raffle.enter_cta")}`;
   } else if (raffle.status === "closed") {
-    msg += `\n\n🚫 This raffle is closed.`;
+    msg += `\n\n🚫 ${t(lang, "raffle.closed")}`;
   } else if (raffle.status === "drawn") {
-    msg += `\n\n🎉 Winners have been drawn!`;
+    msg += `\n\n🎉 ${t(lang, "raffle.drawn")}`;
   }
 
   return msg;
@@ -79,17 +79,21 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number): string
 
 export function formatWinnersMessage(
   raffle: Raffle,
-  winners: RaffleWinner[]
+  winners: RaffleWinner[],
+  lang: string = "en"
 ): string {
   const prizes = parsePrizes(raffle);
   const hasMultiplePrizes = prizes.length > 1;
 
-  let msg = `🎉 <b>Raffle Drawn: ${escapeHtml(raffle.title)}</b>\n\n`;
+  let msg = `🎉 <b>${t(lang, "winner.title", { title: escapeHtml(raffle.title) })}</b>\n\n`;
 
   if (winners.length === 0) {
-    msg += `No entries were received. No winners selected.`;
+    msg += t(lang, "winner.no_entries");
   } else {
-    msg += `🏆 <b>Winner${winners.length > 1 ? "s" : ""}:</b>\n`;
+    const winnerLabel = winners.length > 1
+      ? t(lang, "winner.label_plural")
+      : t(lang, "winner.label");
+    msg += `🏆 <b>${winnerLabel}:</b>\n`;
     winners.forEach((w, i) => {
       const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
       if (hasMultiplePrizes) {
@@ -102,10 +106,10 @@ export function formatWinnersMessage(
     });
 
     if (!hasMultiplePrizes) {
-      msg += `\n🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}`;
+      msg += `\n🎁 <b>${t(lang, "raffle.prize")}:</b> ${escapeHtml(prizes[0])}`;
     }
 
-    msg += `\nCongratulations! 🥳`;
+    msg += `\n${t(lang, "winner.congrats_footer")} 🥳`;
   }
 
   return msg;

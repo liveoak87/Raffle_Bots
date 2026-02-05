@@ -33,7 +33,6 @@ import {
   sleep,
   performWheelSpin,
 } from "./helpers";
-import { parsePrizes } from "./types";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
 import {
@@ -213,13 +212,13 @@ async function checkExpiredRaffles(): Promise<void> {
               await bot.api.editMessageText(
                 raffle.chat_id,
                 spinMsgId,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
             } catch {
               await bot.api.sendMessage(
                 raffle.chat_id,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
             }
@@ -229,7 +228,7 @@ async function checkExpiredRaffles(): Promise<void> {
             try {
               await bot.api.sendMessage(
                 raffle.chat_id,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
               announced = true;
@@ -241,7 +240,7 @@ async function checkExpiredRaffles(): Promise<void> {
           try {
             await bot.api.sendMessage(
               raffle.chat_id,
-              formatWinnersMessage(raffle, winners),
+              formatWinnersMessage(raffle, winners, lang),
               { parse_mode: "HTML" }
             );
             announced = true;
@@ -266,26 +265,15 @@ async function checkExpiredRaffles(): Promise<void> {
         try {
           const updatedRaffle = db.getRaffleById(raffle.id);
           if (updatedRaffle) {
-            const prizes = parsePrizes(updatedRaffle);
-            let text = `🎟 <b>${escapeHtml(updatedRaffle.title)}</b>\n\n`;
+            let text = formatRaffleMessage(updatedRaffle, entryCount, lang);
 
-            if (prizes.length > 1) {
-              text += `🎁 <b>Prizes:</b>\n`;
-              prizes.forEach((p, i) => {
-                const label = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
-                text += `  ${label} ${escapeHtml(p)}\n`;
-              });
-            } else {
-              text += `🎁 <b>Prize:</b> ${escapeHtml(prizes[0])}\n`;
-            }
-
-            text += `👥 <b>Entries:</b> ${entryCount}\n`;
-            text += `\n🎉 This raffle has ended!`;
-
-            const winners = db.getWinnersForRaffle(raffle.id);
-            if (winners.length > 0) {
-              text += `\n\n🏆 <b>Winners:</b>\n`;
-              winners.forEach((w) => {
+            const drawnWinners = db.getWinnersForRaffle(raffle.id);
+            if (drawnWinners.length > 0) {
+              const winnerLabel = drawnWinners.length > 1
+                ? t(lang, "winner.label_plural")
+                : t(lang, "winner.label");
+              text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
+              drawnWinners.forEach((w) => {
                 const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
                 if (w.prize) {
                   text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
@@ -336,7 +324,7 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
     await bot.api.editMessageText(
       raffle.chat_id,
       raffle.message_id,
-      formatRaffleMessage(raffle, count),
+      formatRaffleMessage(raffle, count, lang),
       { parse_mode: "HTML", reply_markup: keyboard }
     );
   } catch {
@@ -464,7 +452,7 @@ async function checkRecurringTemplates(): Promise<void> {
 
         const msg = await bot.api.sendMessage(
           template.chat_id,
-          formatRaffleMessage(raffle, 0),
+          formatRaffleMessage(raffle, 0, recLang),
           { parse_mode: "HTML", reply_markup: keyboard }
         );
 

@@ -590,7 +590,7 @@ export function setChatLanguage(chatId: number, language: string): void {
 }
 
 export function getSupportedLanguages(): string[] {
-  return ["en", "es", "pt", "ru", "fr", "de", "ar", "zh"];
+  return ["en", "es", "pt", "ru", "fr", "de"];
 }
 
 // --- Utility ---

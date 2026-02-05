@@ -1,4 +1,4 @@
-import { InlineKeyboard } from "grammy";
+import { InlineKeyboard, InputFile } from "grammy";
 import type { Context } from "grammy";
 import * as db from "./database";
 import { parsePrizes } from "./types";
@@ -234,7 +234,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     .row()
     .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-  const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
+  const msg = await ctx.reply(formatRaffleMessage(raffle, 0, lang), {
     parse_mode: "HTML",
     reply_markup: keyboard,
   });
@@ -370,23 +370,23 @@ export async function handleDraw(ctx: Context): Promise<void> {
         await ctx.api.editMessageText(
           ctx.chat!.id,
           spinMsgId,
-          formatWinnersMessage(raffle, winners),
+          formatWinnersMessage(raffle, winners, lang),
           { parse_mode: "HTML" }
         );
       } catch {
         // Fallback: send separate message
-        await ctx.reply(formatWinnersMessage(raffle, winners), {
+        await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
           parse_mode: "HTML",
         });
       }
     } catch {
       // Wheel spin failed, just announce winners directly
-      await ctx.reply(formatWinnersMessage(raffle, winners), {
+      await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
         parse_mode: "HTML",
       });
     }
   } else {
-    await ctx.reply(formatWinnersMessage(raffle, winners), {
+    await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
       parse_mode: "HTML",
     });
   }
@@ -590,8 +590,6 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     return;
   }
 
-  const userId2 = ctx.from!.id;
-
   let msg = `📋 <b>Participants Export: ${escapeHtml(raffle.title)}</b>\n`;
   msg += `<b>Raffle ID:</b> ${raffle.id} | <b>Status:</b> ${raffle.status}\n`;
   msg += `<b>Total Entries:</b> ${entries.length}\n\n`;
@@ -619,7 +617,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
 
     const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
     try {
-      await ctx.api.sendDocument(userId2,
+      await ctx.api.sendDocument(userId,
         new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
         {
           caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nUse /rerun ${raffle.id} to create a new raffle with these same participants.`,
@@ -730,7 +728,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
     .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
 
   const msg = await ctx.reply(
-    formatRaffleMessage(newRaffle, added) +
+    formatRaffleMessage(newRaffle, added, rerunLang) +
       `\n\n🔄 <i>Re-run of raffle #${sourceId} with ${added} participants copied.</i>`,
     {
       parse_mode: "HTML",
@@ -1027,7 +1025,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     .row()
     .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-  const msg = await ctx.reply(formatRaffleMessage(raffle, 0), {
+  const msg = await ctx.reply(formatRaffleMessage(raffle, 0, lang), {
     parse_mode: "HTML",
     reply_markup: keyboard,
   });
@@ -1267,13 +1265,13 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
               await ctx.api.editMessageText(
                 raffle.chat_id,
                 spinMsgId,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
             } catch {
               await ctx.api.sendMessage(
                 raffle.chat_id,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
             }
@@ -1281,7 +1279,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
             try {
               await ctx.api.sendMessage(
                 raffle.chat_id,
-                formatWinnersMessage(raffle, winners),
+                formatWinnersMessage(raffle, winners, lang),
                 { parse_mode: "HTML" }
               );
             } catch {}
@@ -1290,7 +1288,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
           try {
             await ctx.api.sendMessage(
               raffle.chat_id,
-              formatWinnersMessage(raffle, winners),
+              formatWinnersMessage(raffle, winners, lang),
               { parse_mode: "HTML" }
             );
           } catch {}
@@ -1401,17 +1399,20 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
       await ctx.api.editMessageText(
         raffle.chat_id,
         raffle.message_id,
-        formatRaffleMessage(raffle, count),
+        formatRaffleMessage(raffle, count, lang),
         { parse_mode: "HTML", reply_markup: keyboard }
       );
     } else {
       // Raffle is closed or drawn - remove entry buttons
-      let text = formatRaffleMessage(raffle, count);
+      let text = formatRaffleMessage(raffle, count, lang);
 
       if (raffle.status === "drawn") {
         const winners = db.getWinnersForRaffle(raffleId);
         if (winners.length > 0) {
-          text += `\n\n🏆 <b>Winners:</b>\n`;
+          const winnerLabel = winners.length > 1
+            ? t(lang, "winner.label_plural")
+            : t(lang, "winner.label");
+          text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
           winners.forEach((w) => {
             const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
             if (w.prize) {
@@ -1509,6 +1510,3 @@ export async function notifyWinnersAndCreator(
 
 // Re-export for use in index.ts auto-draw
 export { updateRafflePost };
-
-// InputFile import for document sending
-import { InputFile } from "grammy";

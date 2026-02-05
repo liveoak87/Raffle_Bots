@@ -461,6 +461,21 @@ export function deleteTemplate(chatId: number, name: string): boolean {
   return result.changes > 0;
 }
 
+export function getTemplateById(
+  templateId: number
+): RaffleTemplate | undefined {
+  return getDb()
+    .prepare("SELECT * FROM raffle_templates WHERE id = ?")
+    .get(templateId) as RaffleTemplate | undefined;
+}
+
+export function deleteTemplateById(templateId: number): boolean {
+  const result = getDb()
+    .prepare("DELETE FROM raffle_templates WHERE id = ?")
+    .run(templateId);
+  return result.changes > 0;
+}
+
 export function setRecurringActive(
   templateId: number,
   active: boolean,

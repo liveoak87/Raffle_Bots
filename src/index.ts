@@ -22,6 +22,7 @@ import {
   handleDeleteTemplate,
   handleUseTemplate,
   handleRecurring,
+  handleTemplateCallback,
   handleEditRaffle,
   handleLanguage,
   handleStats,
@@ -131,6 +132,9 @@ bot.callbackQuery(/^edit_/, handleEditCallback);
 
 // --- Rerun callback queries ---
 bot.callbackQuery(/^rerun_/, handleRerunCallback);
+
+// --- Template hub callback queries ---
+bot.callbackQuery(/^tmpl_/, handleTemplateCallback);
 
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {

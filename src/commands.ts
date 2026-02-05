@@ -853,6 +853,371 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
   }
 }
 
+// ===================================================================
+// TEMPLATE HUB — Button-based template management
+// ===================================================================
+
+/** Format template details for preview */
+function formatTemplateSummary(tmpl: ReturnType<typeof db.getTemplateById>): string {
+  if (!tmpl) return "Template not found.";
+  let msg = "";
+  msg += `📝 <b>Title:</b> ${escapeHtml(tmpl.title)}\n`;
+  if (tmpl.prizes) {
+    try {
+      const prizes = JSON.parse(tmpl.prizes) as string[];
+      if (prizes.length > 1) {
+        msg += `🎁 <b>Prizes:</b> ${prizes.map((p) => escapeHtml(p)).join(", ")}\n`;
+      } else {
+        msg += `🎁 <b>Prize:</b> ${escapeHtml(tmpl.prize)}\n`;
+      }
+    } catch {
+      msg += `🎁 <b>Prize:</b> ${escapeHtml(tmpl.prize)}\n`;
+    }
+  } else {
+    msg += `🎁 <b>Prize:</b> ${escapeHtml(tmpl.prize)}\n`;
+  }
+  msg += `🏆 <b>Winners:</b> ${tmpl.max_winners}\n`;
+  if (tmpl.max_entries) {
+    msg += `👥 <b>Max entries:</b> ${tmpl.max_entries}\n`;
+  }
+  if (tmpl.duration_minutes) {
+    msg += `⏰ <b>Duration:</b> ${formatDurationHuman(tmpl.duration_minutes * 60000)}\n`;
+  }
+  if (tmpl.sponsor_name) {
+    msg += `💎 <b>Sponsor:</b> ${escapeHtml(tmpl.sponsor_name)}\n`;
+  }
+  if (tmpl.anonymous) {
+    msg += `👁 <b>Hidden entries:</b> On\n`;
+  }
+  if (tmpl.recurring_interval_minutes) {
+    const interval = formatDurationHuman(tmpl.recurring_interval_minutes * 60000);
+    msg += `🔄 <b>Recurring:</b> every ${interval}`;
+    msg += tmpl.recurring_active ? " (active)\n" : " (paused)\n";
+  }
+  return msg;
+}
+
+/** Build and show the template list hub (send new or edit existing message) */
+async function buildTemplateHub(
+  ctx: Context,
+  chatId: number,
+  edit: boolean = false
+): Promise<void> {
+  const templates = db.getTemplatesForChat(chatId);
+
+  const keyboard = new InlineKeyboard();
+  for (const tmpl of templates.slice(0, 10)) {
+    let label = tmpl.name;
+    if (tmpl.recurring_active) label += " 🔄";
+    keyboard.text(label, `tmpl_pick_${tmpl.id}`);
+    keyboard.row();
+  }
+  keyboard.text("➕ Create New", "tmpl_create");
+  keyboard.row();
+  keyboard.text("❌ Close", "tmpl_cancel");
+
+  const text =
+    templates.length > 0
+      ? `📋 <b>Templates (${templates.length})</b>\n\nTap a template to use, edit, or delete:`
+      : `📋 <b>Templates</b>\n\nNo templates saved yet. Tap below to create one:`;
+
+  if (edit) {
+    await ctx.editMessageText(text, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  } else {
+    await ctx.reply(text, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  }
+}
+
+/** Handle all tmpl_* callback queries */
+export async function handleTemplateCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return;
+
+  // --- Close hub ---
+  if (data === "tmpl_cancel") {
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+    return;
+  }
+
+  // --- Back to template list ---
+  if (data === "tmpl_back") {
+    await ctx.answerCallbackQuery();
+    await buildTemplateHub(ctx, chatId, true);
+    return;
+  }
+
+  // --- Show /savetemplate help ---
+  if (data === "tmpl_create") {
+    await ctx.answerCallbackQuery();
+    const keyboard = new InlineKeyboard().text("⬅️ Back", "tmpl_back");
+    await ctx.editMessageText(
+      `➕ <b>Create a Template</b>\n\n` +
+        `Use this format in the group chat:\n\n` +
+        `<code>/savetemplate Name | Title | Prize | winners:N | ends:30m</code>\n\n` +
+        `<b>Options (add after prize):</b>\n` +
+        `• <code>winners:N</code> — number of winners\n` +
+        `• <code>ends:30m</code> / <code>ends:2h</code> / <code>ends:1d</code> — duration\n` +
+        `• <code>sponsor:Name</code> — sponsor display name\n` +
+        `• <code>anonymous:on</code> — hide entry list\n` +
+        `• <code>recurring:6h</code> — auto-create interval`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  // --- Pick a template (action menu) ---
+  if (data.startsWith("tmpl_pick_")) {
+    const templateId = parseInt(data.replace("tmpl_pick_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    const keyboard = new InlineKeyboard()
+      .text("🚀 Use Template", `tmpl_use_${tmpl.id}`)
+      .row();
+
+    if (tmpl.recurring_interval_minutes) {
+      keyboard.text(
+        tmpl.recurring_active ? "⏸ Pause Recurring" : "🔄 Start Recurring",
+        `tmpl_recur_${tmpl.id}`
+      );
+      keyboard.row();
+    }
+
+    keyboard
+      .text("🗑 Delete", `tmpl_delete_${tmpl.id}`)
+      .text("⬅️ Back", "tmpl_back");
+
+    await ctx.editMessageText(
+      `📋 <b>Template: "${escapeHtml(tmpl.name)}"</b>\n\n` +
+        formatTemplateSummary(tmpl),
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  // --- Use template (confirmation screen) ---
+  if (data.startsWith("tmpl_use_confirm_")) {
+    const templateId = parseInt(data.replace("tmpl_use_confirm_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.answerCallbackQuery({ text: "Only admins can create raffles.", show_alert: true });
+      return;
+    }
+
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl || tmpl.chat_id !== chatId) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    // Delete the hub message
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+
+    // Create the raffle (reuses logic from handleUseTemplate)
+    const displayName = getUserDisplayName(ctx.from.first_name, ctx.from.last_name);
+
+    let endsAt: string | null = null;
+    if (tmpl.duration_minutes) {
+      const endDate = new Date(Date.now() + tmpl.duration_minutes * 60 * 1000);
+      endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+    }
+
+    const raffle = db.createRaffle({
+      chat_id: chatId,
+      creator_id: ctx.from.id,
+      creator_name: displayName,
+      title: tmpl.title,
+      description: "",
+      prize: tmpl.prize,
+      prizes: tmpl.prizes,
+      max_entries: tmpl.max_entries,
+      max_winners: tmpl.max_winners,
+      ends_at: endsAt,
+      starts_at: null,
+      required_chat_id: null,
+      required_chat_title: null,
+      sponsor_name: tmpl.sponsor_name,
+      anonymous: tmpl.anonymous,
+      image_file_id: null,
+      auto_pin: 0,
+    });
+
+    const lang = db.getChatLanguage(chatId);
+
+    await sendBanner(ctx.api, chatId, "open");
+
+    const raffleKeyboard = new InlineKeyboard()
+      .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+      .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+      .row()
+      .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+
+    const msg = await ctx.api.sendMessage(
+      chatId,
+      formatRaffleMessage(raffle, 0, lang),
+      { parse_mode: "HTML", reply_markup: raffleKeyboard }
+    );
+
+    db.updateRaffleMessageId(raffle.id, msg.message_id);
+    return;
+  }
+
+  if (data.startsWith("tmpl_use_")) {
+    const templateId = parseInt(data.replace("tmpl_use_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    const keyboard = new InlineKeyboard()
+      .text("✅ Create Raffle", `tmpl_use_confirm_${tmpl.id}`)
+      .row()
+      .text("⬅️ Back", `tmpl_pick_${tmpl.id}`);
+
+    await ctx.editMessageText(
+      `🚀 <b>Create raffle from "${escapeHtml(tmpl.name)}"?</b>\n\n` +
+        formatTemplateSummary(tmpl),
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  // --- Toggle recurring ---
+  if (data.startsWith("tmpl_recur_")) {
+    const templateId = parseInt(data.replace("tmpl_recur_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.answerCallbackQuery({ text: "Only admins can manage recurring.", show_alert: true });
+      return;
+    }
+
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl || !tmpl.recurring_interval_minutes) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+
+    if (tmpl.recurring_active) {
+      db.setRecurringActive(tmpl.id, false, null);
+      await ctx.answerCallbackQuery({ text: "Recurring paused." });
+    } else {
+      const nextRun = new Date(Date.now() + tmpl.recurring_interval_minutes * 60 * 1000);
+      const nextRunStr = nextRun.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      db.setRecurringActive(tmpl.id, true, nextRunStr);
+      await ctx.answerCallbackQuery({ text: "Recurring activated!" });
+    }
+
+    // Refresh the action menu with updated status
+    const updated = db.getTemplateById(templateId);
+    if (!updated) return;
+
+    const keyboard = new InlineKeyboard()
+      .text("🚀 Use Template", `tmpl_use_${updated.id}`)
+      .row();
+
+    if (updated.recurring_interval_minutes) {
+      keyboard.text(
+        updated.recurring_active ? "⏸ Pause Recurring" : "🔄 Start Recurring",
+        `tmpl_recur_${updated.id}`
+      );
+      keyboard.row();
+    }
+
+    keyboard
+      .text("🗑 Delete", `tmpl_delete_${updated.id}`)
+      .text("⬅️ Back", "tmpl_back");
+
+    await ctx.editMessageText(
+      `📋 <b>Template: "${escapeHtml(updated.name)}"</b>\n\n` +
+        formatTemplateSummary(updated),
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  // --- Delete confirmation ---
+  if (data.startsWith("tmpl_delete_yes_")) {
+    const templateId = parseInt(data.replace("tmpl_delete_yes_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
+    if (!isAdmin) {
+      await ctx.answerCallbackQuery({ text: "Only admins can delete templates.", show_alert: true });
+      return;
+    }
+
+    const tmpl = db.getTemplateById(templateId);
+    const name = tmpl ? tmpl.name : "template";
+
+    const deleted = db.deleteTemplateById(templateId);
+    if (deleted) {
+      await ctx.answerCallbackQuery({ text: `"${name}" deleted.` });
+    } else {
+      await ctx.answerCallbackQuery({ text: "Template already deleted.", show_alert: true });
+    }
+
+    // Return to hub
+    await buildTemplateHub(ctx, chatId, true);
+    return;
+  }
+
+  if (data.startsWith("tmpl_delete_")) {
+    const templateId = parseInt(data.replace("tmpl_delete_", ""), 10);
+    if (isNaN(templateId)) return;
+
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    const keyboard = new InlineKeyboard()
+      .text("🗑 Yes, Delete", `tmpl_delete_yes_${tmpl.id}`)
+      .text("⬅️ Cancel", `tmpl_pick_${tmpl.id}`);
+
+    await ctx.editMessageText(
+      `⚠️ <b>Delete template "${escapeHtml(tmpl.name)}"?</b>\n\n` +
+        `This cannot be undone.`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+}
+
 // /savetemplate - Save a raffle configuration as a reusable template
 export async function handleSaveTemplate(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {
@@ -998,35 +1363,21 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
   }
 }
 
-// /templates - List saved templates
+// /templates - Template management hub with inline buttons
 export async function handleTemplates(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {
     await ctx.reply("Use this command in a group chat.");
     return;
   }
 
-  const templates = db.getTemplatesForChat(ctx.chat.id);
-
-  if (templates.length === 0) {
-    await replyPrivately(ctx,
-      "No templates saved for this chat.\nUse /savetemplate to create one.");
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await ctx.reply("Only group admins can manage templates.");
     return;
   }
 
-  let msg = `📋 <b>Saved Templates (${templates.length})</b>\n\n`;
-  for (const t of templates) {
-    msg += `<b>${escapeHtml(t.name)}</b>\n`;
-    msg += `  📝 ${escapeHtml(t.title)} | 🎁 ${escapeHtml(t.prize)} | 🏆 ${t.max_winners}w\n`;
-    if (t.duration_minutes) msg += `  ⏰ ${t.duration_minutes}m`;
-    if (t.recurring_interval_minutes) {
-      msg += ` | 🔄 every ${t.recurring_interval_minutes}m`;
-      msg += t.recurring_active ? " (active)" : " (paused)";
-    }
-    if (t.duration_minutes || t.recurring_interval_minutes) msg += `\n`;
-    msg += `  → <code>/usetemplate ${escapeHtml(t.name)}</code>\n\n`;
-  }
-
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await buildTemplateHub(ctx, ctx.chat.id, false);
 }
 
 // /deletetemplate - Delete a saved template
@@ -1047,9 +1398,7 @@ export async function handleDeleteTemplate(ctx: Context): Promise<void> {
   const name = text.replace(/^\/deletetemplate(@\w+)?/i, "").trim();
 
   if (!name) {
-    await replyPrivately(ctx,
-      "Usage: <code>/deletetemplate TemplateName</code>",
-      { parse_mode: "HTML" });
+    await buildTemplateHub(ctx, ctx.chat.id, false);
     return;
   }
 
@@ -1083,9 +1432,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
   const name = text.replace(/^\/usetemplate(@\w+)?/i, "").trim();
 
   if (!name) {
-    await replyPrivately(ctx,
-      "Usage: <code>/usetemplate TemplateName</code>\n\nUse /templates to see saved templates.",
-      { parse_mode: "HTML" });
+    await buildTemplateHub(ctx, ctx.chat.id, false);
     return;
   }
 
@@ -1168,13 +1515,7 @@ export async function handleRecurring(ctx: Context): Promise<void> {
   const args = text.replace(/^\/recurring(@\w+)?/i, "").trim();
 
   if (!args) {
-    await replyPrivately(ctx,
-      `<b>Recurring Raffles</b>\n\n` +
-        `<code>/recurring TemplateName on</code> — Start recurring\n` +
-        `<code>/recurring TemplateName off</code> — Stop recurring\n\n` +
-        `The template must have a <code>recurring:TIME</code> interval set.\n` +
-        `Use <code>/templates</code> to see your saved templates.`,
-      { parse_mode: "HTML" });
+    await buildTemplateHub(ctx, ctx.chat.id, false);
     return;
   }
 

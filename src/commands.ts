@@ -623,100 +623,193 @@ export async function handleRerun(ctx: Context): Promise<void> {
     return;
   }
 
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/rerun(@\w+)?/i, "").trim();
+  const drawnRaffles = db
+    .getRecentRafflesForChat(ctx.chat.id, 20)
+    .filter((r) => r.status === "drawn" || r.status === "closed");
 
-  if (!args) {
-    const drawnRaffles = db
-      .getRecentRafflesForChat(ctx.chat.id, 20)
-      .filter((r) => r.status === "drawn" || r.status === "closed");
-    if (drawnRaffles.length === 0) {
-      await replyPrivately(ctx, "No completed raffles to re-run.");
+  if (drawnRaffles.length === 0) {
+    await ctx.reply("No completed raffles to re-run.");
+    return;
+  }
+
+  const keyboard = new InlineKeyboard();
+  for (const r of drawnRaffles.slice(0, 10)) {
+    const count = db.getEntryCount(r.id);
+    keyboard.text(
+      `${escapeHtml(r.title)} (${count} entries)`,
+      `rerun_pick_${r.id}`
+    );
+    keyboard.row();
+  }
+  keyboard.text("❌ Cancel", "rerun_cancel");
+
+  await ctx.reply(
+    `🔄 <b>Re-run a Raffle</b>\n\n` +
+      `Pick a completed raffle to re-run with the same participants:`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
+export async function handleRerunCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  // Cancel button
+  if (data === "rerun_cancel") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText("Re-run cancelled.");
+    return;
+  }
+
+  // Pick a raffle to preview
+  if (data.startsWith("rerun_pick_")) {
+    const sourceId = parseInt(data.replace("rerun_pick_", ""), 10);
+    if (isNaN(sourceId)) return;
+
+    const sourceRaffle = db.getRaffleById(sourceId);
+    if (!sourceRaffle) {
+      await ctx.answerCallbackQuery({ text: "Raffle not found.", show_alert: true });
       return;
     }
-    let msg = `Which raffle do you want to re-run?\n\n`;
-    for (const r of drawnRaffles) {
+
+    const entryCount = db.getEntryCount(sourceId);
+    const prizes = sourceRaffle.prizes
+      ? (JSON.parse(sourceRaffle.prizes) as string[]).map((p) => escapeHtml(p)).join(", ")
+      : escapeHtml(sourceRaffle.prize);
+
+    await ctx.answerCallbackQuery();
+
+    const keyboard = new InlineKeyboard()
+      .text("✅ Re-run This Raffle", `rerun_confirm_${sourceId}`)
+      .row()
+      .text("⬅️ Back", "rerun_back");
+
+    await ctx.editMessageText(
+      `🔄 <b>Re-run: ${escapeHtml(sourceRaffle.title)}</b>\n\n` +
+        `🎁 <b>Prize:</b> ${prizes}\n` +
+        `🏆 <b>Winners:</b> ${sourceRaffle.max_winners}\n` +
+        `👥 <b>Entries to copy:</b> ${entryCount}\n` +
+        (sourceRaffle.sponsor_name ? `💎 <b>Sponsor:</b> ${escapeHtml(sourceRaffle.sponsor_name)}\n` : "") +
+        `\n<i>A new open raffle will be created with all ${entryCount} participants pre-entered.</i>`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  // Back to raffle list
+  if (data === "rerun_back") {
+    const chatId = ctx.callbackQuery?.message?.chat?.id;
+    if (!chatId) return;
+
+    const drawnRaffles = db
+      .getRecentRafflesForChat(chatId, 20)
+      .filter((r) => r.status === "drawn" || r.status === "closed");
+
+    const keyboard = new InlineKeyboard();
+    for (const r of drawnRaffles.slice(0, 10)) {
       const count = db.getEntryCount(r.id);
-      msg += `/rerun ${r.id} - ${escapeHtml(r.title)} (${count} entries)\n`;
+      keyboard.text(
+        `${escapeHtml(r.title)} (${count} entries)`,
+        `rerun_pick_${r.id}`
+      );
+      keyboard.row();
     }
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    keyboard.text("❌ Cancel", "rerun_cancel");
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `🔄 <b>Re-run a Raffle</b>\n\n` +
+        `Pick a completed raffle to re-run with the same participants:`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
     return;
   }
 
-  const sourceId = parseInt(args, 10);
-  if (isNaN(sourceId)) {
-    await replyPrivately(ctx, "Please provide a valid raffle ID.");
-    return;
-  }
+  // Confirm re-run
+  if (data.startsWith("rerun_confirm_")) {
+    const sourceId = parseInt(data.replace("rerun_confirm_", ""), 10);
+    if (isNaN(sourceId)) return;
 
-  const sourceRaffle = db.getRaffleById(sourceId);
-  if (!sourceRaffle || sourceRaffle.chat_id !== ctx.chat.id) {
-    await replyPrivately(ctx, "Raffle not found in this chat.");
-    return;
-  }
+    const chatId = ctx.callbackQuery?.message?.chat?.id;
+    if (!chatId) return;
 
-  const sourceEntries = db.getEntriesForRaffle(sourceId);
-  if (sourceEntries.length === 0) {
-    await replyPrivately(ctx, "The source raffle has no entries to copy.");
-    return;
-  }
-
-  const displayName = getUserDisplayName(
-    ctx.from!.first_name,
-    ctx.from!.last_name
-  );
-
-  // Create a new raffle with the same settings
-  const newRaffle = db.createRaffle({
-    chat_id: ctx.chat.id,
-    creator_id: userId,
-    creator_name: displayName,
-    title: `${sourceRaffle.title} (Re-run)`,
-    description: sourceRaffle.description,
-    prize: sourceRaffle.prize,
-    prizes: sourceRaffle.prizes,
-    max_entries: null, // Don't limit since we're pre-filling
-    max_winners: sourceRaffle.max_winners,
-    ends_at: null,
-    starts_at: null,
-    required_chat_id: sourceRaffle.required_chat_id,
-    required_chat_title: sourceRaffle.required_chat_title,
-    sponsor_name: sourceRaffle.sponsor_name,
-    anonymous: sourceRaffle.anonymous,
-    image_file_id: sourceRaffle.image_file_id,
-    auto_pin: 0,
-  });
-
-  // Copy all entries from the source raffle
-  const added = db.bulkAddEntries(
-    newRaffle.id,
-    sourceEntries.map((e) => ({
-      user_id: e.user_id,
-      user_name: e.user_name,
-      user_display_name: e.user_display_name,
-    }))
-  );
-
-  const rerunLang = db.getChatLanguage(ctx.chat.id);
-
-  await sendBanner(ctx.api, ctx.chat.id, "open", newRaffle.image_file_id);
-
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
-    .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
-    .row()
-    .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
-
-  const msg = await ctx.reply(
-    formatRaffleMessage(newRaffle, added, rerunLang) +
-      `\n\n🔄 <i>Re-run of raffle #${sourceId} with ${added} participants copied.</i>`,
-    {
-      parse_mode: "HTML",
-      reply_markup: keyboard,
+    const sourceRaffle = db.getRaffleById(sourceId);
+    if (!sourceRaffle || sourceRaffle.chat_id !== chatId) {
+      await ctx.answerCallbackQuery({ text: "Raffle not found.", show_alert: true });
+      return;
     }
-  );
 
-  db.updateRaffleMessageId(newRaffle.id, msg.message_id);
+    const sourceEntries = db.getEntriesForRaffle(sourceId);
+    if (sourceEntries.length === 0) {
+      await ctx.answerCallbackQuery({ text: "No entries to copy.", show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    // Remove the selection message
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+
+    const displayName = getUserDisplayName(
+      ctx.from.first_name,
+      ctx.from.last_name
+    );
+
+    // Create a new raffle with the same settings
+    const newRaffle = db.createRaffle({
+      chat_id: chatId,
+      creator_id: ctx.from.id,
+      creator_name: displayName,
+      title: `${sourceRaffle.title} (Re-run)`,
+      description: sourceRaffle.description,
+      prize: sourceRaffle.prize,
+      prizes: sourceRaffle.prizes,
+      max_entries: null,
+      max_winners: sourceRaffle.max_winners,
+      ends_at: null,
+      starts_at: null,
+      required_chat_id: sourceRaffle.required_chat_id,
+      required_chat_title: sourceRaffle.required_chat_title,
+      sponsor_name: sourceRaffle.sponsor_name,
+      anonymous: sourceRaffle.anonymous,
+      image_file_id: sourceRaffle.image_file_id,
+      auto_pin: 0,
+    });
+
+    // Copy all entries from the source raffle
+    const added = db.bulkAddEntries(
+      newRaffle.id,
+      sourceEntries.map((e) => ({
+        user_id: e.user_id,
+        user_name: e.user_name,
+        user_display_name: e.user_display_name,
+      }))
+    );
+
+    const rerunLang = db.getChatLanguage(chatId);
+
+    await sendBanner(ctx.api, chatId, "open", newRaffle.image_file_id);
+
+    const raffleKeyboard = new InlineKeyboard()
+      .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
+      .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
+      .row()
+      .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
+
+    const msg = await ctx.api.sendMessage(
+      chatId,
+      formatRaffleMessage(newRaffle, added, rerunLang) +
+        `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: raffleKeyboard,
+      }
+    );
+
+    db.updateRaffleMessageId(newRaffle.id, msg.message_id);
+  }
 }
 
 // /savetemplate - Save a raffle configuration as a reusable template

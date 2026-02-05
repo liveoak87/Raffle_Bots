@@ -13,6 +13,7 @@ import {
   handleRaffleHistory,
   handleExportEntries,
   handleRerun,
+  handleRerunCallback,
   handleEnterCallback,
   handleLeaveCallback,
   handleEntriesCallback,
@@ -127,6 +128,9 @@ bot.callbackQuery(/^wiz_opt_/, handleOptionsCallback);
 
 // --- Edit wizard callback queries ---
 bot.callbackQuery(/^edit_/, handleEditCallback);
+
+// --- Rerun callback queries ---
+bot.callbackQuery(/^rerun_/, handleRerunCallback);
 
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {

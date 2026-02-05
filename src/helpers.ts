@@ -232,8 +232,8 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Perform a wheel spin animation by rapidly editing a message,
- * cycling through entry names and slowing down to reveal winners.
+ * Perform a slot-machine style spin animation by editing a message,
+ * showing a visible window of names scrolling and slowing down.
  * Returns the message ID of the spin message (for further editing).
  */
 export async function performWheelSpin(
@@ -257,44 +257,112 @@ export async function performWheelSpin(
 ): Promise<number> {
   const safeTitle = escapeHtml(raffleTitle);
 
-  // Send initial spinning message
+  // Build a shuffled pool of names for the scroll
+  const pool = cryptoShuffleArray([...entryNames]);
+  // Ensure enough names to fill the visible window on every frame
+  while (pool.length < 20) {
+    pool.push(...cryptoShuffleArray([...entryNames]));
+  }
+
+  // Send initial message
   const spinMsg = await api.sendMessage(
     chatId,
     `🎰 <b>${t(lang, "spin.drawing", { title: safeTitle })}</b>\n\n` +
       `🔄 ${t(lang, "spin.spinning")}`,
     { parse_mode: "HTML" }
   );
-
   const msgId = spinMsg.message_id;
 
-  // Timing: start fast, slow down for suspense
-  const delays = [500, 500, 500, 600, 700, 800, 1000, 1200, 1500, 2000];
+  // Phase 1: Fast spinning (names scrolling quickly)
+  // Phase 2: Slowing down (building suspense)
+  // Phase 3: "And the winner is..." dramatic pause
+  const frames: { delay: number; offset: number; phase: "fast" | "slow" | "reveal" }[] = [];
 
-  for (let i = 0; i < delays.length; i++) {
-    await sleep(delays[i]);
+  // Fast phase: 5 frames
+  for (let i = 0; i < 5; i++) {
+    frames.push({ delay: 400, offset: i * 3, phase: "fast" });
+  }
+  // Slow phase: 5 frames, progressively slower
+  const slowDelays = [600, 800, 1000, 1300, 1800];
+  for (let i = 0; i < slowDelays.length; i++) {
+    frames.push({ delay: slowDelays[i], offset: 15 + i * 2, phase: "slow" });
+  }
+  // Final reveal frame
+  frames.push({ delay: 2000, offset: pool.length - 3, phase: "reveal" });
 
-    // Pick a random name to display
-    const idx = Math.floor(Math.random() * entryNames.length);
-    const displayName = entryNames[idx];
+  for (const frame of frames) {
+    await sleep(frame.delay);
 
-    // Visual progress bar
-    const filled = i + 1;
-    const empty = delays.length - filled;
-    const progress = "\u2593".repeat(filled) + "\u2591".repeat(empty);
+    // Build the visible "slot window" — 5 names with the middle one highlighted
+    const windowSize = 5;
+    const windowNames: string[] = [];
+    for (let j = 0; j < windowSize; j++) {
+      const idx = (frame.offset + j) % pool.length;
+      windowNames.push(pool[idx]);
+    }
+
+    const middleIdx = Math.floor(windowSize / 2);
+    let slotDisplay = "";
+
+    if (frame.phase === "reveal") {
+      // Final frame: dramatic reveal
+      slotDisplay += `\n✨ ${t(lang, "spin.winner_is")} ✨\n\n`;
+      slotDisplay += `     <i>${escapeHtml(windowNames[middleIdx - 1])}</i>\n`;
+      slotDisplay += `▸ 🎯 <b>${escapeHtml(windowNames[middleIdx])}</b> 🎯 ◂\n`;
+      slotDisplay += `     <i>${escapeHtml(windowNames[middleIdx + 1])}</i>`;
+    } else {
+      // Scrolling frames: show the slot window
+      for (let j = 0; j < windowSize; j++) {
+        const name = escapeHtml(windowNames[j]);
+        if (j === middleIdx) {
+          // Highlighted center row
+          slotDisplay += `▸ <b>${name}</b> ◂\n`;
+        } else {
+          // Faded surrounding rows
+          const dist = Math.abs(j - middleIdx);
+          if (dist === 1) {
+            slotDisplay += `   <i>${name}</i>\n`;
+          } else {
+            slotDisplay += `      ${name}\n`;
+          }
+        }
+      }
+    }
+
+    // Speed indicator
+    let speedLabel = "";
+    if (frame.phase === "fast") {
+      speedLabel = "⚡ " + t(lang, "spin.spinning");
+    } else if (frame.phase === "slow") {
+      speedLabel = "🔄 " + t(lang, "spin.spinning");
+    }
+
+    let text = `🎰 <b>${t(lang, "spin.drawing", { title: safeTitle })}</b>\n\n`;
+    text += `┌─────────────────┐\n`;
+    text += slotDisplay;
+    text += `└─────────────────┘`;
+    if (speedLabel) {
+      text += `\n\n${speedLabel}`;
+    }
 
     try {
-      await api.editMessageText(
-        chatId,
-        msgId,
-        `🎰 <b>${t(lang, "spin.drawing", { title: safeTitle })}</b>\n\n` +
-          `${progress}\n\n` +
-          `🎯 <b>${escapeHtml(displayName)}</b>`,
-        { parse_mode: "HTML" }
-      );
+      await api.editMessageText(chatId, msgId, text, { parse_mode: "HTML" });
     } catch {
       // Edit failed (rate limit or deleted), skip frame
     }
   }
 
   return msgId;
+}
+
+/** Simple crypto-random shuffle for the spin animation pool */
+function cryptoShuffleArray<T>(arr: T[]): T[] {
+  const crypto = require("crypto");
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const bytes = crypto.randomBytes(4);
+    const j = bytes.readUInt32BE(0) % (i + 1);
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
 }

@@ -171,6 +171,11 @@ function migrateDatabase(): void {
       "ALTER TABLE raffles ADD COLUMN winner_cooldown INTEGER NOT NULL DEFAULT 0"
     );
   }
+  if (!raffleColumns.includes("show_animation")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN show_animation INTEGER NOT NULL DEFAULT 1"
+    );
+  }
 }
 
 export function getDb(): Database.Database {
@@ -184,8 +189,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;

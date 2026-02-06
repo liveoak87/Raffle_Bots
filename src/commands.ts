@@ -266,6 +266,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     min_account_age_days: 0,
     require_username: 0,
     winner_cooldown: 0,
+    show_animation: 1,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -398,8 +399,8 @@ export async function handleDraw(ctx: Context): Promise<void> {
 
   await sendBanner(ctx.api, ctx.chat!.id, "drawn");
 
-  // Wheel spin GIF animation (2+ entries for suspense)
-  if (entryNames.length >= 2) {
+  // Wheel spin GIF animation (2+ entries for suspense, if animation enabled)
+  if (entryNames.length >= 2 && raffle.show_animation) {
     await sendWheelSpin(ctx.api, ctx.chat!.id);
   }
 
@@ -849,6 +850,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       min_account_age_days: sourceRaffle.min_account_age_days,
       require_username: sourceRaffle.require_username,
       winner_cooldown: sourceRaffle.winner_cooldown,
+      show_animation: sourceRaffle.show_animation,
     });
 
     // Copy all entries from the source raffle
@@ -1093,6 +1095,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       min_account_age_days: 0,
       require_username: 0,
       winner_cooldown: 0,
+      show_animation: 1,
     });
 
     const lang = db.getChatLanguage(chatId);
@@ -1501,6 +1504,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     min_account_age_days: 0,
     require_username: 0,
     winner_cooldown: 0,
+    show_animation: 1,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -1771,8 +1775,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
 
         await sendBanner(ctx.api, raffle.chat_id, "drawn");
 
-        // Wheel spin GIF animation
-        if (entryNames.length >= 2) {
+        // Wheel spin GIF animation (if animation enabled)
+        if (entryNames.length >= 2 && raffle.show_animation) {
           await sendWheelSpin(ctx.api, raffle.chat_id);
         }
 

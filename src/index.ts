@@ -245,12 +245,12 @@ async function checkExpiredRaffles(): Promise<void> {
 
         await sendBanner(bot.api, raffle.chat_id, "drawn");
 
-        // Only show wheel spin if raffle expired recently (within 2 minutes)
+        // Only show wheel spin if raffle expired recently (within 2 minutes) and animation is enabled
         const expiredAt = new Date(raffle.ends_at + "Z");
         const staleness = Date.now() - expiredAt.getTime();
         const isRecent = staleness < 2 * 60 * 1000;
 
-        if (isRecent && entryNames.length >= 2) {
+        if (isRecent && entryNames.length >= 2 && raffle.show_animation) {
           await sendWheelSpin(bot.api, raffle.chat_id);
         }
 
@@ -480,6 +480,7 @@ async function checkRecurringTemplates(): Promise<void> {
         min_account_age_days: 0,
         require_username: 0,
         winner_cooldown: 0,
+        show_animation: 1,
       });
 
       try {

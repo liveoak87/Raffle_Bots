@@ -33,6 +33,8 @@ export interface Raffle {
   require_username: number;
   /** Exclude users who won within the last N raffles in this chat (0 = disabled) */
   winner_cooldown: number;
+  /** Whether to show the wheel spin animation when drawing (0 = no, 1 = yes) */
+  show_animation: number;
   created_at: string;
   drawn_at: string | null;
 }
@@ -79,6 +81,7 @@ export interface CreateRaffleInput {
   min_account_age_days: number;
   require_username: number;
   winner_cooldown: number;
+  show_animation: number;
 }
 
 export interface RaffleTemplate {

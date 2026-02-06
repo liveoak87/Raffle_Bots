@@ -41,6 +41,7 @@ interface WizardState {
   minAccountAgeDays?: number;
   requireUsername?: boolean;
   winnerCooldown?: number;
+  showAnimation?: boolean;
   createdAt: number;
 }
 
@@ -545,6 +546,10 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
     state.winnerCooldown ? `🛡 Cooldown: ${state.winnerCooldown}` : "🛡 Cooldown: Off",
     "wiz_opt_cooldown"
   );
+  kb.text(
+    state.showAnimation !== false ? "🎡 Animation: On" : "🎡 Animation: Off",
+    "wiz_opt_animation"
+  );
   kb.row();
   kb.text("✅ Create Raffle", "wiz_opt_create");
 
@@ -648,6 +653,14 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
           `<i>Type <code>0</code> or <code>skip</code> to disable.</i>`,
         { parse_mode: "HTML" }
       );
+      break;
+
+    case "wiz_opt_animation":
+      state.showAnimation = state.showAnimation === false ? true : false;
+      await ctx.editMessageText(buildOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildOptionsKeyboard(state),
+      });
       break;
 
     case "wiz_opt_create":
@@ -800,6 +813,7 @@ async function createRaffleFromWizard(
     min_account_age_days: state.minAccountAgeDays || 0,
     require_username: state.requireUsername ? 1 : 0,
     winner_cooldown: state.winnerCooldown || 0,
+    show_animation: state.showAnimation !== false ? 1 : 0,
   });
 
   cancelWizard(state.userId);

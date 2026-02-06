@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendBanner, sendCustomImage, sendWheelSpin, sendRafflePost } from "./banners";
+import { sendBanner, sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -1902,7 +1902,7 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
       );
     } else {
-      // Raffle is closed or drawn - remove entry buttons
+      // Raffle is closed or drawn - remove entry buttons and swap banner to "closed"
       let text = formatRaffleMessage(raffle, count, lang);
 
       if (raffle.status === "drawn") {
@@ -1923,6 +1923,27 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         }
       }
 
+      // Try to swap the banner to "closed" using editMessageMedia
+      const closedBannerFileId = await getBannerFileId(ctx.api, raffle.chat_id, "closed");
+      if (closedBannerFileId) {
+        try {
+          await ctx.api.editMessageMedia(
+            raffle.chat_id,
+            raffle.message_id,
+            {
+              type: "photo",
+              media: closedBannerFileId,
+              caption: text,
+              parse_mode: "HTML",
+            }
+          );
+          return; // Success - exit early
+        } catch {
+          // editMessageMedia failed, fall back to editMessageCaption
+        }
+      }
+
+      // Fallback: just update the caption (banner stays as "open")
       await ctx.api.editMessageCaption(
         raffle.chat_id,
         raffle.message_id,

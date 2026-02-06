@@ -60,7 +60,7 @@ import {
   handleBugReportPhoto,
   handleBugReportSkip,
 } from "./wizard";
-import { sendBanner, sendWheelSpin, sendRafflePost } from "./banners";
+import { sendBanner, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -273,7 +273,7 @@ async function checkExpiredRaffles(): Promise<void> {
         await notifyWinnersAndCreator(bot.api, raffle, winners);
       }
 
-      // Update the original raffle post
+      // Update the original raffle post with "closed" banner
       if (raffle.message_id) {
         try {
           const updatedRaffle = db.getRaffleById(raffle.id);
@@ -296,11 +296,35 @@ async function checkExpiredRaffles(): Promise<void> {
               });
             }
 
-            await bot.api.editMessageCaption(
-              raffle.chat_id,
-              raffle.message_id,
-              { caption: text, parse_mode: "HTML" }
-            );
+            // Try to swap the banner to "closed"
+            const closedBannerFileId = await getBannerFileId(bot.api, raffle.chat_id, "closed");
+            if (closedBannerFileId) {
+              try {
+                await bot.api.editMessageMedia(
+                  raffle.chat_id,
+                  raffle.message_id,
+                  {
+                    type: "photo",
+                    media: closedBannerFileId,
+                    caption: text,
+                    parse_mode: "HTML",
+                  }
+                );
+              } catch {
+                // Fallback to just caption update
+                await bot.api.editMessageCaption(
+                  raffle.chat_id,
+                  raffle.message_id,
+                  { caption: text, parse_mode: "HTML" }
+                );
+              }
+            } else {
+              await bot.api.editMessageCaption(
+                raffle.chat_id,
+                raffle.message_id,
+                { caption: text, parse_mode: "HTML" }
+              );
+            }
           }
         } catch {
           // Message may be too old or deleted

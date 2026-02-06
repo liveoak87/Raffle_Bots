@@ -69,6 +69,48 @@ export async function sendBanner(
 }
 
 /**
+ * Get the banner file_id as a string (for editMessageMedia).
+ * Returns null if not cached and unable to upload.
+ */
+export async function getBannerFileId(
+  api: {
+    sendPhoto: (
+      chatId: number,
+      photo: string | InputFile,
+      opts?: Record<string, unknown>
+    ) => Promise<{
+      message_id: number;
+      photo?: Array<{ file_id: string }>;
+    }>;
+    deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
+  },
+  chatId: number,
+  bannerType: BannerType
+): Promise<string | null> {
+  // Try cached file_id first
+  const cachedFileId = getCachedBannerFileId(bannerType);
+  if (cachedFileId) {
+    return cachedFileId;
+  }
+
+  // Need to upload to get a file_id — send and delete a temporary message
+  const filePath = getAssetPath(BANNER_FILES[bannerType]);
+  try {
+    const msg = await api.sendPhoto(chatId, new InputFile(filePath));
+    if (msg.photo && msg.photo.length > 0) {
+      const largestPhoto = msg.photo[msg.photo.length - 1];
+      setCachedBannerFileId(bannerType, largestPhoto.file_id);
+      try {
+        await api.deleteMessage(chatId, msg.message_id);
+      } catch {}
+      return largestPhoto.file_id;
+    }
+  } catch {}
+
+  return null;
+}
+
+/**
  * Get the banner file_id (cached) or InputFile for a banner type.
  * Used internally for sending raffle posts with embedded banners.
  */

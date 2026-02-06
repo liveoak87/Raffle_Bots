@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendBanner, sendCustomImage, sendWheelSpin } from "./banners";
+import { sendBanner, sendCustomImage, sendWheelSpin, sendRafflePost } from "./banners";
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -271,20 +271,23 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
 
   const lang = db.getChatLanguage(ctx.chat.id);
 
-  await sendBanner(ctx.api, ctx.chat.id, "open");
-
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
     .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-  const msg = await ctx.reply(formatRaffleMessage(raffle, 0, lang), {
-    parse_mode: "HTML",
-    reply_markup: keyboard,
-  });
+  const msgId = await sendRafflePost(
+    ctx.api,
+    ctx.chat.id,
+    "open",
+    formatRaffleMessage(raffle, 0, lang),
+    keyboard
+  );
 
-  db.updateRaffleMessageId(raffle.id, msg.message_id);
+  if (msgId) {
+    db.updateRaffleMessageId(raffle.id, msgId);
+  }
 }
 
 // /raffles - List open raffles
@@ -865,29 +868,26 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
 
     const rerunLang = db.getChatLanguage(chatId);
 
-    await sendBanner(ctx.api, chatId, "open");
-
     const raffleKeyboard = new InlineKeyboard()
       .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
       .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
       .row()
       .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
 
-    const msg = await ctx.api.sendMessage(
+    const caption = formatRaffleMessage(newRaffle, added, rerunLang) +
+      `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`;
+
+    const msgId = await sendRafflePost(
+      ctx.api,
       chatId,
-      formatRaffleMessage(newRaffle, added, rerunLang) +
-        `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`,
-      {
-        parse_mode: "HTML",
-        reply_markup: raffleKeyboard,
-      }
+      "open",
+      caption,
+      raffleKeyboard,
+      newRaffle.image_file_id
     );
 
-    db.updateRaffleMessageId(newRaffle.id, msg.message_id);
-
-    // Send custom image below the raffle post
-    if (newRaffle.image_file_id) {
-      await sendCustomImage(ctx.api, chatId, newRaffle.image_file_id);
+    if (msgId) {
+      db.updateRaffleMessageId(newRaffle.id, msgId);
     }
   }
 }
@@ -1100,21 +1100,23 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
     const lang = db.getChatLanguage(chatId);
 
-    await sendBanner(ctx.api, chatId, "open");
-
     const raffleKeyboard = new InlineKeyboard()
       .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
       .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
       .row()
       .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-    const msg = await ctx.api.sendMessage(
+    const msgId = await sendRafflePost(
+      ctx.api,
       chatId,
+      "open",
       formatRaffleMessage(raffle, 0, lang),
-      { parse_mode: "HTML", reply_markup: raffleKeyboard }
+      raffleKeyboard
     );
 
-    db.updateRaffleMessageId(raffle.id, msg.message_id);
+    if (msgId) {
+      db.updateRaffleMessageId(raffle.id, msgId);
+    }
     return;
   }
 
@@ -1509,20 +1511,23 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
 
   const lang = db.getChatLanguage(ctx.chat.id);
 
-  await sendBanner(ctx.api, ctx.chat.id, "open");
-
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
     .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-  const msg = await ctx.reply(formatRaffleMessage(raffle, 0, lang), {
-    parse_mode: "HTML",
-    reply_markup: keyboard,
-  });
+  const msgId = await sendRafflePost(
+    ctx.api,
+    ctx.chat.id,
+    "open",
+    formatRaffleMessage(raffle, 0, lang),
+    keyboard
+  );
 
-  db.updateRaffleMessageId(raffle.id, msg.message_id);
+  if (msgId) {
+    db.updateRaffleMessageId(raffle.id, msgId);
+  }
 }
 
 // /recurring - Toggle recurring on/off for a template
@@ -1891,11 +1896,10 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         .row()
         .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
 
-      await ctx.api.editMessageText(
+      await ctx.api.editMessageCaption(
         raffle.chat_id,
         raffle.message_id,
-        formatRaffleMessage(raffle, count, lang),
-        { parse_mode: "HTML", reply_markup: keyboard }
+        { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
       );
     } else {
       // Raffle is closed or drawn - remove entry buttons
@@ -1919,11 +1923,10 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         }
       }
 
-      await ctx.api.editMessageText(
+      await ctx.api.editMessageCaption(
         raffle.chat_id,
         raffle.message_id,
-        text,
-        { parse_mode: "HTML" }
+        { caption: text, parse_mode: "HTML" }
       );
     }
   } catch {

@@ -60,7 +60,7 @@ import {
   handleBugReportPhoto,
   handleBugReportSkip,
 } from "./wizard";
-import { sendBanner, sendWheelSpin } from "./banners";
+import { sendBanner, sendWheelSpin, sendRafflePost } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -296,11 +296,10 @@ async function checkExpiredRaffles(): Promise<void> {
               });
             }
 
-            await bot.api.editMessageText(
+            await bot.api.editMessageCaption(
               raffle.chat_id,
               raffle.message_id,
-              text,
-              { parse_mode: "HTML" }
+              { caption: text, parse_mode: "HTML" }
             );
           }
         } catch {
@@ -336,11 +335,10 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
     .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
 
   try {
-    await bot.api.editMessageText(
+    await bot.api.editMessageCaption(
       raffle.chat_id,
       raffle.message_id,
-      formatRaffleMessage(raffle, count, lang),
-      { parse_mode: "HTML", reply_markup: keyboard }
+      { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
     );
   } catch {
     // Message unchanged or deleted — ignore
@@ -486,21 +484,23 @@ async function checkRecurringTemplates(): Promise<void> {
       try {
         const recLang = db.getChatLanguage(template.chat_id);
 
-        await sendBanner(bot.api, template.chat_id, "open");
-
         const keyboard = new InlineKeyboard()
           .text(`🎟 ${t(recLang, "btn.enter")}`, `enter_${raffle.id}`)
           .text(`❌ ${t(recLang, "btn.leave")}`, `leave_${raffle.id}`)
           .row()
           .text(`👥 ${t(recLang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-        const msg = await bot.api.sendMessage(
+        const msgId = await sendRafflePost(
+          bot.api,
           template.chat_id,
+          "open",
           formatRaffleMessage(raffle, 0, recLang),
-          { parse_mode: "HTML", reply_markup: keyboard }
+          keyboard
         );
 
-        db.updateRaffleMessageId(raffle.id, msg.message_id);
+        if (msgId) {
+          db.updateRaffleMessageId(raffle.id, msgId);
+        }
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
       }

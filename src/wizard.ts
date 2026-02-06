@@ -10,7 +10,7 @@ import {
   formatCountdown,
 } from "./helpers";
 import { t } from "./i18n";
-import { sendBanner, sendCustomImage } from "./banners";
+import { sendBanner, sendCustomImage, sendRafflePost } from "./banners";
 
 interface WizardState {
   step:
@@ -818,9 +818,6 @@ async function createRaffleFromWizard(
 
   cancelWizard(state.userId);
 
-  // Send branded banner
-  await sendBanner(ctx.api, state.targetChatId, "open");
-
   const lang = db.getChatLanguage(state.targetChatId);
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
@@ -828,31 +825,28 @@ async function createRaffleFromWizard(
     .row()
     .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
 
-  const msg = await ctx.api.sendMessage(
+  const msgId = await sendRafflePost(
+    ctx.api,
     state.targetChatId,
+    "open",
     formatRaffleMessage(raffle, 0, lang),
-    {
-      parse_mode: "HTML",
-      reply_markup: keyboard,
-    }
+    keyboard,
+    raffle.image_file_id
   );
 
-  db.updateRaffleMessageId(raffle.id, msg.message_id);
+  if (msgId) {
+    db.updateRaffleMessageId(raffle.id, msgId);
 
-  // Auto-pin the raffle message if enabled
-  if (raffle.auto_pin) {
-    try {
-      await ctx.api.pinChatMessage(state.targetChatId, msg.message_id, {
-        disable_notification: true,
-      });
-    } catch {
-      // Bot may not have pin permission
+    // Auto-pin the raffle message if enabled
+    if (raffle.auto_pin) {
+      try {
+        await ctx.api.pinChatMessage(state.targetChatId, msgId, {
+          disable_notification: true,
+        });
+      } catch {
+        // Bot may not have pin permission
+      }
     }
-  }
-
-  // Send custom image below the raffle post
-  if (raffle.image_file_id) {
-    await sendCustomImage(ctx.api, state.targetChatId, raffle.image_file_id);
   }
 
   await ctx.reply(

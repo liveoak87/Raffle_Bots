@@ -2054,6 +2054,21 @@ export async function handleStats(ctx: Context): Promise<void> {
   msg += `  📋 Raffles created: <b>${stats.rafflesLast7Days}</b>\n`;
   msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
 
+  // Fetch group names
+  const chatIds = db.getAllGroupChatIds();
+  if (chatIds.length > 0) {
+    msg += `\n<b>Groups:</b>\n`;
+    for (const chatId of chatIds) {
+      try {
+        const chat = await ctx.api.getChat(chatId);
+        const title = "title" in chat && chat.title ? chat.title : `Chat ${chatId}`;
+        msg += `  • ${escapeHtml(title)}\n`;
+      } catch {
+        msg += `  • <i>(left/banned) ${chatId}</i>\n`;
+      }
+    }
+  }
+
   // Send as DM to the owner
   try {
     await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML" });

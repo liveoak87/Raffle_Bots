@@ -803,6 +803,14 @@ export function getBotStats(): BotStats {
   };
 }
 
+// --- Group list ---
+
+export function getAllGroupChatIds(): number[] {
+  const d = getDb();
+  const rows = d.prepare("SELECT DISTINCT chat_id FROM raffles ORDER BY chat_id").all() as { chat_id: number }[];
+  return rows.map((r) => r.chat_id);
+}
+
 // --- Banner cache ---
 
 export function getCachedBannerFileId(bannerType: string): string | null {

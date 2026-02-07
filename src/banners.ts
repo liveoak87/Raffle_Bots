@@ -12,7 +12,7 @@ const BANNER_FILES: Record<BannerType, string> = {
 
 const WHEEL_GIF = "wheel_spin.gif";
 const WHEEL_CACHE_KEY = "wheel_spin";
-const WHEEL_PLAY_TIME = 5000; // ms to let the GIF play before deleting
+const WHEEL_PLAY_TIME = 2500; // ms to let the GIF play before deleting
 
 function getAssetPath(filename: string): string {
   return path.join(process.cwd(), "assets", filename);

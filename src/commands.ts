@@ -400,8 +400,8 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const entryNames = entries.map((e) => e.user_display_name);
   const winners = db.selectWinners(raffle.id);
 
-  // Wheel spin GIF animation (2+ entries for suspense, if animation enabled)
-  if (entryNames.length >= 2 && raffle.show_animation) {
+  // Countdown animation (if animation enabled and at least 1 entry)
+  if (entryNames.length >= 1 && raffle.show_animation) {
     await sendWheelSpin(ctx.api, ctx.chat!.id);
   }
 
@@ -1774,8 +1774,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffleId);
 
-        // Wheel spin GIF animation (if animation enabled)
-        if (entryNames.length >= 2 && raffle.show_animation) {
+        // Countdown animation (if animation enabled)
+        if (entryNames.length >= 1 && raffle.show_animation) {
           await sendWheelSpin(ctx.api, raffle.chat_id);
         }
 

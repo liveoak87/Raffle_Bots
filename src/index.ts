@@ -248,7 +248,7 @@ async function checkExpiredRaffles(): Promise<void> {
         const staleness = Date.now() - expiredAt.getTime();
         const isRecent = staleness < 2 * 60 * 1000;
 
-        if (isRecent && entryNames.length >= 2 && raffle.show_animation) {
+        if (isRecent && entryNames.length >= 1 && raffle.show_animation) {
           await sendWheelSpin(bot.api, raffle.chat_id);
         }
 
@@ -259,9 +259,29 @@ async function checkExpiredRaffles(): Promise<void> {
             formatWinnersMessage(raffle, winners, lang),
             { parse_mode: "HTML" }
           );
-        } catch (err) {
-          console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
-          continue; // Leave as "open" so it retries next check
+        } catch (err: unknown) {
+          // Check if rate limited - if so, wait and retry
+          if (err && typeof err === "object" && "error_code" in err && err.error_code === 429) {
+            const retryAfter = ("parameters" in err && err.parameters && typeof err.parameters === "object" && "retry_after" in err.parameters)
+              ? (err.parameters as { retry_after: number }).retry_after
+              : 30;
+            console.log(`Rate limited on raffle ${raffle.id}, waiting ${retryAfter}s before retry...`);
+            await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+            // Try once more after waiting
+            try {
+              await bot.api.sendMessage(
+                raffle.chat_id,
+                formatWinnersMessage(raffle, winners, lang),
+                { parse_mode: "HTML" }
+              );
+            } catch (retryErr) {
+              console.error(`Failed to announce raffle ${raffle.id} after retry:`, retryErr);
+              continue;
+            }
+          } else {
+            console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
+            continue; // Leave as "open" so it retries next check
+          }
         }
 
         // Mark as drawn only after successful announcement

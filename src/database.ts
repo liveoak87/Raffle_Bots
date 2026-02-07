@@ -829,6 +829,12 @@ export function setCachedBannerFileId(bannerType: string, fileId: string): void 
   ).run(bannerType, fileId, fileId);
 }
 
+export function clearBannerCache(): void {
+  const d = getDb();
+  d.prepare("DELETE FROM banner_cache").run();
+  console.log("Banner cache cleared");
+}
+
 // --- Utility ---
 
 function cryptoShuffle<T>(array: T[]): T[] {

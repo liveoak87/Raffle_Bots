@@ -256,7 +256,7 @@ export async function sendCustomImage(
 }
 
 /**
- * Send a 10-second countdown before revealing winners.
+ * Send a 5-second countdown before revealing winners.
  * Non-fatal — if anything fails, the draw still proceeds.
  */
 export async function sendWheelSpin(
@@ -278,12 +278,12 @@ export async function sendWheelSpin(
 ): Promise<void> {
   try {
     // Send initial countdown message
-    const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner in 10...</b>`, {
+    const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner in 5...</b>`, {
       parse_mode: "HTML",
     });
 
-    // Countdown from 9 to 1
-    for (let i = 9; i >= 1; i--) {
+    // Countdown from 4 to 1
+    for (let i = 4; i >= 1; i--) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       try {
         await api.editMessageText(
@@ -308,5 +308,72 @@ export async function sendWheelSpin(
   } catch (err) {
     console.error(`Failed to send countdown to chat ${chatId}:`, err);
     // Non-fatal — the draw proceeds without the animation
+  }
+}
+
+/**
+ * Send the winner announcement as a photo with the "drawn" banner and winner details as caption.
+ */
+export async function sendWinnerPost(
+  api: {
+    sendPhoto: (
+      chatId: number,
+      photo: string | InputFile,
+      opts?: Record<string, unknown>
+    ) => Promise<{
+      message_id: number;
+      photo?: Array<{ file_id: string }>;
+    }>;
+    sendMessage: (
+      chatId: number,
+      text: string,
+      opts?: Record<string, unknown>
+    ) => Promise<{ message_id: number }>;
+    deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
+  },
+  chatId: number,
+  winnerText: string
+): Promise<void> {
+  const MAX_CAPTION_LENGTH = 1024;
+
+  // Get or upload the "drawn" banner
+  let fileId = getCachedBannerFileId("drawn");
+
+  if (!fileId) {
+    // Upload to get file_id
+    const filePath = getAssetPath(BANNER_FILES["drawn"]);
+    try {
+      const msg = await api.sendPhoto(chatId, new InputFile(filePath));
+      if (msg.photo && msg.photo.length > 0) {
+        fileId = msg.photo[msg.photo.length - 1].file_id;
+        setCachedBannerFileId("drawn", fileId);
+        // Delete the temp message
+        try {
+          await api.deleteMessage(chatId, msg.message_id);
+        } catch {}
+      }
+    } catch (err) {
+      console.error("Failed to upload drawn banner:", err);
+    }
+  }
+
+  // If we have a file_id and caption fits, send as photo with caption
+  if (fileId && winnerText.length <= MAX_CAPTION_LENGTH) {
+    try {
+      await api.sendPhoto(chatId, fileId, {
+        caption: winnerText,
+        parse_mode: "HTML",
+      });
+      return;
+    } catch (err) {
+      console.error("Failed to send winner post with banner:", err);
+    }
+  }
+
+  // Fallback: just send text
+  try {
+    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML" });
+  } catch (err) {
+    console.error("Failed to send winner text:", err);
   }
 }

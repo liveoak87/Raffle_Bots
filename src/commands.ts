@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
+import { sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -405,10 +405,8 @@ export async function handleDraw(ctx: Context): Promise<void> {
     await sendWheelSpin(ctx.api, ctx.chat!.id);
   }
 
-  // Announce winners
-  await ctx.reply(formatWinnersMessage(raffle, winners, lang), {
-    parse_mode: "HTML",
-  });
+  // Announce winners with embedded "WINNERS DRAWN" banner
+  await sendWinnerPost(ctx.api, ctx.chat!.id, formatWinnersMessage(raffle, winners, lang));
 
   // Mark as drawn after successful announcement
   db.markRaffleDrawn(raffle.id);
@@ -1779,14 +1777,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
           await sendWheelSpin(ctx.api, raffle.chat_id);
         }
 
-        // Announce winners
-        try {
-          await ctx.api.sendMessage(
-            raffle.chat_id,
-            formatWinnersMessage(raffle, winners, lang),
-            { parse_mode: "HTML" }
-          );
-        } catch {}
+        // Announce winners with embedded "WINNERS DRAWN" banner
+        await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang));
 
         db.markRaffleDrawn(raffleId);
         await updateRafflePost(ctx, raffleId);
@@ -1831,11 +1823,17 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
   }
 }
 
+const ENTRIES_PER_PAGE = 15;
+
 export async function handleEntriesCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
   if (!data) return;
 
-  const raffleId = parseInt(data.replace("entries_", ""), 10);
+  // Parse raffleId and page number from callback data
+  // Format: "entries_123" or "entries_123_2" (page 2)
+  const parts = data.replace("entries_", "").split("_");
+  const raffleId = parseInt(parts[0], 10);
+  const page = parts[1] ? parseInt(parts[1], 10) : 1;
   if (isNaN(raffleId)) return;
 
   const raffle = db.getRaffleById(raffleId);
@@ -1862,14 +1860,86 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  const names = entries
-    .map((e, i) => `${i + 1}. ${e.user_display_name}`)
+  // Calculate pagination
+  const totalPages = Math.ceil(entries.length / ENTRIES_PER_PAGE);
+  const currentPage = Math.max(1, Math.min(page, totalPages));
+  const startIdx = (currentPage - 1) * ENTRIES_PER_PAGE;
+  const endIdx = Math.min(startIdx + ENTRIES_PER_PAGE, entries.length);
+  const pageEntries = entries.slice(startIdx, endIdx);
+
+  // Build the entries list for this page
+  const names = pageEntries
+    .map((e, i) => `${startIdx + i + 1}. ${e.user_display_name}`)
     .join("\n");
 
-  await ctx.answerCallbackQuery({
-    text: `Entries (${entries.length}):\n${names}`.slice(0, 200),
-    show_alert: true,
-  });
+  const title = raffle ? raffle.title : `Raffle #${raffleId}`;
+  let message = `📋 "${title}" (${entries.length})\n\n${names}`;
+
+  if (totalPages > 1) {
+    message += `\n\n📄 Page ${currentPage}/${totalPages}`;
+  }
+
+  // If only one page, just show the alert
+  if (totalPages === 1) {
+    await ctx.answerCallbackQuery({
+      text: message,
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Multiple pages - send/edit message with pagination buttons
+  await ctx.answerCallbackQuery();
+
+  const keyboard = new InlineKeyboard();
+  if (currentPage > 1) {
+    keyboard.text("⬅️ Prev", `entries_${raffleId}_${currentPage - 1}`);
+  }
+  if (currentPage < totalPages) {
+    keyboard.text("Next ➡️", `entries_${raffleId}_${currentPage + 1}`);
+  }
+  keyboard.row().text("❌ Close", `entries_close_${raffleId}`);
+
+  // Check if this is a pagination click (editing existing message) or initial click
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+
+  if (chatId && messageId && parts[1]) {
+    // Pagination click - edit existing message
+    try {
+      await ctx.api.editMessageText(chatId, messageId, message, {
+        reply_markup: keyboard,
+      });
+    } catch {
+      // Message unchanged or can't edit
+    }
+  } else {
+    // Initial click - send new message as DM
+    const userId = ctx.from?.id;
+    if (userId) {
+      try {
+        await ctx.api.sendMessage(userId, message, { reply_markup: keyboard });
+      } catch {
+        // Can't DM, try in chat
+        await ctx.reply(message, { reply_markup: keyboard });
+      }
+    }
+  }
+}
+
+export async function handleEntriesCloseCallback(ctx: Context): Promise<void> {
+  const messageId = ctx.callbackQuery?.message?.message_id;
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+
+  await ctx.answerCallbackQuery();
+
+  if (chatId && messageId) {
+    try {
+      await ctx.api.deleteMessage(chatId, messageId);
+    } catch {
+      // Can't delete, ignore
+    }
+  }
 }
 
 // --- Utility ---
@@ -1890,11 +1960,22 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         .row()
         .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
 
-      await ctx.api.editMessageCaption(
-        raffle.chat_id,
-        raffle.message_id,
-        { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
-      );
+      try {
+        // Try editMessageCaption first (for photo messages with embedded banner)
+        await ctx.api.editMessageCaption(
+          raffle.chat_id,
+          raffle.message_id,
+          { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
+        );
+      } catch {
+        // Fallback to editMessageText (for old text-only messages without banner)
+        await ctx.api.editMessageText(
+          raffle.chat_id,
+          raffle.message_id,
+          formatRaffleMessage(raffle, count, lang),
+          { parse_mode: "HTML", reply_markup: keyboard }
+        );
+      }
     } else {
       // Raffle is closed or drawn - remove entry buttons and swap banner to "closed"
       let text = formatRaffleMessage(raffle, count, lang);

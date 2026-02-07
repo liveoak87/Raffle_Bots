@@ -17,6 +17,7 @@ import {
   handleEnterCallback,
   handleLeaveCallback,
   handleEntriesCallback,
+  handleEntriesCloseCallback,
   handleSaveTemplate,
   handleTemplates,
   handleDeleteTemplate,
@@ -60,7 +61,7 @@ import {
   handleBugReportPhoto,
   handleBugReportSkip,
 } from "./wizard";
-import { sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
+import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -80,6 +81,9 @@ const DATA_RETENTION_HOURS = parseInt(
 // Initialize database
 initDatabase(DB_PATH);
 console.log(`Database initialized at ${DB_PATH}`);
+
+// Clear banner cache on startup to ensure fresh banners are used
+db.clearBannerCache();
 if (DATA_RETENTION_HOURS > 0) {
   console.log(
     `Data retention: completed raffle data will be purged after ${DATA_RETENTION_HOURS} hours`
@@ -133,7 +137,8 @@ bot.command("bugreport", handleBugReport);
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
 bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
-bot.callbackQuery(/^entries_\d+$/, handleEntriesCallback);
+bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
+bot.callbackQuery(/^entries_close_\d+$/, handleEntriesCloseCallback);
 
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
@@ -214,7 +219,7 @@ bot.on("message:photo", async (ctx) => {
 });
 
 // --- Auto-draw expired raffles ---
-const EXPIRY_CHECK_INTERVAL = 30_000; // 30 seconds
+const EXPIRY_CHECK_INTERVAL = 10_000; // 10 seconds - check more frequently for quicker auto-draw
 
 async function checkExpiredRaffles(): Promise<void> {
   try {
@@ -222,8 +227,10 @@ async function checkExpiredRaffles(): Promise<void> {
     for (const raffle of expired) {
       console.log(`Auto-drawing expired raffle: ${raffle.id} - ${raffle.title}`);
 
-      const entryCount = db.getEntryCount(raffle.id);
+      // Mark as drawn IMMEDIATELY to prevent double-processing
+      db.markRaffleDrawn(raffle.id);
 
+      const entryCount = db.getEntryCount(raffle.id);
       const lang = db.getChatLanguage(raffle.chat_id);
 
       if (entryCount === 0) {
@@ -233,17 +240,15 @@ async function checkExpiredRaffles(): Promise<void> {
             `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. ${t(lang, "winner.no_entries")}`,
             { parse_mode: "HTML" }
           );
-          db.markRaffleDrawn(raffle.id);
         } catch (err) {
-          console.error(`Failed to announce empty raffle ${raffle.id}, will retry:`, err);
-          continue; // Leave as "open" so it retries next check
+          console.error(`Failed to announce empty raffle ${raffle.id}:`, err);
         }
       } else {
         const entries = db.getEntriesForRaffle(raffle.id);
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
 
-        // Only show wheel spin if raffle expired recently (within 2 minutes) and animation is enabled
+        // Only show countdown if raffle expired recently (within 2 minutes) and animation is enabled
         const expiredAt = new Date(raffle.ends_at + "Z");
         const staleness = Date.now() - expiredAt.getTime();
         const isRecent = staleness < 2 * 60 * 1000;
@@ -252,40 +257,8 @@ async function checkExpiredRaffles(): Promise<void> {
           await sendWheelSpin(bot.api, raffle.chat_id);
         }
 
-        // Announce winners
-        try {
-          await bot.api.sendMessage(
-            raffle.chat_id,
-            formatWinnersMessage(raffle, winners, lang),
-            { parse_mode: "HTML" }
-          );
-        } catch (err: unknown) {
-          // Check if rate limited - if so, wait and retry
-          if (err && typeof err === "object" && "error_code" in err && err.error_code === 429) {
-            const retryAfter = ("parameters" in err && err.parameters && typeof err.parameters === "object" && "retry_after" in err.parameters)
-              ? (err.parameters as { retry_after: number }).retry_after
-              : 30;
-            console.log(`Rate limited on raffle ${raffle.id}, waiting ${retryAfter}s before retry...`);
-            await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
-            // Try once more after waiting
-            try {
-              await bot.api.sendMessage(
-                raffle.chat_id,
-                formatWinnersMessage(raffle, winners, lang),
-                { parse_mode: "HTML" }
-              );
-            } catch (retryErr) {
-              console.error(`Failed to announce raffle ${raffle.id} after retry:`, retryErr);
-              continue;
-            }
-          } else {
-            console.error(`Failed to announce raffle ${raffle.id}, will retry:`, err);
-            continue; // Leave as "open" so it retries next check
-          }
-        }
-
-        // Mark as drawn only after successful announcement
-        db.markRaffleDrawn(raffle.id);
+        // Announce winners with embedded "WINNERS DRAWN" banner
+        await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang));
 
         // DM winners and creator
         await notifyWinnersAndCreator(bot.api, raffle, winners);
@@ -357,11 +330,6 @@ async function checkExpiredRaffles(): Promise<void> {
 
 // --- Refresh countdowns on active raffle posts ---
 const COUNTDOWN_REFRESH_INTERVAL = 60_000; // 1 minute
-const COUNTDOWN_FAST_INTERVAL = 1_000; // 1 second for final 30s
-const COUNTDOWN_FAST_THRESHOLD = 30_000; // 30 seconds
-
-let fastTickerActive = false;
-let fastTickerInterval: ReturnType<typeof setInterval> | null = null;
 const ENDING_SOON_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 const endingSoonSent = new Set<number>(); // raffle IDs that already got a reminder
 
@@ -378,13 +346,24 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
     .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
 
   try {
+    // Try editMessageCaption first (for photo messages with embedded banner)
     await bot.api.editMessageCaption(
       raffle.chat_id,
       raffle.message_id,
       { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
     );
   } catch {
-    // Message unchanged or deleted — ignore
+    // Fallback to editMessageText (for old text-only messages without banner)
+    try {
+      await bot.api.editMessageText(
+        raffle.chat_id,
+        raffle.message_id,
+        formatRaffleMessage(raffle, count, lang),
+        { parse_mode: "HTML", reply_markup: keyboard }
+      );
+    } catch {
+      // Message unchanged or deleted — ignore
+    }
   }
 }
 
@@ -394,7 +373,6 @@ async function refreshCountdowns(): Promise<void> {
     if (raffles.length > 0) {
       console.log(`Refreshing countdown for ${raffles.length} active raffle(s)`);
     }
-    let hasUrgent = false;
 
     for (const raffle of raffles) {
       const endsAt = new Date(raffle.ends_at + "Z");
@@ -422,47 +400,13 @@ async function refreshCountdowns(): Promise<void> {
         }
       }
 
-      if (remaining > COUNTDOWN_FAST_THRESHOLD) {
-        // Normal refresh — update once per minute
+      // Refresh countdown display (once per minute)
+      if (remaining > 0) {
         await refreshRaffleMessage(raffle);
-      } else if (remaining > 0) {
-        hasUrgent = true;
       }
-    }
-
-    // Start fast ticker if any raffles are in the final 30s
-    if (hasUrgent && !fastTickerActive) {
-      fastTickerActive = true;
-      fastTickerInterval = setInterval(refreshFinalCountdowns, COUNTDOWN_FAST_INTERVAL);
     }
   } catch (err) {
     console.error("Error refreshing countdowns:", err);
-  }
-}
-
-async function refreshFinalCountdowns(): Promise<void> {
-  try {
-    const raffles = db.getOpenRafflesWithEndTime();
-    let stillUrgent = false;
-
-    for (const raffle of raffles) {
-      const endsAt = new Date(raffle.ends_at + "Z");
-      const remaining = endsAt.getTime() - Date.now();
-
-      if (remaining > 0 && remaining <= COUNTDOWN_FAST_THRESHOLD) {
-        stillUrgent = true;
-        await refreshRaffleMessage(raffle);
-      }
-    }
-
-    // Stop fast ticker when no more urgent raffles
-    if (!stillUrgent && fastTickerInterval) {
-      clearInterval(fastTickerInterval);
-      fastTickerInterval = null;
-      fastTickerActive = false;
-    }
-  } catch (err) {
-    console.error("Error in fast countdown refresh:", err);
   }
 }
 
@@ -639,7 +583,7 @@ bot.on("my_chat_member", async (ctx) => {
     `<b>🏆 Drawing & Winners</b>\n` +
     `• Animated wheel spin before revealing winners\n` +
     `• Auto-draw when timer expires or max entries reached\n` +
-    `• Live countdown on raffle posts (per-second in final 30s)\n` +
+    `• Live countdown on raffle posts (updates every minute)\n` +
     `• 5-minute "ending soon" reminders\n` +
     `• Winners & creator notified via DM\n\n` +
     `<b>📋 Templates & Recurring</b>\n` +
@@ -704,7 +648,7 @@ async function main(): Promise<void> {
 
   // Start countdown refresh
   setInterval(refreshCountdowns, COUNTDOWN_REFRESH_INTERVAL);
-  console.log("Countdown refresh active: every 60s, per-second in final 30s");
+  console.log("Countdown refresh active: every 60s");
 
   // Start recurring template checker
   setInterval(checkRecurringTemplates, RECURRING_CHECK_INTERVAL);

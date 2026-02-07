@@ -1932,9 +1932,12 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
             }
           );
           return; // Success - exit early
-        } catch {
+        } catch (err) {
+          console.error(`Failed to swap banner to closed:`, err);
           // editMessageMedia failed, fall back to editMessageCaption
         }
+      } else {
+        console.log(`No closed banner file_id available for chat ${raffle.chat_id}`);
       }
 
       // Fallback: just update the caption (banner stays as "open")

@@ -101,7 +101,9 @@ export async function getBannerFileId(
       } catch {}
       return largestPhoto.file_id;
     }
-  } catch {}
+  } catch (err) {
+    console.error(`Failed to get banner file_id for ${bannerType}:`, err);
+  }
 
   return null;
 }
@@ -254,7 +256,7 @@ export async function sendCustomImage(
 }
 
 /**
- * Send a countdown animation (5, 4, 3, 2, 1) before revealing winners.
+ * Send a 10-second countdown before revealing winners.
  * Non-fatal — if anything fails, the draw still proceeds.
  */
 export async function sendWheelSpin(
@@ -274,23 +276,20 @@ export async function sendWheelSpin(
   },
   chatId: number
 ): Promise<void> {
-  const countdownEmojis = ["5️⃣", "4️⃣", "3️⃣", "2️⃣", "1️⃣"];
-  const delayMs = 800; // Time between each number
-
   try {
     // Send initial countdown message
-    const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner...</b>\n\n${countdownEmojis[0]}`, {
+    const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner in 10...</b>`, {
       parse_mode: "HTML",
     });
 
-    // Edit through the countdown
-    for (let i = 1; i < countdownEmojis.length; i++) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    // Countdown from 9 to 1
+    for (let i = 9; i >= 1; i--) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       try {
         await api.editMessageText(
           chatId,
           msg.message_id,
-          `🎰 <b>Drawing winner...</b>\n\n${countdownEmojis[i]}`,
+          `🎰 <b>Drawing winner in ${i}...</b>`,
           { parse_mode: "HTML" }
         );
       } catch {
@@ -298,8 +297,8 @@ export async function sendWheelSpin(
       }
     }
 
-    // Brief pause on "1" then delete
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    // Brief pause then delete
+    await new Promise((resolve) => setTimeout(resolve, 1000));
 
     try {
       await api.deleteMessage(chatId, msg.message_id);

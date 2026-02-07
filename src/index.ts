@@ -328,7 +328,8 @@ async function checkExpiredRaffles(): Promise<void> {
                     parse_mode: "HTML",
                   }
                 );
-              } catch {
+              } catch (err) {
+                console.error(`Failed to swap banner to closed:`, err);
                 // Fallback to just caption update
                 await bot.api.editMessageCaption(
                   raffle.chat_id,

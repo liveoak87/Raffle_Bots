@@ -1,16 +1,19 @@
 # CLAUDE.md — AI Assistant Guide for redbeardpeptides
 
-> Last updated: 2026-02-04
+> Last updated: 2026-02-07
 
 ## Project Overview
 
 **Repository:** `liveoak87/redbeardpeptides`
-**Status:** New project — repository initialized, no application code yet.
-**Purpose:** Red Beard Peptides project repository.
+**Status:** Active development
+**Purpose:** Discord raffle bot — "Ultimate Random" — a number board where users claim slots and admins draw a random winner.
 
-## Repository State
+## Technology Stack
 
-This repository is currently empty and awaiting initial project scaffolding. When the project is bootstrapped, this document should be updated to reflect the chosen technology stack, directory structure, and development workflows.
+- **Runtime:** Node.js
+- **Discord library:** discord.js v14
+- **Database:** SQLite via better-sqlite3
+- **Config:** dotenv for environment variables
 
 ## Branch Strategy
 
@@ -50,30 +53,30 @@ This repository is currently empty and awaiting initial project scaffolding. Whe
 
 ### File Organization
 
-- Once the project is scaffolded, document the directory structure here.
+```
+src/
+  index.js      — Bot entry point, event handlers, command logic
+  commands.js   — Slash command definitions (/raffle, /pick)
+  board.js      — Embed board rendering + button grid
+  database.js   — SQLite schema and queries
+  deploy.js     — One-time slash command registration script
+.env.example    — Required environment variables template
+```
+
 - Keep related code co-located.
 - Place tests alongside or mirroring the source files they cover.
 
 ## Build & Development Commands
 
-> To be documented once the project stack is chosen. Example format:
-
 ```bash
 # Install dependencies
-# npm install / yarn / pnpm install
+npm install
 
-# Start development server
-# npm run dev
+# Register slash commands with Discord (run once, or after changing command definitions)
+npm run deploy
 
-# Run tests
-# npm test
-
-# Build for production
-# npm run build
-
-# Lint / format
-# npm run lint
-# npm run format
+# Start the bot
+npm start
 ```
 
 ## Testing
@@ -96,8 +99,10 @@ This repository is currently empty and awaiting initial project scaffolding. Whe
 
 ## Known Issues / Notes
 
-- Repository is freshly initialized with no code or configuration yet.
-- This CLAUDE.md should be updated as the project evolves to reflect actual structure, commands, and conventions.
+- Bot requires `DISCORD_TOKEN` and `CLIENT_ID` in `.env` (see `.env.example`).
+- One active raffle per channel at a time.
+- Button grid supports up to 25 slots (Discord component limit).
+- The `raffle.db` SQLite file is created at runtime in the project root (gitignored).
 
 ---
 

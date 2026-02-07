@@ -17,7 +17,6 @@ import {
   handleEnterCallback,
   handleLeaveCallback,
   handleEntriesCallback,
-  handleEntriesCloseCallback,
   handleSaveTemplate,
   handleTemplates,
   handleDeleteTemplate,
@@ -138,7 +137,6 @@ bot.command("bugreport", handleBugReport);
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
 bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
 bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
-bot.callbackQuery(/^entries_close_\d+$/, handleEntriesCloseCallback);
 
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);

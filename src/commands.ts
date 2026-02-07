@@ -1823,7 +1823,7 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
   }
 }
 
-const ENTRIES_PER_PAGE = 15;
+const ENTRIES_PER_PAGE = 12; // Fit nicely in popup alert
 
 export async function handleEntriesCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
@@ -1872,74 +1872,37 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
     .map((e, i) => `${startIdx + i + 1}. ${e.user_display_name}`)
     .join("\n");
 
-  const title = raffle ? raffle.title : `Raffle #${raffleId}`;
-  let message = `📋 "${title}" (${entries.length})\n\n${names}`;
+  let message = `📋 Entries (${entries.length})\n\n${names}`;
 
+  // Add pagination info and navigation hint
   if (totalPages > 1) {
     message += `\n\n📄 Page ${currentPage}/${totalPages}`;
-  }
-
-  // If only one page, just show the alert
-  if (totalPages === 1) {
-    await ctx.answerCallbackQuery({
-      text: message,
-      show_alert: true,
-    });
-    return;
-  }
-
-  // Multiple pages - send/edit message with pagination buttons
-  await ctx.answerCallbackQuery();
-
-  const keyboard = new InlineKeyboard();
-  if (currentPage > 1) {
-    keyboard.text("⬅️ Prev", `entries_${raffleId}_${currentPage - 1}`);
-  }
-  if (currentPage < totalPages) {
-    keyboard.text("Next ➡️", `entries_${raffleId}_${currentPage + 1}`);
-  }
-  keyboard.row().text("❌ Close", `entries_close_${raffleId}`);
-
-  // Check if this is a pagination click (editing existing message) or initial click
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  const messageId = ctx.callbackQuery?.message?.message_id;
-
-  if (chatId && messageId && parts[1]) {
-    // Pagination click - edit existing message
+    // Update the button to show next page
+    const nextPage = currentPage < totalPages ? currentPage + 1 : 1; // Wrap around
+    // We'll update the button's callback data for next click
     try {
-      await ctx.api.editMessageText(chatId, messageId, message, {
-        reply_markup: keyboard,
-      });
-    } catch {
-      // Message unchanged or can't edit
-    }
-  } else {
-    // Initial click - send new message as DM
-    const userId = ctx.from?.id;
-    if (userId) {
-      try {
-        await ctx.api.sendMessage(userId, message, { reply_markup: keyboard });
-      } catch {
-        // Can't DM, try in chat
-        await ctx.reply(message, { reply_markup: keyboard });
+      const chatId = ctx.callbackQuery?.message?.chat?.id;
+      const messageId = ctx.callbackQuery?.message?.message_id;
+      if (chatId && messageId && raffle) {
+        const lang = db.getChatLanguage(chatId);
+        const count = entries.length;
+        const keyboard = new InlineKeyboard()
+          .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+          .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+          .row()
+          .text(`👥 ${t(lang, "btn.entries", { count })} [${nextPage}/${totalPages}]`, `entries_${raffleId}_${nextPage}`);
+
+        await ctx.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard });
       }
-    }
-  }
-}
-
-export async function handleEntriesCloseCallback(ctx: Context): Promise<void> {
-  const messageId = ctx.callbackQuery?.message?.message_id;
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-
-  await ctx.answerCallbackQuery();
-
-  if (chatId && messageId) {
-    try {
-      await ctx.api.deleteMessage(chatId, messageId);
     } catch {
-      // Can't delete, ignore
+      // Can't edit markup, ignore
     }
   }
+
+  await ctx.answerCallbackQuery({
+    text: message,
+    show_alert: true,
+  });
 }
 
 // --- Utility ---

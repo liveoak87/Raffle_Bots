@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendBanner, sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
+import { sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -400,8 +400,6 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const entryNames = entries.map((e) => e.user_display_name);
   const winners = db.selectWinners(raffle.id);
 
-  await sendBanner(ctx.api, ctx.chat!.id, "drawn");
-
   // Wheel spin GIF animation (2+ entries for suspense, if animation enabled)
   if (entryNames.length >= 2 && raffle.show_animation) {
     await sendWheelSpin(ctx.api, ctx.chat!.id);
@@ -470,8 +468,6 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   }
 
   db.closeRaffle(raffleId);
-
-  await sendBanner(ctx.api, ctx.chat!.id, "closed");
 
   await replyPrivately(ctx,
     `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
@@ -1777,8 +1773,6 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         const entries = db.getEntriesForRaffle(raffleId);
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffleId);
-
-        await sendBanner(ctx.api, raffle.chat_id, "drawn");
 
         // Wheel spin GIF animation (if animation enabled)
         if (entryNames.length >= 2 && raffle.show_animation) {

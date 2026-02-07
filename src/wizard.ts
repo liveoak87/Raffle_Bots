@@ -10,7 +10,7 @@ import {
   formatCountdown,
 } from "./helpers";
 import { t } from "./i18n";
-import { sendBanner, sendCustomImage, sendRafflePost } from "./banners";
+import { sendCustomImage, sendRafflePost } from "./banners";
 
 interface WizardState {
   step:

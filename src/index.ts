@@ -60,7 +60,7 @@ import {
   handleBugReportPhoto,
   handleBugReportSkip,
 } from "./wizard";
-import { sendBanner, sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
+import { sendWheelSpin, sendRafflePost, getBannerFileId } from "./banners";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -242,8 +242,6 @@ async function checkExpiredRaffles(): Promise<void> {
         const entries = db.getEntriesForRaffle(raffle.id);
         const entryNames = entries.map((e) => e.user_display_name);
         const winners = db.selectWinners(raffle.id);
-
-        await sendBanner(bot.api, raffle.chat_id, "drawn");
 
         // Only show wheel spin if raffle expired recently (within 2 minutes) and animation is enabled
         const expiredAt = new Date(raffle.ends_at + "Z");

@@ -10,10 +10,6 @@ const BANNER_FILES: Record<BannerType, string> = {
   closed: "banner_closed.png",
 };
 
-const WHEEL_GIF = "wheel_spin.gif";
-const WHEEL_CACHE_KEY = "wheel_spin";
-const WHEEL_PLAY_TIME = 2500; // ms to let the GIF play before deleting
-
 function getAssetPath(filename: string): string {
   return path.join(process.cwd(), "assets", filename);
 }
@@ -258,62 +254,60 @@ export async function sendCustomImage(
 }
 
 /**
- * Send the spinning wheel GIF animation, wait for it to play,
- * then delete it. Used before revealing winners.
+ * Send a countdown animation (5, 4, 3, 2, 1) before revealing winners.
  * Non-fatal — if anything fails, the draw still proceeds.
  */
 export async function sendWheelSpin(
   api: {
-    sendAnimation: (
+    sendMessage: (
       chatId: number,
-      animation: string | InputFile,
+      text: string,
       opts?: Record<string, unknown>
-    ) => Promise<{
-      message_id: number;
-      animation?: { file_id: string };
-    }>;
+    ) => Promise<{ message_id: number }>;
+    editMessageText: (
+      chatId: number,
+      messageId: number,
+      text: string,
+      opts?: Record<string, unknown>
+    ) => Promise<unknown>;
     deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
   },
   chatId: number
 ): Promise<void> {
-  let msgId: number | null = null;
+  const countdownEmojis = ["5️⃣", "4️⃣", "3️⃣", "2️⃣", "1️⃣"];
+  const delayMs = 800; // Time between each number
 
   try {
-    // 1. Try cached file_id
-    const cachedFileId = getCachedBannerFileId(WHEEL_CACHE_KEY);
-    if (cachedFileId) {
+    // Send initial countdown message
+    const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner...</b>\n\n${countdownEmojis[0]}`, {
+      parse_mode: "HTML",
+    });
+
+    // Edit through the countdown
+    for (let i = 1; i < countdownEmojis.length; i++) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
       try {
-        const msg = await api.sendAnimation(chatId, cachedFileId);
-        msgId = msg.message_id;
+        await api.editMessageText(
+          chatId,
+          msg.message_id,
+          `🎰 <b>Drawing winner...</b>\n\n${countdownEmojis[i]}`,
+          { parse_mode: "HTML" }
+        );
       } catch {
-        // Cache stale — fall through to file upload
+        // Edit failed, continue anyway
       }
     }
 
-    // 2. Upload from local file
-    if (!msgId) {
-      const filePath = getAssetPath(WHEEL_GIF);
-      const msg = await api.sendAnimation(chatId, new InputFile(filePath));
-      msgId = msg.message_id;
-      // Cache the file_id
-      if (msg.animation?.file_id) {
-        setCachedBannerFileId(WHEEL_CACHE_KEY, msg.animation.file_id);
-      }
-    }
+    // Brief pause on "1" then delete
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
 
-    // 3. Wait for the animation to play
-    await new Promise((resolve) => setTimeout(resolve, WHEEL_PLAY_TIME));
-
-    // 4. Delete the GIF message
-    if (msgId) {
-      try {
-        await api.deleteMessage(chatId, msgId);
-      } catch {
-        // Delete failed (permissions) — leave it, not critical
-      }
+    try {
+      await api.deleteMessage(chatId, msg.message_id);
+    } catch {
+      // Delete failed (permissions) — leave it, not critical
     }
   } catch (err) {
-    console.error(`Failed to send wheel spin GIF to chat ${chatId}:`, err);
+    console.error(`Failed to send countdown to chat ${chatId}:`, err);
     // Non-fatal — the draw proceeds without the animation
   }
 }

@@ -750,7 +750,15 @@ async function main(): Promise<void> {
   setInterval(purgeOldData, PURGE_CHECK_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
-  await bot.start();
+  await bot.start({
+    allowed_updates: [
+      "message",
+      "callback_query",
+      "inline_query",
+      "my_chat_member",
+      "chat_member",
+    ],
+  });
 }
 
 main().catch((err) => {

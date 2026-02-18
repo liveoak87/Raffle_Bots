@@ -24,7 +24,8 @@ interface WizardState {
     | "options_image"
     | "options_scheduled"
     | "options_minage"
-    | "options_cooldown";
+    | "options_cooldown"
+    | "options_referral_max";
   targetChatId: number;
   targetChatTitle: string;
   dmChatId: number;
@@ -42,6 +43,8 @@ interface WizardState {
   requireUsername?: boolean;
   winnerCooldown?: number;
   showAnimation?: boolean;
+  referralEnabled?: boolean;
+  maxReferralEntries?: number;
   createdAt: number;
 }
 
@@ -254,6 +257,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleOptionsMinAgeText(ctx, state, text);
     case "options_cooldown":
       return await handleOptionsCooldownText(ctx, state, text);
+    case "options_referral_max":
+      return await handleOptionsReferralMaxText(ctx, state, text);
     default:
       return false;
   }
@@ -504,6 +509,13 @@ function buildOptionsText(state: WizardState): string {
     msg += `🛡 <b>Winner cooldown:</b> Last ${state.winnerCooldown} raffle${state.winnerCooldown > 1 ? "s" : ""} ✅\n`;
   }
 
+  if (state.referralEnabled) {
+    const cap = state.maxReferralEntries && state.maxReferralEntries > 0
+      ? `max ${state.maxReferralEntries}`
+      : "unlimited";
+    msg += `🔗 <b>Referral entries:</b> On (${cap}) ✅\n`;
+  }
+
   return msg;
 }
 
@@ -549,6 +561,11 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
   kb.text(
     state.showAnimation !== false ? "🎡 Animation: On" : "🎡 Animation: Off",
     "wiz_opt_animation"
+  );
+  kb.row();
+  kb.text(
+    state.referralEnabled ? "🔗 Referrals: On" : "🔗 Referrals: Off",
+    "wiz_opt_referral"
   );
   kb.row();
   kb.text("✅ Create Raffle", "wiz_opt_create");
@@ -661,6 +678,30 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
         parse_mode: "HTML",
         reply_markup: buildOptionsKeyboard(state),
       });
+      break;
+
+    case "wiz_opt_referral":
+      if (state.referralEnabled) {
+        // Toggle off
+        state.referralEnabled = false;
+        state.maxReferralEntries = undefined;
+        await ctx.editMessageText(buildOptionsText(state), {
+          parse_mode: "HTML",
+          reply_markup: buildOptionsKeyboard(state),
+        });
+      } else {
+        // Toggle on — ask for max cap
+        state.referralEnabled = true;
+        state.step = "options_referral_max";
+        await ctx.editMessageText(
+          `🔗 <b>Referral Entries</b>\n\n` +
+            `When enabled, users who enter will get a unique invite link DMd to them. ` +
+            `Each person who joins the group via their link earns them +1 bonus entry.\n\n` +
+            `Set a <b>max bonus entries</b> per user, or type <code>0</code> for unlimited:\n\n` +
+            `Examples: <code>5</code>, <code>10</code>, <code>0</code> (unlimited)`,
+          { parse_mode: "HTML" }
+        );
+      }
       break;
 
     case "wiz_opt_create":
@@ -777,6 +818,22 @@ async function handleOptionsCooldownText(
   return true;
 }
 
+async function handleOptionsReferralMaxText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const num = parseInt(text, 10);
+  if (isNaN(num) || num < 0) {
+    await ctx.reply("Enter a number (0 for unlimited, or a positive number for the cap).");
+    return true;
+  }
+
+  state.maxReferralEntries = num;
+  await sendOptionsScreen(ctx, state);
+  return true;
+}
+
 // --- Create the raffle and post it to the group ---
 
 async function createRaffleFromWizard(
@@ -814,6 +871,8 @@ async function createRaffleFromWizard(
     require_username: state.requireUsername ? 1 : 0,
     winner_cooldown: state.winnerCooldown || 0,
     show_animation: state.showAnimation !== false ? 1 : 0,
+    referral_enabled: state.referralEnabled ? 1 : 0,
+    max_referral_entries: state.maxReferralEntries || 0,
   });
 
   cancelWizard(state.userId);
@@ -834,18 +893,31 @@ async function createRaffleFromWizard(
     raffle.image_file_id
   );
 
-  if (msgId) {
-    db.updateRaffleMessageId(raffle.id, msgId);
+  if (!msgId) {
+    // Failed to post - delete the raffle from database and notify user
+    db.deleteRaffle(raffle.id);
+    await ctx.reply(
+      `❌ Failed to post raffle to <b>${escapeHtml(state.targetChatTitle)}</b>.\n\n` +
+        `This can happen if:\n` +
+        `• The topic/thread is closed\n` +
+        `• The bot was removed from the group\n` +
+        `• The bot doesn't have permission to post\n\n` +
+        `Please check the group settings and try again.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
-    // Auto-pin the raffle message if enabled
-    if (raffle.auto_pin) {
-      try {
-        await ctx.api.pinChatMessage(state.targetChatId, msgId, {
-          disable_notification: true,
-        });
-      } catch {
-        // Bot may not have pin permission
-      }
+  db.updateRaffleMessageId(raffle.id, msgId);
+
+  // Auto-pin the raffle message if enabled
+  if (raffle.auto_pin) {
+    try {
+      await ctx.api.pinChatMessage(state.targetChatId, msgId, {
+        disable_notification: true,
+      });
+    } catch {
+      // Bot may not have pin permission
     }
   }
 

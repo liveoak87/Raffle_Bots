@@ -5,6 +5,7 @@ import type {
   RaffleWinner,
   CreateRaffleInput,
   RaffleTemplate,
+  ReferralLink,
 } from "./types";
 import { getPrizeForPosition } from "./types";
 
@@ -96,11 +97,26 @@ export function initDatabase(dbPath: string): Database.Database {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS referral_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raffle_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      user_display_name TEXT NOT NULL,
+      chat_id INTEGER NOT NULL,
+      invite_link TEXT NOT NULL,
+      bonus_entries INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
+      UNIQUE(raffle_id, user_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_user_id ON raffle_entries(user_id);
     CREATE INDEX IF NOT EXISTS idx_templates_chat_id ON raffle_templates(chat_id);
+    CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
+    CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
   `);
 
   // Run migrations for existing databases
@@ -176,6 +192,34 @@ function migrateDatabase(): void {
       "ALTER TABLE raffles ADD COLUMN show_animation INTEGER NOT NULL DEFAULT 1"
     );
   }
+  if (!raffleColumns.includes("referral_enabled")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN referral_enabled INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("max_referral_entries")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN max_referral_entries INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+
+  // Create referral_links table if it doesn't exist
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS referral_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raffle_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      user_display_name TEXT NOT NULL,
+      chat_id INTEGER NOT NULL,
+      invite_link TEXT NOT NULL,
+      bonus_entries INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
+      UNIQUE(raffle_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
+    CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
+  `);
 }
 
 export function getDb(): Database.Database {
@@ -189,8 +233,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -293,7 +337,14 @@ export function addEntry(
     return { success: true, maxReached };
   } catch (err: any) {
     if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      return { success: false, reason: "You already entered this raffle!" };
+      const messages = [
+        "Look, we get it. Free stuff hits different. But you already threw your name in this one, you eager beaver.",
+        "Your enthusiasm for free things is noted and respected. But you already entered this one, champ.",
+        "We love the energy, but you already snagged your spot in this one. Save some luck for the rest of us.",
+        "Easy there, tiger. You already entered this one. We admire the hustle though.",
+      ];
+      const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+      return { success: false, reason: randomMessage };
     }
     throw err;
   }
@@ -374,7 +425,34 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
   if (entries.length === 0) return [];
 
   const numWinners = Math.min(raffle.max_winners, entries.length);
-  const selected = cryptoShuffle(entries).slice(0, numWinners);
+
+  // Build weighted entry pool if referral entries are enabled
+  let pool: RaffleEntry[];
+  if (raffle.referral_enabled) {
+    pool = [];
+    for (const entry of entries) {
+      // 1 base entry
+      pool.push(entry);
+      // Add bonus entries from referrals
+      const bonus = getBonusEntries(raffleId, entry.user_id);
+      for (let i = 0; i < bonus; i++) {
+        pool.push(entry);
+      }
+    }
+  } else {
+    pool = entries;
+  }
+
+  // Shuffle and pick unique winners
+  const shuffled = cryptoShuffle(pool);
+  const selected: RaffleEntry[] = [];
+  const selectedIds = new Set<number>();
+  for (const entry of shuffled) {
+    if (selectedIds.has(entry.user_id)) continue;
+    selectedIds.add(entry.user_id);
+    selected.push(entry);
+    if (selected.length >= numWinners) break;
+  }
 
   const insertStmt = getDb().prepare(`
     INSERT INTO raffle_winners (raffle_id, user_id, user_name, user_display_name, prize, position)
@@ -718,6 +796,8 @@ export function updateRaffleFields(
     "require_username",
     "winner_cooldown",
     "image_file_id",
+    "referral_enabled",
+    "max_referral_entries",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];
@@ -811,6 +891,26 @@ export function getAllGroupChatIds(): number[] {
   return rows.map((r) => r.chat_id);
 }
 
+// --- Active raffles by group ---
+
+export function getActiveRafflesByGroup(): Array<{ chat_id: number; raffles: Raffle[] }> {
+  const d = getDb();
+  const activeRaffles = d
+    .prepare("SELECT * FROM raffles WHERE status = 'open' ORDER BY chat_id, created_at DESC")
+    .all() as Raffle[];
+
+  // Group by chat_id
+  const grouped = new Map<number, Raffle[]>();
+  for (const raffle of activeRaffles) {
+    if (!grouped.has(raffle.chat_id)) {
+      grouped.set(raffle.chat_id, []);
+    }
+    grouped.get(raffle.chat_id)!.push(raffle);
+  }
+
+  return Array.from(grouped.entries()).map(([chat_id, raffles]) => ({ chat_id, raffles }));
+}
+
 // --- Banner cache ---
 
 export function getCachedBannerFileId(bannerType: string): string | null {
@@ -833,6 +933,77 @@ export function clearBannerCache(): void {
   const d = getDb();
   d.prepare("DELETE FROM banner_cache").run();
   console.log("Banner cache cleared");
+}
+
+// --- Referral links ---
+
+export function createReferralLink(
+  raffleId: number,
+  userId: number,
+  displayName: string,
+  chatId: number,
+  inviteLink: string
+): ReferralLink {
+  const stmt = getDb().prepare(`
+    INSERT INTO referral_links (raffle_id, user_id, user_display_name, chat_id, invite_link)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const result = stmt.run(raffleId, userId, displayName, chatId, inviteLink);
+  return getDb()
+    .prepare("SELECT * FROM referral_links WHERE id = ?")
+    .get(result.lastInsertRowid) as ReferralLink;
+}
+
+export function getReferralLink(
+  raffleId: number,
+  userId: number
+): ReferralLink | undefined {
+  return getDb()
+    .prepare("SELECT * FROM referral_links WHERE raffle_id = ? AND user_id = ?")
+    .get(raffleId, userId) as ReferralLink | undefined;
+}
+
+export function getReferralByInviteLink(
+  inviteLink: string
+): ReferralLink | undefined {
+  return getDb()
+    .prepare("SELECT * FROM referral_links WHERE invite_link = ?")
+    .get(inviteLink) as ReferralLink | undefined;
+}
+
+/**
+ * Find all active referral links for a chat (across all open raffles).
+ * Used when a new member joins via invite link to match the referrer.
+ */
+export function getActiveReferralsByInviteLink(
+  inviteLink: string
+): ReferralLink[] {
+  return getDb()
+    .prepare(
+      `SELECT rl.* FROM referral_links rl
+       JOIN raffles r ON rl.raffle_id = r.id
+       WHERE rl.invite_link = ? AND r.status = 'open'`
+    )
+    .all(inviteLink) as ReferralLink[];
+}
+
+export function incrementBonusEntries(referralId: number): void {
+  getDb()
+    .prepare("UPDATE referral_links SET bonus_entries = bonus_entries + 1 WHERE id = ?")
+    .run(referralId);
+}
+
+export function getBonusEntries(raffleId: number, userId: number): number {
+  const row = getDb()
+    .prepare("SELECT bonus_entries FROM referral_links WHERE raffle_id = ? AND user_id = ?")
+    .get(raffleId, userId) as { bonus_entries: number } | undefined;
+  return row?.bonus_entries ?? 0;
+}
+
+export function getReferralLinksForRaffle(raffleId: number): ReferralLink[] {
+  return getDb()
+    .prepare("SELECT * FROM referral_links WHERE raffle_id = ? ORDER BY bonus_entries DESC")
+    .all(raffleId) as ReferralLink[];
 }
 
 // --- Utility ---

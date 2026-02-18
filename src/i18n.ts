@@ -46,7 +46,7 @@ const translations: Translations = {
 
     // Entry responses
     "entry.success": "You're in! Good luck!",
-    "entry.already": "You already entered this raffle!",
+    "entry.already": "Hey, everyone loves free stuff, but sadly you already entered this one.",
     "entry.full": "This raffle is full.",
     "entry.expired": "This raffle has expired.",
     "entry.not_open": "This raffle hasn't opened yet.",

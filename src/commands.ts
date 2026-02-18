@@ -267,6 +267,8 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     require_username: 0,
     winner_cooldown: 0,
     show_animation: 1,
+    referral_enabled: 0,
+    max_referral_entries: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -848,6 +850,8 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       require_username: sourceRaffle.require_username,
       winner_cooldown: sourceRaffle.winner_cooldown,
       show_animation: sourceRaffle.show_animation,
+      referral_enabled: sourceRaffle.referral_enabled,
+      max_referral_entries: sourceRaffle.max_referral_entries,
     });
 
     // Copy all entries from the source raffle
@@ -1090,6 +1094,8 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       require_username: 0,
       winner_cooldown: 0,
       show_animation: 1,
+      referral_enabled: 0,
+      max_referral_entries: 0,
     });
 
     const lang = db.getChatLanguage(chatId);
@@ -1501,6 +1507,8 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     require_username: 0,
     winner_cooldown: 0,
     show_animation: 1,
+    referral_enabled: 0,
+    max_referral_entries: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -1763,6 +1771,43 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
     await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
     await updateRafflePost(ctx, raffleId);
 
+    // Send referral invite link via DM if referrals are enabled
+    if (raffle && raffle.referral_enabled) {
+      try {
+        // Check if user already has a referral link for this raffle
+        let refLink = db.getReferralLink(raffleId, userId);
+        if (!refLink) {
+          // Create a unique invite link for this user
+          const invite = await ctx.api.createChatInviteLink(raffle.chat_id, {
+            name: `ref_${raffleId}_${userId}`,
+            creates_join_request: false,
+          });
+          refLink = db.createReferralLink(
+            raffleId,
+            userId,
+            displayName,
+            raffle.chat_id,
+            invite.invite_link
+          );
+        }
+
+        const capText = raffle.max_referral_entries > 0
+          ? `(max ${raffle.max_referral_entries} bonus entries)`
+          : "(no limit)";
+
+        await ctx.api.sendMessage(
+          userId,
+          `🔗 <b>Referral Link — ${escapeHtml(raffle.title)}</b>\n\n` +
+            `Share this link to earn <b>bonus entries</b>! Each person who joins the group ` +
+            `through your link gives you +1 extra chance to win ${capText}.\n\n` +
+            `Your link:\n${refLink.invite_link}`,
+          { parse_mode: "HTML" }
+        );
+      } catch {
+        // User may not have started the bot — can't DM them
+      }
+    }
+
     // Auto-draw when max entries reached
     if (result.maxReached) {
       const raffle = db.getRaffleById(raffleId);
@@ -1823,17 +1868,11 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
   }
 }
 
-const ENTRIES_PER_PAGE = 12; // Fit nicely in popup alert
-
 export async function handleEntriesCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
   if (!data) return;
 
-  // Parse raffleId and page number from callback data
-  // Format: "entries_123" or "entries_123_2" (page 2)
-  const parts = data.replace("entries_", "").split("_");
-  const raffleId = parseInt(parts[0], 10);
-  const page = parts[1] ? parseInt(parts[1], 10) : 1;
+  const raffleId = parseInt(data.replace(/^entries_/, "").split("_")[0], 10);
   if (isNaN(raffleId)) return;
 
   const raffle = db.getRaffleById(raffleId);
@@ -1860,47 +1899,22 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // Calculate pagination
-  const totalPages = Math.ceil(entries.length / ENTRIES_PER_PAGE);
-  const currentPage = Math.max(1, Math.min(page, totalPages));
-  const startIdx = (currentPage - 1) * ENTRIES_PER_PAGE;
-  const endIdx = Math.min(startIdx + ENTRIES_PER_PAGE, entries.length);
-  const pageEntries = entries.slice(startIdx, endIdx);
+  // Build entries list - Telegram popup limit is ~200 chars
+  // Show most recent entries first (reverse order)
+  const reversed = [...entries].reverse();
+  const names = reversed.map((e, i) => `${entries.length - i}. ${e.user_display_name}`);
+  let message = `📋 Entries (${entries.length}) - Recent:\n`;
 
-  // Build the entries list for this page
-  const names = pageEntries
-    .map((e, i) => `${startIdx + i + 1}. ${e.user_display_name}`)
-    .join("\n");
-
-  let message = `📋 Entries (${entries.length})\n\n${names}`;
-
-  // Add pagination info and navigation hint
-  if (totalPages > 1) {
-    message += `\n\n📄 Page ${currentPage}/${totalPages}`;
-    // Update the button to show next page
-    const nextPage = currentPage < totalPages ? currentPage + 1 : 1; // Wrap around
-    // We'll update the button's callback data for next click
-    try {
-      const chatId = ctx.callbackQuery?.message?.chat?.id;
-      const messageId = ctx.callbackQuery?.message?.message_id;
-      if (chatId && messageId && raffle) {
-        const lang = db.getChatLanguage(chatId);
-        const count = entries.length;
-        const keyboard = new InlineKeyboard()
-          .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-          .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-          .row()
-          .text(`👥 ${t(lang, "btn.entries", { count })} [${nextPage}/${totalPages}]`, `entries_${raffleId}_${nextPage}`);
-
-        await ctx.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard });
-      }
-    } catch {
-      // Can't edit markup, ignore
+  for (const name of names) {
+    if ((message + name + "\n").length > 195) {
+      message += "...";
+      break;
     }
+    message += name + "\n";
   }
 
   await ctx.answerCallbackQuery({
-    text: message,
+    text: message.trim(),
     show_alert: true,
   });
 }
@@ -2091,7 +2105,26 @@ export async function handleStats(ctx: Context): Promise<void> {
   msg += `<b>Raffles:</b>\n`;
   msg += `  📋 Total: <b>${stats.totalRaffles}</b>\n`;
   msg += `  🟢 Active: <b>${stats.activeRaffles}</b>\n`;
-  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n\n`;
+  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n`;
+
+  // Show active raffles by group
+  const activeByGroup = db.getActiveRafflesByGroup();
+  if (activeByGroup.length > 0) {
+    msg += `\n<b>🟢 Active Raffles:</b>\n`;
+    for (const group of activeByGroup) {
+      let groupTitle = `Chat ${group.chat_id}`;
+      try {
+        const chat = await ctx.api.getChat(group.chat_id);
+        if ("title" in chat && chat.title) groupTitle = chat.title;
+      } catch {}
+      msg += `  <b>${escapeHtml(groupTitle)}:</b>\n`;
+      for (const raffle of group.raffles) {
+        const count = db.getEntryCount(raffle.id);
+        msg += `    • ${escapeHtml(raffle.title)} (${count} entries)\n`;
+      }
+    }
+  }
+  msg += `\n`;
 
   msg += `<b>Entries:</b>\n`;
   msg += `  📝 Total entries: <b>${stats.totalEntries}</b>\n`;
@@ -2101,18 +2134,22 @@ export async function handleStats(ctx: Context): Promise<void> {
   msg += `  📋 Raffles created: <b>${stats.rafflesLast7Days}</b>\n`;
   msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
 
-  // Fetch group names
+  // Fetch group names (only show groups bot is still in)
   const chatIds = db.getAllGroupChatIds();
-  if (chatIds.length > 0) {
+  const activeGroups: string[] = [];
+  for (const chatId of chatIds) {
+    try {
+      const chat = await ctx.api.getChat(chatId);
+      const title = "title" in chat && chat.title ? chat.title : `Chat ${chatId}`;
+      activeGroups.push(title);
+    } catch {
+      // Skip left/banned groups
+    }
+  }
+  if (activeGroups.length > 0) {
     msg += `\n<b>Groups:</b>\n`;
-    for (const chatId of chatIds) {
-      try {
-        const chat = await ctx.api.getChat(chatId);
-        const title = "title" in chat && chat.title ? chat.title : `Chat ${chatId}`;
-        msg += `  • ${escapeHtml(title)}\n`;
-      } catch {
-        msg += `  • <i>(left/banned) ${chatId}</i>\n`;
-      }
+    for (const title of activeGroups) {
+      msg += `  • ${escapeHtml(title)}\n`;
     }
   }
 

@@ -365,16 +365,30 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   }
 }
 
+// Track last refresh time for each raffle (for smart refresh intervals)
+const lastRefreshTime = new Map<number, number>();
+
+// Determine refresh interval based on time remaining
+function getRefreshInterval(remainingMs: number): number {
+  const TEN_MINUTES = 10 * 60 * 1000;
+  const ONE_HOUR = 60 * 60 * 1000;
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+
+  if (remainingMs <= TEN_MINUTES) return 60 * 1000;       // <10 min: every 1 minute
+  if (remainingMs <= ONE_HOUR) return 5 * 60 * 1000;      // 10-60 min: every 5 minutes
+  if (remainingMs <= SIX_HOURS) return 15 * 60 * 1000;    // 1-6 hours: every 15 minutes
+  return 30 * 60 * 1000;                                   // 6+ hours: every 30 minutes
+}
+
 async function refreshCountdowns(): Promise<void> {
   try {
     const raffles = db.getOpenRafflesWithEndTime();
-    if (raffles.length > 0) {
-      console.log(`Refreshing countdown for ${raffles.length} active raffle(s)`);
-    }
+    const now = Date.now();
+    let refreshedCount = 0;
 
     for (const raffle of raffles) {
       const endsAt = new Date(raffle.ends_at + "Z");
-      const remaining = endsAt.getTime() - Date.now();
+      const remaining = endsAt.getTime() - now;
 
       // Send "ending soon" reminder when <= 5 minutes remain
       if (
@@ -384,24 +398,41 @@ async function refreshCountdowns(): Promise<void> {
       ) {
         endingSoonSent.add(raffle.id);
         const entryCount = db.getEntryCount(raffle.id);
-        const lang = db.getChatLanguage(raffle.chat_id);
         const mins = Math.ceil(remaining / 60_000);
         try {
           await bot.api.sendMessage(
             raffle.chat_id,
             `⏰ <b>${escapeHtml(raffle.title)}</b> ends in ${mins} minute${mins > 1 ? "s" : ""}! ` +
-              `${entryCount} entr${entryCount === 1 ? "y" : "ies"} so far — ${t(lang, "raffle.enter_cta")}`,
-            { parse_mode: "HTML" }
+              `${entryCount} entr${entryCount === 1 ? "y" : "ies"} so far — Don't miss out!`,
+            {
+              parse_mode: "HTML",
+              reply_parameters: raffle.message_id ? { message_id: raffle.message_id } : undefined
+            }
           );
         } catch {
           // Couldn't send reminder — not critical
         }
       }
 
-      // Refresh countdown display (once per minute)
+      // Smart refresh: only update if enough time has passed based on remaining time
       if (remaining > 0) {
-        await refreshRaffleMessage(raffle);
+        const lastRefresh = lastRefreshTime.get(raffle.id) || 0;
+        const refreshInterval = getRefreshInterval(remaining);
+        const timeSinceLastRefresh = now - lastRefresh;
+
+        if (timeSinceLastRefresh >= refreshInterval) {
+          await refreshRaffleMessage(raffle);
+          lastRefreshTime.set(raffle.id, now);
+          refreshedCount++;
+        }
+      } else {
+        // Clean up tracking for ended raffles
+        lastRefreshTime.delete(raffle.id);
       }
+    }
+
+    if (refreshedCount > 0) {
+      console.log(`Refreshed ${refreshedCount} of ${raffles.length} active raffle(s)`);
     }
   } catch (err) {
     console.error("Error refreshing countdowns:", err);
@@ -464,6 +495,8 @@ async function checkRecurringTemplates(): Promise<void> {
         require_username: 0,
         winner_cooldown: 0,
         show_animation: 1,
+        referral_enabled: 0,
+        max_referral_entries: 0,
       });
 
       try {
@@ -542,6 +575,64 @@ bot.on("inline_query", async (ctx) => {
     await ctx.answerInlineQuery(results, { cache_time: 10 });
   } catch (err) {
     console.error("Inline query error:", err);
+  }
+});
+
+// --- Detect new members joining via referral invite links ---
+bot.on("chat_member", async (ctx) => {
+  const update = ctx.chatMember;
+  if (!update) return;
+
+  const oldStatus = update.old_chat_member.status;
+  const newStatus = update.new_chat_member.status;
+
+  // Only trigger when someone joins (was not in, now is a member)
+  const wasOut = oldStatus === "left" || oldStatus === "kicked";
+  const isIn = newStatus === "member" || newStatus === "administrator";
+  if (!wasOut || !isIn) return;
+
+  // Check if the join was via an invite link
+  const inviteLink = update.invite_link?.invite_link;
+  if (!inviteLink) return;
+
+  // Look up all active referral links matching this invite
+  const referrals = db.getActiveReferralsByInviteLink(inviteLink);
+  if (referrals.length === 0) return;
+
+  const joinedUserId = update.new_chat_member.user.id;
+
+  for (const ref of referrals) {
+    // Don't award bonus if the referrer is the person joining
+    if (ref.user_id === joinedUserId) continue;
+
+    const raffle = db.getRaffleById(ref.raffle_id);
+    if (!raffle || raffle.status !== "open") continue;
+
+    // Check max referral cap
+    if (raffle.max_referral_entries > 0 && ref.bonus_entries >= raffle.max_referral_entries) {
+      continue; // Cap reached
+    }
+
+    // Award +1 bonus entry
+    db.incrementBonusEntries(ref.id);
+
+    // Notify the referrer via DM
+    const newBonus = ref.bonus_entries + 1;
+    const joinerName = getUserDisplayName(
+      update.new_chat_member.user.first_name,
+      update.new_chat_member.user.last_name
+    );
+    try {
+      await bot.api.sendMessage(
+        ref.user_id,
+        `🔗 <b>+1 Bonus Entry!</b>\n\n` +
+          `${escapeHtml(joinerName)} joined via your referral link for <b>${escapeHtml(raffle.title)}</b>.\n` +
+          `You now have <b>${newBonus}</b> bonus entr${newBonus === 1 ? "y" : "ies"}.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // Can't DM the referrer
+    }
   }
 });
 

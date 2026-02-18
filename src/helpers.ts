@@ -73,6 +73,13 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
     msg += `🛡 <b>Requirements:</b> ${reqs.join(" · ")}\n`;
   }
 
+  if (raffle.referral_enabled) {
+    const cap = raffle.max_referral_entries > 0
+      ? `max ${raffle.max_referral_entries}`
+      : "unlimited";
+    msg += `🔗 <b>Referral bonus:</b> Invite friends for extra entries (${cap})\n`;
+  }
+
   msg += `\n<i>${t(lang, "raffle.created_by")} ${escapeHtml(raffle.creator_name)}</i>`;
 
   if (raffle.status === "open") {

@@ -35,6 +35,10 @@ export interface Raffle {
   winner_cooldown: number;
   /** Whether to show the wheel spin animation when drawing (0 = no, 1 = yes) */
   show_animation: number;
+  /** Whether referral entries are enabled (0 = no, 1 = yes) */
+  referral_enabled: number;
+  /** Maximum bonus entries a user can earn via referrals (0 = unlimited) */
+  max_referral_entries: number;
   created_at: string;
   drawn_at: string | null;
 }
@@ -82,6 +86,8 @@ export interface CreateRaffleInput {
   require_username: number;
   winner_cooldown: number;
   show_animation: number;
+  referral_enabled: number;
+  max_referral_entries: number;
 }
 
 export interface RaffleTemplate {
@@ -102,6 +108,17 @@ export interface RaffleTemplate {
   recurring_interval_minutes: number | null;
   recurring_active: number;
   next_run_at: string | null;
+  created_at: string;
+}
+
+export interface ReferralLink {
+  id: number;
+  raffle_id: number;
+  user_id: number;
+  user_display_name: string;
+  chat_id: number;
+  invite_link: string;
+  bonus_entries: number;
   created_at: string;
 }
 

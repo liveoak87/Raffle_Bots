@@ -269,6 +269,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     show_animation: 1,
     referral_enabled: 0,
     max_referral_entries: 0,
+    revoke_referral_links: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -390,6 +391,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
   const entryCount = db.getEntryCount(raffle.id);
   if (entryCount === 0) {
     db.markRaffleDrawn(raffle.id);
+    await revokeReferralInviteLinks(ctx.api, raffle.id);
     await replyPrivately(ctx,
       `🎟 <b>${escapeHtml(raffle.title)}</b>\n\nNo entries were received. Raffle closed with no winners.`,
       { parse_mode: "HTML" });
@@ -412,6 +414,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
 
   // Mark as drawn after successful announcement
   db.markRaffleDrawn(raffle.id);
+  await revokeReferralInviteLinks(ctx.api, raffle.id);
 
   await updateRafflePost(ctx, raffle.id);
 
@@ -468,6 +471,7 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   }
 
   db.closeRaffle(raffleId);
+  await revokeReferralInviteLinks(ctx.api, raffleId);
 
   await replyPrivately(ctx,
     `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
@@ -852,6 +856,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       show_animation: sourceRaffle.show_animation,
       referral_enabled: sourceRaffle.referral_enabled,
       max_referral_entries: sourceRaffle.max_referral_entries,
+      revoke_referral_links: sourceRaffle.revoke_referral_links,
     });
 
     // Copy all entries from the source raffle
@@ -1096,6 +1101,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       show_animation: 1,
       referral_enabled: 0,
       max_referral_entries: 0,
+      revoke_referral_links: 0,
     });
 
     const lang = db.getChatLanguage(chatId);
@@ -1509,6 +1515,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     show_animation: 1,
     referral_enabled: 0,
     max_referral_entries: 0,
+    revoke_referral_links: 0,
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
@@ -1826,6 +1833,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang));
 
         db.markRaffleDrawn(raffleId);
+        await revokeReferralInviteLinks(ctx.api, raffleId);
         await updateRafflePost(ctx, raffleId);
         await notifyWinnersAndCreator(ctx.api, raffle, winners);
       }
@@ -2007,6 +2015,36 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
     }
   } catch {
     // Message may have been deleted or too old to edit
+  }
+}
+
+/**
+ * Revoke all referral invite links for a raffle, if revoke_referral_links is enabled.
+ * Silently skips links that are already revoked or invalid.
+ */
+export async function revokeReferralInviteLinks(
+  api: { revokeChatInviteLink: (chatId: number, inviteLink: string) => Promise<unknown> },
+  raffleId: number
+): Promise<void> {
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle) return;
+  if (!raffle.referral_enabled || !raffle.revoke_referral_links) return;
+
+  const links = db.getReferralLinksForRaffle(raffleId);
+  if (links.length === 0) return;
+
+  let revoked = 0;
+  for (const link of links) {
+    try {
+      await api.revokeChatInviteLink(link.chat_id, link.invite_link);
+      revoked++;
+    } catch {
+      // Link may already be revoked, expired, or bot lost admin — skip
+    }
+  }
+
+  if (revoked > 0) {
+    console.log(`Revoked ${revoked}/${links.length} referral invite links for raffle ${raffleId}`);
   }
 }
 

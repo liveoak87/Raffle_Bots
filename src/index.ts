@@ -29,6 +29,7 @@ import {
   handleGroupStats,
   handleBugReport,
   notifyWinnersAndCreator,
+  revokeReferralInviteLinks,
 } from "./commands";
 import {
   formatRaffleMessage,
@@ -227,6 +228,7 @@ async function checkExpiredRaffles(): Promise<void> {
 
       // Mark as drawn IMMEDIATELY to prevent double-processing
       db.markRaffleDrawn(raffle.id);
+      await revokeReferralInviteLinks(bot.api, raffle.id);
 
       const entryCount = db.getEntryCount(raffle.id);
       const lang = db.getChatLanguage(raffle.chat_id);
@@ -497,6 +499,7 @@ async function checkRecurringTemplates(): Promise<void> {
         show_animation: 1,
         referral_enabled: 0,
         max_referral_entries: 0,
+        revoke_referral_links: 0,
       });
 
       try {

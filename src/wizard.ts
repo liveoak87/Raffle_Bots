@@ -45,6 +45,7 @@ interface WizardState {
   showAnimation?: boolean;
   referralEnabled?: boolean;
   maxReferralEntries?: number;
+  revokeReferralLinks?: boolean;
   createdAt: number;
 }
 
@@ -514,6 +515,7 @@ function buildOptionsText(state: WizardState): string {
       ? `max ${state.maxReferralEntries}`
       : "unlimited";
     msg += `🔗 <b>Referral entries:</b> On (${cap}) ✅\n`;
+    msg += `🗑 <b>Revoke links on end:</b> ${state.revokeReferralLinks ? "On ✅" : "Off"}\n`;
   }
 
   return msg;
@@ -567,6 +569,12 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
     state.referralEnabled ? "🔗 Referrals: On" : "🔗 Referrals: Off",
     "wiz_opt_referral"
   );
+  if (state.referralEnabled) {
+    kb.text(
+      state.revokeReferralLinks ? "🗑 Revoke Links: On" : "🗑 Revoke Links: Off",
+      "wiz_opt_revoke_links"
+    );
+  }
   kb.row();
   kb.text("✅ Create Raffle", "wiz_opt_create");
 
@@ -680,11 +688,20 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
       });
       break;
 
+    case "wiz_opt_revoke_links":
+      state.revokeReferralLinks = !state.revokeReferralLinks;
+      await ctx.editMessageText(buildOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildOptionsKeyboard(state),
+      });
+      break;
+
     case "wiz_opt_referral":
       if (state.referralEnabled) {
         // Toggle off
         state.referralEnabled = false;
         state.maxReferralEntries = undefined;
+        state.revokeReferralLinks = undefined;
         await ctx.editMessageText(buildOptionsText(state), {
           parse_mode: "HTML",
           reply_markup: buildOptionsKeyboard(state),
@@ -873,6 +890,7 @@ async function createRaffleFromWizard(
     show_animation: state.showAnimation !== false ? 1 : 0,
     referral_enabled: state.referralEnabled ? 1 : 0,
     max_referral_entries: state.maxReferralEntries || 0,
+    revoke_referral_links: state.revokeReferralLinks ? 1 : 0,
   });
 
   cancelWizard(state.userId);

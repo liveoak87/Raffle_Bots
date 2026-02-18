@@ -39,6 +39,8 @@ export interface Raffle {
   referral_enabled: number;
   /** Maximum bonus entries a user can earn via referrals (0 = unlimited) */
   max_referral_entries: number;
+  /** Whether to revoke referral invite links when raffle ends (0 = no, 1 = yes) */
+  revoke_referral_links: number;
   created_at: string;
   drawn_at: string | null;
 }
@@ -88,6 +90,7 @@ export interface CreateRaffleInput {
   show_animation: number;
   referral_enabled: number;
   max_referral_entries: number;
+  revoke_referral_links: number;
 }
 
 export interface RaffleTemplate {

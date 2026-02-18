@@ -202,6 +202,11 @@ function migrateDatabase(): void {
       "ALTER TABLE raffles ADD COLUMN max_referral_entries INTEGER NOT NULL DEFAULT 0"
     );
   }
+  if (!raffleColumns.includes("revoke_referral_links")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN revoke_referral_links INTEGER NOT NULL DEFAULT 0"
+    );
+  }
 
   // Create referral_links table if it doesn't exist
   getDb().exec(`
@@ -233,8 +238,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries)
+    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
+    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -798,6 +803,7 @@ export function updateRaffleFields(
     "image_file_id",
     "referral_enabled",
     "max_referral_entries",
+    "revoke_referral_links",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];

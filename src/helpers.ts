@@ -1,7 +1,7 @@
 import type { Context } from "grammy";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
-import { getEntryCount } from "./database";
+import { getEntryCount, getTotalEntryCount } from "./database";
 import { t } from "./i18n";
 
 export function escapeHtml(text: string): string {
@@ -20,7 +20,7 @@ export function getUserDisplayName(
 }
 
 export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: string = "en"): string {
-  const count = entryCount ?? getEntryCount(raffle.id);
+  const baseCount = entryCount ?? getEntryCount(raffle.id);
   const maxStr = raffle.max_entries ? `/${raffle.max_entries}` : "";
   const prizes = parsePrizes(raffle);
   const hasMultiplePrizes = prizes.length > 1;
@@ -41,7 +41,13 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
     msg += `🎁 <b>${t(lang, "raffle.prize")}:</b> ${escapeHtml(prizes[0])}\n`;
   }
 
-  msg += `👥 <b>${t(lang, "raffle.entries")}:</b> ${count}${maxStr}\n`;
+  // Show total weighted entries (base + referral bonus) when referrals are enabled
+  if (raffle.referral_enabled) {
+    const totalCount = getTotalEntryCount(raffle.id);
+    msg += `👥 <b>${t(lang, "raffle.entries")}:</b> ${totalCount}${maxStr} (${baseCount} participants)\n`;
+  } else {
+    msg += `👥 <b>${t(lang, "raffle.entries")}:</b> ${baseCount}${maxStr}\n`;
+  }
   msg += `🏆 <b>${t(lang, "raffle.winners")}:</b> ${raffle.max_winners}\n`;
 
   if (raffle.ends_at) {

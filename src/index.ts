@@ -337,13 +337,14 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   if (!raffle.message_id) return;
 
   const count = db.getEntryCount(raffle.id);
+  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : count;
   const lang = db.getChatLanguage(raffle.chat_id);
 
   const keyboard = new InlineKeyboard()
     .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
     .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
     .row()
-    .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+    .text(`👥 ${t(lang, "btn.entries", { count: displayCount })}`, `entries_${raffle.id}`);
 
   try {
     // Try editMessageCaption first (for photo messages with embedded banner)
@@ -399,7 +400,7 @@ async function refreshCountdowns(): Promise<void> {
         !endingSoonSent.has(raffle.id)
       ) {
         endingSoonSent.add(raffle.id);
-        const entryCount = db.getEntryCount(raffle.id);
+        const entryCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : db.getEntryCount(raffle.id);
         const mins = Math.ceil(remaining / 60_000);
         try {
           await bot.api.sendMessage(
@@ -619,6 +620,13 @@ bot.on("chat_member", async (ctx) => {
     // Award +1 bonus entry
     db.incrementBonusEntries(ref.id);
 
+    // Refresh the raffle post to show updated entry count
+    try {
+      await refreshRaffleMessage(raffle);
+    } catch {
+      // Non-critical — will refresh on next countdown cycle
+    }
+
     // Notify the referrer via DM
     const newBonus = ref.bonus_entries + 1;
     const joinerName = getUserDisplayName(
@@ -626,11 +634,12 @@ bot.on("chat_member", async (ctx) => {
       update.new_chat_member.user.last_name
     );
     try {
+      const totalEntries = 1 + newBonus; // 1 base + bonus
       await bot.api.sendMessage(
         ref.user_id,
         `🔗 <b>+1 Bonus Entry!</b>\n\n` +
           `${escapeHtml(joinerName)} joined via your referral link for <b>${escapeHtml(raffle.title)}</b>.\n` +
-          `You now have <b>${newBonus}</b> bonus entr${newBonus === 1 ? "y" : "ies"}.`,
+          `You now have <b>${totalEntries}</b> total entr${totalEntries === 1 ? "y" : "ies"} (1 base + ${newBonus} referral).`,
         { parse_mode: "HTML" }
       );
     } catch {

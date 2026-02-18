@@ -379,6 +379,19 @@ export function getEntryCount(raffleId: number): number {
   return row.count;
 }
 
+/** Get total entries including referral bonus entries (for display purposes) */
+export function getTotalEntryCount(raffleId: number): number {
+  const baseCount = getEntryCount(raffleId);
+  const raffle = getRaffleById(raffleId);
+  if (!raffle || !raffle.referral_enabled) return baseCount;
+  const bonusRow = getDb()
+    .prepare(
+      "SELECT COALESCE(SUM(bonus_entries), 0) as total FROM referral_links WHERE raffle_id = ?"
+    )
+    .get(raffleId) as { total: number };
+  return baseCount + bonusRow.total;
+}
+
 export function hasUserEntered(raffleId: number, userId: number): boolean {
   const row = getDb()
     .prepare(

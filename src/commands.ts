@@ -506,6 +506,10 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
     } else {
       msg += `  🎁 ${escapeHtml(prizes[0])}\n`;
     }
+    if (r.referral_enabled) {
+      const bonus = db.getBonusEntries(r.id, userId);
+      msg += `  🔗 ${1 + bonus} total entries (${bonus} referral bonus)\n`;
+    }
   }
 
   await replyPrivately(ctx, msg, { parse_mode: "HTML" });
@@ -1887,7 +1891,7 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
 
   // Anonymous mode: hide entry names until drawn
   if (raffle && raffle.anonymous && raffle.status !== "drawn") {
-    const count = db.getEntryCount(raffleId);
+    const count = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : db.getEntryCount(raffleId);
     await ctx.answerCallbackQuery({
       text: count === 0
         ? "No entries yet. Be the first!"
@@ -1910,8 +1914,24 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
   // Build entries list - Telegram popup limit is ~200 chars
   // Show most recent entries first (reverse order)
   const reversed = [...entries].reverse();
-  const names = reversed.map((e, i) => `${entries.length - i}. ${e.user_display_name}`);
-  let message = `📋 Entries (${entries.length}) - Recent:\n`;
+
+  // If referrals are enabled, show bonus entries next to names
+  const showBonus = raffle && raffle.referral_enabled;
+  const names = reversed.map((e, i) => {
+    const num = entries.length - i;
+    if (showBonus) {
+      const bonus = db.getBonusEntries(raffleId, e.user_id);
+      return bonus > 0
+        ? `${num}. ${e.user_display_name} (+${bonus})`
+        : `${num}. ${e.user_display_name}`;
+    }
+    return `${num}. ${e.user_display_name}`;
+  });
+
+  const totalCount = raffle && raffle.referral_enabled
+    ? db.getTotalEntryCount(raffleId)
+    : entries.length;
+  let message = `📋 Entries (${totalCount}) - Recent:\n`;
 
   for (const name of names) {
     if ((message + name + "\n").length > 195) {
@@ -1934,6 +1954,7 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
   if (!raffle || !raffle.message_id) return;
 
   const count = db.getEntryCount(raffleId);
+  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
 
   const lang = db.getChatLanguage(raffle.chat_id);
 
@@ -1943,7 +1964,7 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
         .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
         .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
         .row()
-        .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+        .text(`👥 ${t(lang, "btn.entries", { count: displayCount })}`, `entries_${raffle.id}`);
 
       try {
         // Try editMessageCaption first (for photo messages with embedded banner)

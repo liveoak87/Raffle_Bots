@@ -91,6 +91,10 @@ npm start
 3. If using the group membership requirement feature, add the bot as admin to the required group too
 4. Start creating raffles!
 
+**Why does the bot need admin permissions?**
+- It edits the raffle post in real time as participants enter and leave, updating the entry count and countdown timer.
+- When the membership gate feature is used, the bot needs to verify whether a user is a member of a specific group before allowing them to enter.
+
 ## Commands
 
 | Command | Description | Who Can Use |

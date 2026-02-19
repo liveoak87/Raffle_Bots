@@ -30,8 +30,8 @@ A Telegram bot for running raffles and giveaways in group chats. Features inline
 ### 2a. Run with Docker (Recommended for Unraid / Servers)
 
 ```bash
-git clone https://github.com/liveoak87/redbeardpeptides.git
-cd redbeardpeptides
+git clone https://github.com/liveoak87/Raffle_Bots.git
+cd Raffle_Bots
 
 # Create your .env file
 cp .env.example .env
@@ -56,7 +56,7 @@ To restart after updates: `docker compose up -d --build`
 1. Open the Unraid terminal and build the image:
    ```bash
    cd /mnt/user/appdata
-   git clone https://github.com/liveoak87/redbeardpeptides.git raffle-bot
+   git clone https://github.com/liveoak87/Raffle_Bots.git raffle-bot
    cd raffle-bot
    docker build -t raffle-bot .
    ```

@@ -2141,23 +2141,29 @@ export async function notifyWinnersAndCreator(
   }
 }
 
-// /stats - Bot-wide statistics (owner only)
-export async function handleStats(ctx: Context): Promise<void> {
-  const userId = ctx.from?.id;
-  if (!userId) return;
-
-  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
-  if (ownerId === 0 || userId !== ownerId) {
-    // Silently ignore — don't reveal the command exists
-    return;
-  }
-
+// Build stats message — shared by /stats command and weekly auto-report
+export async function buildStatsMessage(
+  api: { getChat: (chatId: number) => Promise<unknown> }
+): Promise<string> {
   const stats = db.getBotStats();
+
+  // Verify which groups the bot is still active in
+  const chatIds = db.getAllGroupChatIds();
+  const activeGroups: { chatId: number; title: string }[] = [];
+  for (const chatId of chatIds) {
+    try {
+      const chat = await api.getChat(chatId) as Record<string, unknown>;
+      const title = chat.title ? String(chat.title) : `Chat ${chatId}`;
+      activeGroups.push({ chatId, title });
+    } catch {
+      // Bot was removed/banned from this group — skip
+    }
+  }
 
   let msg = `📊 <b>Bot Statistics</b>\n\n`;
 
   msg += `<b>Usage:</b>\n`;
-  msg += `  👥 Groups: <b>${stats.totalGroups}</b>\n`;
+  msg += `  👥 Active groups: <b>${activeGroups.length}</b>\n`;
   msg += `  🧑 Unique creators: <b>${stats.totalCreators}</b>\n`;
   msg += `  🎟 Unique participants: <b>${stats.totalParticipants}</b>\n\n`;
 
@@ -2171,11 +2177,8 @@ export async function handleStats(ctx: Context): Promise<void> {
   if (activeByGroup.length > 0) {
     msg += `\n<b>🟢 Active Raffles:</b>\n`;
     for (const group of activeByGroup) {
-      let groupTitle = `Chat ${group.chat_id}`;
-      try {
-        const chat = await ctx.api.getChat(group.chat_id);
-        if ("title" in chat && chat.title) groupTitle = chat.title;
-      } catch {}
+      const known = activeGroups.find((g) => g.chatId === group.chat_id);
+      const groupTitle = known ? known.title : `Chat ${group.chat_id}`;
       msg += `  <b>${escapeHtml(groupTitle)}:</b>\n`;
       for (const raffle of group.raffles) {
         const count = db.getEntryCount(raffle.id);
@@ -2193,24 +2196,28 @@ export async function handleStats(ctx: Context): Promise<void> {
   msg += `  📋 Raffles created: <b>${stats.rafflesLast7Days}</b>\n`;
   msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
 
-  // Fetch group names (only show groups bot is still in)
-  const chatIds = db.getAllGroupChatIds();
-  const activeGroups: string[] = [];
-  for (const chatId of chatIds) {
-    try {
-      const chat = await ctx.api.getChat(chatId);
-      const title = "title" in chat && chat.title ? chat.title : `Chat ${chatId}`;
-      activeGroups.push(title);
-    } catch {
-      // Skip left/banned groups
-    }
-  }
   if (activeGroups.length > 0) {
-    msg += `\n<b>Groups:</b>\n`;
-    for (const title of activeGroups) {
-      msg += `  • ${escapeHtml(title)}\n`;
+    msg += `\n<b>Active Groups:</b>\n`;
+    for (const g of activeGroups) {
+      msg += `  • ${escapeHtml(g.title)}\n`;
     }
   }
+
+  return msg;
+}
+
+// /stats - Bot-wide statistics (owner only)
+export async function handleStats(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) {
+    // Silently ignore — don't reveal the command exists
+    return;
+  }
+
+  const msg = await buildStatsMessage(ctx.api);
 
   // Send as DM to the owner
   try {

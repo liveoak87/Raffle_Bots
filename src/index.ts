@@ -30,6 +30,7 @@ import {
   handleBugReport,
   notifyWinnersAndCreator,
   revokeReferralInviteLinks,
+  buildStatsMessage,
 } from "./commands";
 import {
   formatRaffleMessage,
@@ -757,6 +758,34 @@ async function main(): Promise<void> {
   // Start data retention purge (run once at startup, then hourly)
   purgeOldData();
   setInterval(purgeOldData, PURGE_CHECK_INTERVAL);
+
+  // Weekly stats report to bot owner
+  const WEEKLY_REPORT_INTERVAL = 60_000; // check every minute
+  let lastWeeklyReport = 0;
+
+  async function checkWeeklyReport(): Promise<void> {
+    const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+    if (ownerId === 0) return;
+
+    const now = new Date();
+    // Send every Monday at 9:00 AM UTC
+    if (now.getUTCDay() !== 1) return; // Not Monday
+    if (now.getUTCHours() !== 9 || now.getUTCMinutes() !== 0) return; // Not 9:00
+
+    // Prevent duplicate sends within the same minute
+    const minuteKey = Math.floor(now.getTime() / 60_000);
+    if (minuteKey === lastWeeklyReport) return;
+    lastWeeklyReport = minuteKey;
+
+    try {
+      const msg = `📬 <b>Weekly Report</b>\n\n` + await buildStatsMessage(bot.api);
+      await bot.api.sendMessage(ownerId, msg, { parse_mode: "HTML" });
+      console.log("Weekly stats report sent to owner");
+    } catch (err) {
+      console.error("Failed to send weekly report:", err);
+    }
+  }
+  setInterval(checkWeeklyReport, WEEKLY_REPORT_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
   await bot.start({

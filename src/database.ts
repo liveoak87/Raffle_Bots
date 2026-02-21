@@ -910,6 +910,12 @@ export function getAllGroupChatIds(): number[] {
   return rows.map((r) => r.chat_id);
 }
 
+export function findOpenRaffleByTitle(title: string): Raffle | null {
+  return getDb()
+    .prepare("SELECT * FROM raffles WHERE title = ? AND status = 'open' ORDER BY id DESC LIMIT 1")
+    .get(title) as Raffle | null;
+}
+
 // --- Active raffles by group ---
 
 export function getActiveRafflesByGroup(): Array<{ chat_id: number; raffles: Raffle[] }> {

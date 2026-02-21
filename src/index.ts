@@ -37,6 +37,7 @@ import {
   formatWinnersMessage,
   escapeHtml,
   getUserDisplayName,
+  buildMessageLink,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -161,6 +162,42 @@ bot.callbackQuery("bugreport_skip", handleBugReportSkip);
 bot.callbackQuery(/^twiz_winners_\d+$/, handleTmplWinnersCallback);
 bot.callbackQuery(/^twiz_time_/, handleTmplTimeCallback);
 bot.callbackQuery(/^twiz_opt_/, handleTmplOptionsCallback);
+
+// --- Detect forwarded raffle posts and reply with redirect ---
+bot.on("message", async (ctx, next) => {
+  const msg = ctx.message;
+  if (!msg || !msg.forward_origin) return next();
+
+  // Only handle forwards from this bot
+  const origin = msg.forward_origin;
+  let isFromBot = false;
+  if (origin.type === "user" && origin.sender_user.id === bot.botInfo.id) {
+    isFromBot = true;
+  }
+  if (!isFromBot) return next();
+
+  // Extract raffle title from forwarded text/caption
+  const text = msg.text || msg.caption || "";
+  const titleMatch = text.match(/🎟\s+(.+)/);
+  if (!titleMatch) return next();
+
+  const title = titleMatch[1].trim();
+  const raffle = db.findOpenRaffleByTitle(title);
+  if (!raffle || !raffle.message_id) return next();
+
+  const link = buildMessageLink(raffle.chat_id, raffle.message_id);
+  if (!link) return next();
+
+  const keyboard = new InlineKeyboard().url("🎟 Enter Raffle", link);
+  try {
+    await ctx.reply(
+      `📌 This is a forwarded copy — buttons won't work here.\nTap below to go to the original raffle:`,
+      { reply_markup: keyboard, reply_parameters: { message_id: msg.message_id } }
+    );
+  } catch {
+    // May not have permission to reply in this chat
+  }
+});
 
 // --- Handle text messages (for wizard responses in DMs) ---
 bot.on("message:text", async (ctx) => {

@@ -90,6 +90,10 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
 
   if (raffle.status === "open") {
     msg += `\n\n✅ ${t(lang, "raffle.enter_cta")}`;
+    const link = buildMessageLink(raffle.chat_id, raffle.message_id);
+    if (link) {
+      msg += `\n📌 <a href="${link}">Tap here to enter</a>`;
+    }
   } else if (raffle.status === "closed") {
     msg += `\n\n🚫 ${t(lang, "raffle.closed")}`;
   } else if (raffle.status === "drawn") {
@@ -247,6 +251,14 @@ function getPositionLabel(position: number): string {
     default:
       return `${position}.`;
   }
+}
+
+export function buildMessageLink(chatId: number, messageId: number | null): string | null {
+  if (!messageId) return null;
+  const idStr = String(Math.abs(chatId));
+  // Strip "100" prefix from supergroup IDs (stored as -100XXXXXXXXXX)
+  const shortId = idStr.startsWith("100") ? idStr.slice(3) : idStr;
+  return `https://t.me/c/${shortId}/${messageId}`;
 }
 
 export function sleep(ms: number): Promise<void> {

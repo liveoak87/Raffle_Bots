@@ -90,10 +90,6 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
 
   if (raffle.status === "open") {
     msg += `\n\n✅ ${t(lang, "raffle.enter_cta")}`;
-    const link = buildMessageLink(raffle.chat_id, raffle.message_id);
-    if (link) {
-      msg += `\n📌 <a href="${link}">Tap here to enter</a>`;
-    }
   } else if (raffle.status === "closed") {
     msg += `\n\n🚫 ${t(lang, "raffle.closed")}`;
   } else if (raffle.status === "drawn") {

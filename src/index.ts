@@ -38,6 +38,7 @@ import {
   escapeHtml,
   getUserDisplayName,
   buildMessageLink,
+  buildRaffleKeyboard,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -377,12 +378,9 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   const count = db.getEntryCount(raffle.id);
   const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : count;
   const lang = db.getChatLanguage(raffle.chat_id);
+  const botUsername = bot.botInfo.username;
 
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-    .row()
-    .text(`👥 ${t(lang, "btn.entries", { count: displayCount })}`, `entries_${raffle.id}`);
+  const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
 
   try {
     // Try editMessageCaption first (for photo messages with embedded banner)
@@ -543,12 +541,9 @@ async function checkRecurringTemplates(): Promise<void> {
 
       try {
         const recLang = db.getChatLanguage(template.chat_id);
+        const botUsername = bot.botInfo.username;
 
-        const keyboard = new InlineKeyboard()
-          .text(`🎟 ${t(recLang, "btn.enter")}`, `enter_${raffle.id}`)
-          .text(`❌ ${t(recLang, "btn.leave")}`, `leave_${raffle.id}`)
-          .row()
-          .text(`👥 ${t(recLang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+        const keyboard = buildRaffleKeyboard(raffle, 0, recLang, botUsername);
 
         const msgId = await sendRafflePost(
           bot.api,

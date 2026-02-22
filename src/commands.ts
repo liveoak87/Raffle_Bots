@@ -1806,16 +1806,36 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
           ? `(max ${raffle.max_referral_entries} bonus entries)`
           : "(no limit)";
 
-        await ctx.api.sendMessage(
-          userId,
-          `🔗 <b>Referral Link — ${escapeHtml(raffle.title)}</b>\n\n` +
-            `Share this link to earn <b>bonus entries</b>! Each person who joins the group ` +
-            `through your link gives you +1 extra chance to win ${capText}.\n\n` +
-            `Your link:\n${refLink.invite_link}`,
-          { parse_mode: "HTML" }
-        );
+        // Try DM first
+        try {
+          await ctx.api.sendMessage(
+            userId,
+            `🔗 <b>Referral Link — ${escapeHtml(raffle.title)}</b>\n\n` +
+              `Share this link to earn <b>bonus entries</b>! Each person who joins the group ` +
+              `through your link gives you +1 extra chance to win ${capText}.\n\n` +
+              `Your link:\n${refLink.invite_link}`,
+            { parse_mode: "HTML" }
+          );
+        } catch {
+          // DM failed — send temporary group message telling them to start the bot
+          if (chatId) {
+            try {
+              const botUsername = ctx.me?.username || "the bot";
+              const msg = await ctx.api.sendMessage(
+                chatId,
+                `🔗 <a href="tg://user?id=${userId}">${escapeHtml(displayName)}</a> — ` +
+                  `Start a DM with @${botUsername} to receive your referral link for bonus entries!`,
+                { parse_mode: "HTML" }
+              );
+              // Auto-delete after 15 seconds
+              setTimeout(async () => {
+                try { await ctx.api.deleteMessage(chatId, msg.message_id); } catch {}
+              }, 15_000);
+            } catch {}
+          }
+        }
       } catch {
-        // User may not have started the bot — can't DM them
+        // createChatInviteLink failed — bot may not be admin
       }
     }
 
@@ -2102,6 +2122,7 @@ export async function notifyWinnersAndCreator(
   }
 
   // DM each winner
+  const failedDmWinners: string[] = [];
   for (const w of winners) {
     try {
       let winnerMsg = `🎉 <b>Congratulations!</b>\n\n`;
@@ -2112,7 +2133,22 @@ export async function notifyWinnersAndCreator(
       winnerMsg += contactLine;
       await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
     } catch {
-      // Winner may not have started the bot
+      // Winner hasn't started the bot — track for group notification
+      failedDmWinners.push(w.user_display_name);
+    }
+  }
+
+  // Notify in group if any winners couldn't be DM'd
+  if (failedDmWinners.length > 0) {
+    try {
+      const names = failedDmWinners.map((n) => `<b>${escapeHtml(n)}</b>`).join(", ");
+      await api.sendMessage(
+        raffle.chat_id,
+        `⚠️ ${names} — I couldn't send you a DM! Please start a conversation with me to receive your prize details.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // Can't post in group either
     }
   }
 

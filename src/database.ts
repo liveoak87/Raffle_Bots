@@ -110,6 +110,14 @@ export function initDatabase(dbPath: string): Database.Database {
       UNIQUE(raffle_id, user_id)
     );
 
+    CREATE TABLE IF NOT EXISTS bot_groups (
+      chat_id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '',
+      bot_status TEXT NOT NULL DEFAULT 'member' CHECK(bot_status IN ('member', 'administrator')),
+      added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
@@ -902,12 +910,51 @@ export function getBotStats(): BotStats {
   };
 }
 
-// --- Group list ---
+// --- Group list (legacy — from raffle history) ---
 
 export function getAllGroupChatIds(): number[] {
   const d = getDb();
   const rows = d.prepare("SELECT DISTINCT chat_id FROM raffles ORDER BY chat_id").all() as { chat_id: number }[];
   return rows.map((r) => r.chat_id);
+}
+
+// --- Bot group tracking ---
+
+export interface BotGroup {
+  chat_id: number;
+  title: string;
+  bot_status: "member" | "administrator";
+  added_at: string;
+  updated_at: string;
+}
+
+export function upsertBotGroup(chatId: number, title: string, botStatus: "member" | "administrator"): void {
+  getDb()
+    .prepare(
+      `INSERT INTO bot_groups (chat_id, title, bot_status, updated_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(chat_id) DO UPDATE SET
+         title = excluded.title,
+         bot_status = excluded.bot_status,
+         updated_at = datetime('now')`
+    )
+    .run(chatId, title, botStatus);
+}
+
+export function removeBotGroup(chatId: number): void {
+  getDb().prepare("DELETE FROM bot_groups WHERE chat_id = ?").run(chatId);
+}
+
+export function getActiveBotGroups(): BotGroup[] {
+  return getDb()
+    .prepare("SELECT * FROM bot_groups ORDER BY title COLLATE NOCASE")
+    .all() as BotGroup[];
+}
+
+export function getAdminBotGroups(): BotGroup[] {
+  return getDb()
+    .prepare("SELECT * FROM bot_groups WHERE bot_status = 'administrator' ORDER BY title COLLATE NOCASE")
+    .all() as BotGroup[];
 }
 
 export function findOpenRaffleByTitle(title: string): Raffle | null {

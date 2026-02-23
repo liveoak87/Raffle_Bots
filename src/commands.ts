@@ -12,6 +12,7 @@ import {
   parseEndTime,
   replyPrivately,
   buildRaffleKeyboard,
+  buildMessageLink,
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
@@ -508,6 +509,97 @@ export async function handleCancelCallback(ctx: Context): Promise<void> {
 
     // Update the raffle post in the group
     await updateRafflePost(ctx, raffleId);
+  }
+}
+
+// Callback handler for repost button (admin-only, on raffle post)
+export async function handleRepostCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  const match = data.match(/^repost_(\d+)$/);
+  if (!match) return;
+
+  const raffleId = parseInt(match[1], 10);
+  const userId = ctx.from!.id;
+
+  // Admin check
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== "open") {
+    await ctx.answerCallbackQuery({ text: "This raffle is no longer open.", show_alert: true });
+    return;
+  }
+
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can repost raffles.", show_alert: true });
+    return;
+  }
+
+  await ctx.answerCallbackQuery({ text: "Reposting raffle..." });
+
+  const chatId = raffle.chat_id;
+  const oldMessageId = raffle.message_id;
+  const lang = db.getChatLanguage(chatId);
+  const botUsername = ctx.me.username;
+
+  const count = db.getEntryCount(raffleId);
+  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
+  const caption = formatRaffleMessage(raffle, count, lang);
+  const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
+
+  // Send a new raffle post at the bottom of the chat
+  const newMsgId = await sendRafflePost(
+    ctx.api,
+    chatId,
+    "open",
+    caption,
+    keyboard,
+    raffle.image_file_id
+  );
+
+  if (!newMsgId) {
+    await ctx.api.sendMessage(userId, "Failed to repost the raffle. Please try again.");
+    return;
+  }
+
+  // Update the database to point to the new message
+  db.updateRaffleMessageId(raffleId, newMsgId);
+
+  // Handle the old post: try to delete, otherwise edit with a link
+  if (oldMessageId) {
+    try {
+      await ctx.api.deleteMessage(chatId, oldMessageId);
+    } catch {
+      // Deletion failed (probably older than 48h) — edit with a redirect link
+      const newLink = buildMessageLink(chatId, newMsgId);
+      const redirectText = newLink
+        ? `⬇️ <b>This raffle has moved.</b>\n\n<a href="${newLink}">Tap here to go to the active raffle</a>`
+        : `⬇️ <b>This raffle has moved.</b> Scroll down to find it.`;
+      try {
+        await ctx.api.editMessageCaption(chatId, oldMessageId, {
+          caption: redirectText,
+          parse_mode: "HTML",
+        });
+      } catch {
+        try {
+          await ctx.api.editMessageText(chatId, oldMessageId, redirectText, {
+            parse_mode: "HTML",
+          });
+        } catch {
+          // Old message couldn't be edited either — ignore
+        }
+      }
+    }
+  }
+
+  // Auto-pin the new post if the raffle had auto_pin enabled
+  if (raffle.auto_pin) {
+    try {
+      await ctx.api.pinChatMessage(chatId, newMsgId, { disable_notification: true });
+    } catch {
+      // Pin failed — bot may not have pin permissions
+    }
   }
 }
 

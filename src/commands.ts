@@ -13,6 +13,7 @@ import {
   replyPrivately,
   buildRaffleKeyboard,
   buildMessageLink,
+  notifyOwnerNewRaffle,
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
@@ -290,6 +291,8 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   if (msgId) {
     db.updateRaffleMessageId(raffle.id, msgId);
   }
+
+  await notifyOwnerNewRaffle(ctx.api, raffle);
 }
 
 // /raffles - List open raffles
@@ -1016,6 +1019,8 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     if (msgId) {
       db.updateRaffleMessageId(newRaffle.id, msgId);
     }
+
+    await notifyOwnerNewRaffle(ctx.api, newRaffle);
   }
 }
 
@@ -1244,6 +1249,8 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     if (msgId) {
       db.updateRaffleMessageId(raffle.id, msgId);
     }
+
+    await notifyOwnerNewRaffle(ctx.api, raffle);
     return;
   }
 
@@ -1655,6 +1662,8 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
   if (msgId) {
     db.updateRaffleMessageId(raffle.id, msgId);
   }
+
+  await notifyOwnerNewRaffle(ctx.api, raffle);
 }
 
 // /recurring - Toggle recurring on/off for a template

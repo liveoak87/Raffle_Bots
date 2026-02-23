@@ -42,6 +42,7 @@ import {
   buildMessageLink,
   buildRaffleKeyboard,
   sleep,
+  notifyOwnerNewRaffle,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -565,6 +566,8 @@ async function checkRecurringTemplates(): Promise<void> {
         if (msgId) {
           db.updateRaffleMessageId(raffle.id, msgId);
         }
+
+        await notifyOwnerNewRaffle(bot.api, raffle);
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
       }

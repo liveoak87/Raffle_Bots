@@ -2,7 +2,7 @@ import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
-import { getEntryCount, getTotalEntryCount } from "./database";
+import { getEntryCount, getTotalEntryCount, getActiveBotGroups } from "./database";
 import { t } from "./i18n";
 
 export function escapeHtml(text: string): string {
@@ -285,5 +285,30 @@ export function buildMessageLink(chatId: number, messageId: number | null): stri
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Notify the bot owner when a new raffle is created.
+ */
+export async function notifyOwnerNewRaffle(
+  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown> },
+  raffle: { id: number; title: string; creator_name: string; chat_id: number },
+  groupTitle?: string
+): Promise<void> {
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0) return;
+
+  const group = groupTitle || getActiveBotGroups().find((g) => g.chat_id === raffle.chat_id)?.title || `Chat ${raffle.chat_id}`;
+  const msg =
+    `🆕 <b>New Raffle Created</b>\n\n` +
+    `📝 <b>${escapeHtml(raffle.title)}</b>\n` +
+    `👤 By: ${escapeHtml(raffle.creator_name)}\n` +
+    `💬 Group: ${escapeHtml(group)}`;
+
+  try {
+    await api.sendMessage(ownerId, msg, { parse_mode: "HTML" });
+  } catch {
+    // Owner hasn't started bot or DM failed — ignore
+  }
 }
 

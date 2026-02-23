@@ -12,6 +12,7 @@ import {
 } from "./helpers";
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
+import { notifyOwnerNewRaffle } from "./helpers";
 
 interface WizardState {
   step:
@@ -1008,6 +1009,8 @@ async function createRaffleFromWizard(
     `✅ Raffle <b>${escapeHtml(raffle.title)}</b> has been posted to <b>${escapeHtml(state.targetChatTitle)}</b>!`,
     { parse_mode: "HTML" }
   );
+
+  await notifyOwnerNewRaffle(ctx.api, raffle, state.targetChatTitle);
 }
 
 // ===================================================================

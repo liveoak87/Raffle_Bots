@@ -420,7 +420,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
   await notifyWinnersAndCreator(ctx.api, raffle, winners);
 }
 
-// /cancelraffle - Cancel a raffle
+// /cancelraffle - Cancel a raffle (sends interactive buttons to DM)
 export async function handleCancelRaffle(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {
     await ctx.reply("Use this command in a group chat.");
@@ -434,48 +434,81 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
     return;
   }
 
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/cancelraffle(@\w+)?/i, "").trim();
-
-  if (!args) {
-    const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
-    if (openRaffles.length === 0) {
-      await replyPrivately(ctx, "No open raffles to cancel.");
-      return;
-    }
-    let msg = `Which raffle do you want to cancel?\n\n`;
-    for (const r of openRaffles) {
-      msg += `/cancelraffle ${r.id} - ${escapeHtml(r.title)}\n`;
-    }
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  if (openRaffles.length === 0) {
+    await replyPrivately(ctx, "No open raffles to cancel.");
     return;
   }
 
-  const raffleId = parseInt(args, 10);
-  if (isNaN(raffleId)) {
-    await replyPrivately(ctx, "Please provide a valid raffle ID.");
-    return;
+  const keyboard = new InlineKeyboard();
+  for (const r of openRaffles) {
+    keyboard.text(`🎟 ${r.title}`, `cancel_pick_${r.id}`).row();
   }
-
-  const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.chat_id !== ctx.chat.id) {
-    await replyPrivately(ctx, "Raffle not found in this chat.");
-    return;
-  }
-
-  if (raffle.status === "drawn") {
-    await replyPrivately(ctx, "Cannot cancel a raffle that has already been drawn.");
-    return;
-  }
-
-  db.closeRaffle(raffleId);
-  await revokeReferralInviteLinks(ctx.api, raffleId);
+  keyboard.text("❌ Nevermind", `cancel_no`);
 
   await replyPrivately(ctx,
-    `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
-    { parse_mode: "HTML" });
+    `Which raffle do you want to cancel?`,
+    { reply_markup: keyboard });
+}
 
-  await updateRafflePost(ctx, raffleId);
+// Callback handler for cancel buttons (runs in DM)
+export async function handleCancelCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+  await ctx.answerCallbackQuery();
+
+  // "Nevermind" button
+  if (data === "cancel_no") {
+    await ctx.editMessageText("👍 No raffle was cancelled.");
+    return;
+  }
+
+  // Pick a raffle → show confirmation
+  const pickMatch = data.match(/^cancel_pick_(\d+)$/);
+  if (pickMatch) {
+    const raffleId = parseInt(pickMatch[1], 10);
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.status !== "open") {
+      await ctx.editMessageText("This raffle is no longer open.");
+      return;
+    }
+    const keyboard = new InlineKeyboard()
+      .text("✅ Yes, cancel it", `cancel_yes_${raffleId}`)
+      .text("❌ No, keep it", `cancel_no`);
+    await ctx.editMessageText(
+      `⚠️ Cancel raffle <b>${escapeHtml(raffle.title)}</b>?\n\nThis cannot be undone.`,
+      { parse_mode: "HTML", reply_markup: keyboard });
+    return;
+  }
+
+  // Confirm cancellation
+  const yesMatch = data.match(/^cancel_yes_(\d+)$/);
+  if (yesMatch) {
+    const raffleId = parseInt(yesMatch[1], 10);
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle) {
+      await ctx.editMessageText("Raffle not found.");
+      return;
+    }
+    if (raffle.status === "drawn") {
+      await ctx.editMessageText("Cannot cancel a raffle that has already been drawn.");
+      return;
+    }
+    if (raffle.status !== "open") {
+      await ctx.editMessageText("This raffle is no longer open.");
+      return;
+    }
+
+    db.closeRaffle(raffleId);
+    await revokeReferralInviteLinks(ctx.api, raffleId);
+
+    await ctx.editMessageText(
+      `🚫 Raffle <b>${escapeHtml(raffle.title)}</b> has been cancelled.`,
+      { parse_mode: "HTML" });
+
+    // Update the raffle post in the group
+    await updateRafflePost(ctx, raffleId);
+  }
 }
 
 // /myentries - Show user's active entries

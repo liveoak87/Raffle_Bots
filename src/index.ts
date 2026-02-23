@@ -41,6 +41,7 @@ import {
   getUserDisplayName,
   buildMessageLink,
   buildRaffleKeyboard,
+  sleep,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -783,6 +784,7 @@ async function seedBotGroups(): Promise<void> {
   if (existing.length > 0) {
     // Already seeded — just refresh titles and status
     console.log(`Refreshing ${existing.length} tracked groups...`);
+    let refreshed = 0;
     for (const group of existing) {
       try {
         const chat = await bot.api.getChat(group.chat_id) as unknown as Record<string, unknown>;
@@ -790,19 +792,22 @@ async function seedBotGroups(): Promise<void> {
         const member = await bot.api.getChatMember(group.chat_id, bot.botInfo.id);
         if (member.status === "administrator") {
           db.upsertBotGroup(group.chat_id, title, "administrator");
+          refreshed++;
         } else if (member.status === "member") {
           db.upsertBotGroup(group.chat_id, title, "member");
+          refreshed++;
         } else {
-          // Bot was removed/kicked
           db.removeBotGroup(group.chat_id);
+          console.log(`  Removed: ${group.title} (${group.chat_id}) — status: ${member.status}`);
         }
-      } catch {
-        // Can't reach this group — remove it
+      } catch (err) {
         db.removeBotGroup(group.chat_id);
+        console.log(`  Removed: ${group.title} (${group.chat_id}) — unreachable`);
       }
+      await sleep(200); // Rate limit: 5 calls/sec max
     }
     const after = db.getActiveBotGroups();
-    console.log(`Group refresh complete: ${after.length} active groups`);
+    console.log(`Group refresh complete: ${after.length} active groups (${refreshed} verified)`);
     return;
   }
 
@@ -812,6 +817,7 @@ async function seedBotGroups(): Promise<void> {
 
   console.log(`Seeding bot_groups from ${chatIds.length} known groups...`);
   let added = 0;
+  let skipped = 0;
   for (const chatId of chatIds) {
     try {
       const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
@@ -820,16 +826,20 @@ async function seedBotGroups(): Promise<void> {
       if (member.status === "administrator") {
         db.upsertBotGroup(chatId, title, "administrator");
         added++;
+        console.log(`  Added: ${title} (admin)`);
       } else if (member.status === "member") {
         db.upsertBotGroup(chatId, title, "member");
         added++;
+        console.log(`  Added: ${title} (member)`);
+      } else {
+        skipped++;
       }
-      // left/kicked = don't add
     } catch {
-      // Bot not in this group anymore — skip
+      skipped++;
     }
+    await sleep(200); // Rate limit: 5 calls/sec max
   }
-  console.log(`Seeded ${added} active groups`);
+  console.log(`Seeded ${added} active groups (${skipped} skipped — bot not present)`);
 }
 
 // --- Start bot ---

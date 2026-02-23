@@ -780,16 +780,19 @@ bot.catch((err) => {
 
 // --- Seed bot_groups on startup ---
 async function seedBotGroups(): Promise<void> {
+  const botId = bot.botInfo.id;
+
   const existing = db.getActiveBotGroups();
   if (existing.length > 0) {
-    // Already seeded — just refresh titles and status
+    // Already seeded — refresh titles and status
     console.log(`Refreshing ${existing.length} tracked groups...`);
     let refreshed = 0;
     for (const group of existing) {
       try {
         const chat = await bot.api.getChat(group.chat_id) as unknown as Record<string, unknown>;
         const title = chat.title ? String(chat.title) : "";
-        const member = await bot.api.getChatMember(group.chat_id, bot.botInfo.id);
+        await sleep(100);
+        const member = await bot.api.getChatMember(group.chat_id, botId);
         if (member.status === "administrator") {
           db.upsertBotGroup(group.chat_id, title, "administrator");
           refreshed++;
@@ -798,16 +801,16 @@ async function seedBotGroups(): Promise<void> {
           refreshed++;
         } else {
           db.removeBotGroup(group.chat_id);
-          console.log(`  Removed: ${group.title} (${group.chat_id}) — status: ${member.status}`);
+          console.log(`  Removed: ${group.title} (status: ${member.status})`);
         }
       } catch (err) {
         db.removeBotGroup(group.chat_id);
-        console.log(`  Removed: ${group.title} (${group.chat_id}) — unreachable`);
+        console.log(`  Removed: ${group.title} — unreachable`);
       }
-      await sleep(200); // Rate limit: 5 calls/sec max
+      await sleep(500);
     }
     const after = db.getActiveBotGroups();
-    console.log(`Group refresh complete: ${after.length} active groups (${refreshed} verified)`);
+    console.log(`Group refresh complete: ${after.length} active groups`);
     return;
   }
 
@@ -822,7 +825,8 @@ async function seedBotGroups(): Promise<void> {
     try {
       const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
       const title = chat.title ? String(chat.title) : "";
-      const member = await bot.api.getChatMember(chatId, bot.botInfo.id);
+      await sleep(100);
+      const member = await bot.api.getChatMember(chatId, botId);
       if (member.status === "administrator") {
         db.upsertBotGroup(chatId, title, "administrator");
         added++;
@@ -836,11 +840,15 @@ async function seedBotGroups(): Promise<void> {
       }
     } catch (err) {
       skipped++;
-      console.log(`  Skip: chat ${chatId} — ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only log non-obvious errors (skip "chat not found")
+      if (!msg.includes("chat not found")) {
+        console.log(`  Skip: chat ${chatId} — ${msg}`);
+      }
     }
-    await sleep(200); // Rate limit: 5 calls/sec max
+    await sleep(500);
   }
-  console.log(`Seeded ${added} active groups (${skipped} skipped — bot not present)`);
+  console.log(`Seeded ${added} active groups (${skipped} skipped)`);
 }
 
 // --- Start bot ---
@@ -862,6 +870,9 @@ async function main(): Promise<void> {
     { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help" },
   ]);
+
+  // Initialize bot info (needed for bot.botInfo.id before bot.start())
+  await bot.init();
 
   // Seed bot_groups table from known groups (one-time on startup)
   await seedBotGroups();

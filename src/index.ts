@@ -834,8 +834,9 @@ async function seedBotGroups(): Promise<void> {
       } else {
         skipped++;
       }
-    } catch {
+    } catch (err) {
       skipped++;
+      console.log(`  Skip: chat ${chatId} — ${err instanceof Error ? err.message : String(err)}`);
     }
     await sleep(200); // Rate limit: 5 calls/sec max
   }

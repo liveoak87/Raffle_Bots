@@ -270,6 +270,8 @@ export function buildRaffleKeyboard(
     keyboard.url("🔗 Get Referral Link", `https://t.me/${botUsername}?start=reflink_${raffle.id}`);
   }
 
+  keyboard.row().text("📌 Repost", `repost_${raffle.id}`);
+
   return keyboard;
 }
 

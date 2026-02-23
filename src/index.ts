@@ -9,6 +9,8 @@ import {
   handleListRaffles,
   handleDraw,
   handleCancelRaffle,
+  handleCancelCallback,
+  handleRepostCallback,
   handleMyEntries,
   handleRaffleHistory,
   handleExportEntries,
@@ -155,6 +157,12 @@ bot.callbackQuery(/^rerun_/, handleRerunCallback);
 
 // --- Template hub callback queries ---
 bot.callbackQuery(/^tmpl_/, handleTemplateCallback);
+
+// --- Cancel raffle callback queries ---
+bot.callbackQuery(/^cancel_/, handleCancelCallback);
+
+// --- Repost raffle callback queries ---
+bot.callbackQuery(/^repost_\d+$/, handleRepostCallback);
 
 // --- Bug report callback ---
 bot.callbackQuery("bugreport_skip", handleBugReportSkip);

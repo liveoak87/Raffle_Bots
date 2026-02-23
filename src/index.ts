@@ -696,8 +696,22 @@ bot.on("my_chat_member", async (ctx) => {
 
   const oldStatus = update.old_chat_member.status;
   const newStatus = update.new_chat_member.status;
+  const chatId = update.chat.id;
+  const chatTitle = "title" in update.chat ? update.chat.title || "" : "";
 
-  // Only trigger when bot was NOT in the group and is now a member/admin
+  // Track bot's group membership
+  if (newStatus === "administrator") {
+    db.upsertBotGroup(chatId, chatTitle, "administrator");
+    console.log(`Bot promoted to admin in "${chatTitle}" (${chatId})`);
+  } else if (newStatus === "member") {
+    db.upsertBotGroup(chatId, chatTitle, "member");
+    console.log(`Bot is member in "${chatTitle}" (${chatId})`);
+  } else if (newStatus === "left" || newStatus === "kicked") {
+    db.removeBotGroup(chatId);
+    console.log(`Bot removed from "${chatTitle}" (${chatId})`);
+  }
+
+  // Only send welcome when bot was NOT in the group and is now a member/admin
   const wasOut = oldStatus === "left" || oldStatus === "kicked";
   const isIn = newStatus === "member" || newStatus === "administrator";
   if (!wasOut || !isIn) return;
@@ -705,10 +719,8 @@ bot.on("my_chat_member", async (ctx) => {
   const addedBy = update.from;
   if (!addedBy) return;
 
-  const chatTitle = "title" in update.chat ? update.chat.title || "your group" : "your group";
-
   console.log(
-    `Bot added to group "${chatTitle}" (${update.chat.id}) by user ${addedBy.id} (${addedBy.first_name})`
+    `Bot added to group "${chatTitle}" (${chatId}) by user ${addedBy.id} (${addedBy.first_name})`
   );
 
   // Build the welcome / feature overview message
@@ -765,6 +777,61 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
+// --- Seed bot_groups on startup ---
+async function seedBotGroups(): Promise<void> {
+  const existing = db.getActiveBotGroups();
+  if (existing.length > 0) {
+    // Already seeded — just refresh titles and status
+    console.log(`Refreshing ${existing.length} tracked groups...`);
+    for (const group of existing) {
+      try {
+        const chat = await bot.api.getChat(group.chat_id) as unknown as Record<string, unknown>;
+        const title = chat.title ? String(chat.title) : "";
+        const member = await bot.api.getChatMember(group.chat_id, bot.botInfo.id);
+        if (member.status === "administrator") {
+          db.upsertBotGroup(group.chat_id, title, "administrator");
+        } else if (member.status === "member") {
+          db.upsertBotGroup(group.chat_id, title, "member");
+        } else {
+          // Bot was removed/kicked
+          db.removeBotGroup(group.chat_id);
+        }
+      } catch {
+        // Can't reach this group — remove it
+        db.removeBotGroup(group.chat_id);
+      }
+    }
+    const after = db.getActiveBotGroups();
+    console.log(`Group refresh complete: ${after.length} active groups`);
+    return;
+  }
+
+  // First run — seed from raffle history
+  const chatIds = db.getAllGroupChatIds();
+  if (chatIds.length === 0) return;
+
+  console.log(`Seeding bot_groups from ${chatIds.length} known groups...`);
+  let added = 0;
+  for (const chatId of chatIds) {
+    try {
+      const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
+      const title = chat.title ? String(chat.title) : "";
+      const member = await bot.api.getChatMember(chatId, bot.botInfo.id);
+      if (member.status === "administrator") {
+        db.upsertBotGroup(chatId, title, "administrator");
+        added++;
+      } else if (member.status === "member") {
+        db.upsertBotGroup(chatId, title, "member");
+        added++;
+      }
+      // left/kicked = don't add
+    } catch {
+      // Bot not in this group anymore — skip
+    }
+  }
+  console.log(`Seeded ${added} active groups`);
+}
+
 // --- Start bot ---
 async function main(): Promise<void> {
   // Set bot commands for the menu
@@ -784,6 +851,9 @@ async function main(): Promise<void> {
     { command: "language", description: "Set bot language" },
     { command: "help", description: "Show help" },
   ]);
+
+  // Seed bot_groups table from known groups (one-time on startup)
+  await seedBotGroups();
 
   // Start expiry checker
   setInterval(checkExpiredRaffles, EXPIRY_CHECK_INTERVAL);
@@ -818,7 +888,7 @@ async function main(): Promise<void> {
     lastWeeklyReport = minuteKey;
 
     try {
-      const msg = `📬 <b>Weekly Report</b>\n\n` + await buildStatsMessage(bot.api);
+      const msg = `📬 <b>Weekly Report</b>\n\n` + buildStatsMessage();
       await bot.api.sendMessage(ownerId, msg, { parse_mode: "HTML" });
       console.log("Weekly stats report sent to owner");
     } catch (err) {

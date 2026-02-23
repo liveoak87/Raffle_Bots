@@ -2235,28 +2235,18 @@ export async function notifyWinnersAndCreator(
 }
 
 // Build stats message — shared by /stats command and weekly auto-report
-export async function buildStatsMessage(
-  api: { getChat: (chatId: number) => Promise<unknown> }
-): Promise<string> {
+export function buildStatsMessage(): string {
   const stats = db.getBotStats();
 
-  // Verify which groups the bot is still active in
-  const chatIds = db.getAllGroupChatIds();
-  const activeGroups: { chatId: number; title: string }[] = [];
-  for (const chatId of chatIds) {
-    try {
-      const chat = await api.getChat(chatId) as Record<string, unknown>;
-      const title = chat.title ? String(chat.title) : `Chat ${chatId}`;
-      activeGroups.push({ chatId, title });
-    } catch {
-      // Bot was removed/banned from this group — skip
-    }
-  }
+  // Get groups from the bot_groups tracking table
+  const allGroups = db.getActiveBotGroups();
+  const adminGroups = db.getAdminBotGroups();
 
   let msg = `📊 <b>Bot Statistics</b>\n\n`;
 
   msg += `<b>Usage:</b>\n`;
-  msg += `  👥 Active groups: <b>${activeGroups.length}</b>\n`;
+  msg += `  👥 Groups (total): <b>${allGroups.length}</b>\n`;
+  msg += `  🛡 Groups (admin): <b>${adminGroups.length}</b>\n`;
   msg += `  🧑 Unique creators: <b>${stats.totalCreators}</b>\n`;
   msg += `  🎟 Unique participants: <b>${stats.totalParticipants}</b>\n\n`;
 
@@ -2270,7 +2260,7 @@ export async function buildStatsMessage(
   if (activeByGroup.length > 0) {
     msg += `\n<b>🟢 Active Raffles:</b>\n`;
     for (const group of activeByGroup) {
-      const known = activeGroups.find((g) => g.chatId === group.chat_id);
+      const known = allGroups.find((g) => g.chat_id === group.chat_id);
       const groupTitle = known ? known.title : `Chat ${group.chat_id}`;
       msg += `  <b>${escapeHtml(groupTitle)}:</b>\n`;
       for (const raffle of group.raffles) {
@@ -2289,9 +2279,17 @@ export async function buildStatsMessage(
   msg += `  📋 Raffles created: <b>${stats.rafflesLast7Days}</b>\n`;
   msg += `  📝 Entries: <b>${stats.entriesLast7Days}</b>\n`;
 
-  if (activeGroups.length > 0) {
-    msg += `\n<b>Active Groups:</b>\n`;
-    for (const g of activeGroups) {
+  if (adminGroups.length > 0) {
+    msg += `\n<b>🛡 Admin Groups:</b>\n`;
+    for (const g of adminGroups) {
+      msg += `  • ${escapeHtml(g.title)}\n`;
+    }
+  }
+
+  const memberOnly = allGroups.filter((g) => g.bot_status === "member");
+  if (memberOnly.length > 0) {
+    msg += `\n<b>👤 Member Only (no admin):</b>\n`;
+    for (const g of memberOnly) {
       msg += `  • ${escapeHtml(g.title)}\n`;
     }
   }
@@ -2310,7 +2308,7 @@ export async function handleStats(ctx: Context): Promise<void> {
     return;
   }
 
-  const msg = await buildStatsMessage(ctx.api);
+  const msg = buildStatsMessage();
 
   // Send as DM to the owner
   try {

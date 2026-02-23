@@ -2327,6 +2327,79 @@ export async function handleStats(ctx: Context): Promise<void> {
   }
 }
 
+// /referralstats — Show referral link stats for active raffles (owner only)
+export async function handleReferralStats(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) {
+    return;
+  }
+
+  // Get all open raffles with referrals enabled
+  const allOpen = db.getActiveRafflesByGroup();
+  const referralRaffles: Array<{ raffle: ReturnType<typeof db.getRaffleById>; links: ReturnType<typeof db.getReferralLinksForRaffle>; entryCount: number; totalCount: number }> = [];
+
+  for (const group of allOpen) {
+    for (const raffle of group.raffles) {
+      if (raffle.referral_enabled) {
+        const links = db.getReferralLinksForRaffle(raffle.id);
+        const entryCount = db.getEntryCount(raffle.id);
+        const totalCount = db.getTotalEntryCount(raffle.id);
+        referralRaffles.push({ raffle, links, entryCount, totalCount });
+      }
+    }
+  }
+
+  if (referralRaffles.length === 0) {
+    try {
+      await ctx.api.sendMessage(userId, "No active raffles with referrals enabled.", { parse_mode: "HTML" });
+    } catch {
+      await ctx.reply("No active raffles with referrals enabled.");
+    }
+    return;
+  }
+
+  let msg = `🔗 <b>Referral Stats</b>\n`;
+
+  for (const { raffle, links, entryCount, totalCount } of referralRaffles) {
+    if (!raffle) continue;
+    const groupInfo = db.getActiveBotGroups().find((g) => g.chat_id === raffle.chat_id);
+    const groupName = groupInfo ? groupInfo.title : `Chat ${raffle.chat_id}`;
+    const totalBonuses = links.reduce((sum, l) => sum + l.bonus_entries, 0);
+
+    msg += `\n━━━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `📝 <b>${escapeHtml(raffle.title)}</b>\n`;
+    msg += `💬 ${escapeHtml(groupName)}\n`;
+    msg += `👥 Entries: <b>${entryCount}</b> unique · <b>${totalCount}</b> effective\n`;
+    msg += `🔗 Links created: <b>${links.length}</b>\n`;
+    msg += `⭐ Bonus entries: <b>${totalBonuses}</b>\n`;
+
+    const withReferrals = links.filter((l) => l.bonus_entries > 0);
+    if (withReferrals.length > 0) {
+      msg += `\n<b>Leaderboard:</b>\n`;
+      for (const l of withReferrals) {
+        msg += `  🏅 ${escapeHtml(l.user_display_name)} — <b>${l.bonus_entries}</b> referral${l.bonus_entries !== 1 ? "s" : ""}\n`;
+      }
+    }
+
+    const noReferrals = links.filter((l) => l.bonus_entries === 0);
+    if (noReferrals.length > 0) {
+      msg += `\n<b>Links created (0 referrals):</b>\n`;
+      for (const l of noReferrals) {
+        msg += `  • ${escapeHtml(l.user_display_name)}\n`;
+      }
+    }
+  }
+
+  try {
+    await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML" });
+  } catch {
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  }
+}
+
 // /groupstats — Show raffle stats for this group (admin only)
 export async function handleGroupStats(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {

@@ -11,6 +11,7 @@ import {
   isGroupAdmin,
   parseEndTime,
   replyPrivately,
+  buildRaffleKeyboard,
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
@@ -273,12 +274,9 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
+  const botUsername = ctx.me.username;
 
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-    .row()
-    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+  const keyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
 
   const msgId = await sendRafflePost(
     ctx.api,
@@ -874,12 +872,9 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     );
 
     const rerunLang = db.getChatLanguage(chatId);
+    const botUsername = ctx.me.username;
 
-    const raffleKeyboard = new InlineKeyboard()
-      .text(`🎟 ${t(rerunLang, "btn.enter")}`, `enter_${newRaffle.id}`)
-      .text(`❌ ${t(rerunLang, "btn.leave")}`, `leave_${newRaffle.id}`)
-      .row()
-      .text(`👥 ${t(rerunLang, "btn.entries", { count: added })}`, `entries_${newRaffle.id}`);
+    const raffleKeyboard = buildRaffleKeyboard(newRaffle, added, rerunLang, botUsername);
 
     const caption = formatRaffleMessage(newRaffle, added, rerunLang) +
       `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`;
@@ -1109,12 +1104,9 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     });
 
     const lang = db.getChatLanguage(chatId);
+    const botUsername = ctx.me.username;
 
-    const raffleKeyboard = new InlineKeyboard()
-      .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-      .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-      .row()
-      .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+    const raffleKeyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
 
     const msgId = await sendRafflePost(
       ctx.api,
@@ -1523,12 +1515,9 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
   });
 
   const lang = db.getChatLanguage(ctx.chat.id);
+  const botUsername = ctx.me.username;
 
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-    .row()
-    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+  const keyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
 
   const msgId = await sendRafflePost(
     ctx.api,
@@ -1782,42 +1771,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
     await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
     await updateRafflePost(ctx, raffleId);
 
-    // Send referral invite link via DM if referrals are enabled
-    if (raffle && raffle.referral_enabled) {
-      try {
-        // Check if user already has a referral link for this raffle
-        let refLink = db.getReferralLink(raffleId, userId);
-        if (!refLink) {
-          // Create a unique invite link for this user
-          const invite = await ctx.api.createChatInviteLink(raffle.chat_id, {
-            name: `ref_${raffleId}_${userId}`,
-            creates_join_request: false,
-          });
-          refLink = db.createReferralLink(
-            raffleId,
-            userId,
-            displayName,
-            raffle.chat_id,
-            invite.invite_link
-          );
-        }
-
-        const capText = raffle.max_referral_entries > 0
-          ? `(max ${raffle.max_referral_entries} bonus entries)`
-          : "(no limit)";
-
-        await ctx.api.sendMessage(
-          userId,
-          `🔗 <b>Referral Link — ${escapeHtml(raffle.title)}</b>\n\n` +
-            `Share this link to earn <b>bonus entries</b>! Each person who joins the group ` +
-            `through your link gives you +1 extra chance to win ${capText}.\n\n` +
-            `Your link:\n${refLink.invite_link}`,
-          { parse_mode: "HTML" }
-        );
-      } catch {
-        // User may not have started the bot — can't DM them
-      }
-    }
+    // Referral link is now handled via the "Get Referral Link" button on the raffle post
+    // which deep-links to the bot DM where the link is generated on demand
 
     // Auto-draw when max entries reached
     if (result.maxReached) {
@@ -1957,14 +1912,11 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
   const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
 
   const lang = db.getChatLanguage(raffle.chat_id);
+  const botUsername = ctx.me.username;
 
   try {
     if (raffle.status === "open") {
-      const keyboard = new InlineKeyboard()
-        .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-        .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-        .row()
-        .text(`👥 ${t(lang, "btn.entries", { count: displayCount })}`, `entries_${raffle.id}`);
+      const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
 
       try {
         // Try editMessageCaption first (for photo messages with embedded banner)
@@ -2102,6 +2054,7 @@ export async function notifyWinnersAndCreator(
   }
 
   // DM each winner
+  const failedDmWinners: string[] = [];
   for (const w of winners) {
     try {
       let winnerMsg = `🎉 <b>Congratulations!</b>\n\n`;
@@ -2112,7 +2065,22 @@ export async function notifyWinnersAndCreator(
       winnerMsg += contactLine;
       await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
     } catch {
-      // Winner may not have started the bot
+      // Winner hasn't started the bot — track for group notification
+      failedDmWinners.push(w.user_display_name);
+    }
+  }
+
+  // Notify in group if any winners couldn't be DM'd
+  if (failedDmWinners.length > 0) {
+    try {
+      const names = failedDmWinners.map((n) => `<b>${escapeHtml(n)}</b>`).join(", ");
+      await api.sendMessage(
+        raffle.chat_id,
+        `⚠️ ${names} — I couldn't send you a DM! Please start a conversation with me to receive your prize details.`,
+        { parse_mode: "HTML" }
+      );
+    } catch {
+      // Can't post in group either
     }
   }
 

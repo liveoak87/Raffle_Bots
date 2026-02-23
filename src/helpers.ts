@@ -1,3 +1,4 @@
+import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
@@ -247,6 +248,29 @@ function getPositionLabel(position: number): string {
     default:
       return `${position}.`;
   }
+}
+
+/**
+ * Build the inline keyboard for an open raffle post.
+ * Includes a "Get Referral Link" URL button when referrals are enabled.
+ */
+export function buildRaffleKeyboard(
+  raffle: Raffle,
+  displayCount: number,
+  lang: string,
+  botUsername: string
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
+    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
+    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
+    .row()
+    .text(`👥 ${t(lang, "btn.entries", { count: displayCount })}`, `entries_${raffle.id}`);
+
+  if (raffle.referral_enabled) {
+    keyboard.url("🔗 Get Referral Link", `https://t.me/${botUsername}?start=reflink_${raffle.id}`);
+  }
+
+  return keyboard;
 }
 
 export function buildMessageLink(chatId: number, messageId: number | null): string | null {

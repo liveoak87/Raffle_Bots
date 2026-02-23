@@ -8,6 +8,7 @@ import {
   isGroupAdmin,
   parseEndTime,
   formatCountdown,
+  buildRaffleKeyboard,
 } from "./helpers";
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
@@ -135,6 +136,73 @@ export async function handleStartDeepLink(
   ctx: Context,
   payload: string
 ): Promise<boolean> {
+  // --- Referral link deep link: /start reflink_RAFFLEID ---
+  const refMatch = payload.match(/^reflink_(\d+)$/);
+  if (refMatch) {
+    const raffleId = parseInt(refMatch[1], 10);
+    const userId = ctx.from!.id;
+    const displayName = getUserDisplayName(
+      ctx.from!.first_name,
+      ctx.from!.last_name
+    );
+
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.status !== "open") {
+      await ctx.reply("This raffle is no longer open.");
+      return true;
+    }
+
+    if (!raffle.referral_enabled) {
+      await ctx.reply("Referrals are not enabled for this raffle.");
+      return true;
+    }
+
+    // Check if user has entered the raffle
+    if (!db.hasUserEntered(raffleId, userId)) {
+      await ctx.reply(
+        `You need to enter the raffle first before getting a referral link.\n\n` +
+          `Go to the group and tap 🎟 <b>Enter Raffle</b> on <b>${escapeHtml(raffle.title)}</b>, then come back here.`,
+        { parse_mode: "HTML" }
+      );
+      return true;
+    }
+
+    // Get or create the referral link
+    let refLink = db.getReferralLink(raffleId, userId);
+    if (!refLink) {
+      try {
+        const invite = await ctx.api.createChatInviteLink(raffle.chat_id, {
+          name: `ref_${raffleId}_${userId}`,
+          creates_join_request: false,
+        });
+        refLink = db.createReferralLink(
+          raffleId,
+          userId,
+          displayName,
+          raffle.chat_id,
+          invite.invite_link
+        );
+      } catch {
+        await ctx.reply("Failed to create your referral link. The bot may need admin permissions in the group.");
+        return true;
+      }
+    }
+
+    const capText = raffle.max_referral_entries > 0
+      ? `(max ${raffle.max_referral_entries} bonus entries)`
+      : "(no limit)";
+
+    await ctx.reply(
+      `🔗 <b>Referral Link — ${escapeHtml(raffle.title)}</b>\n\n` +
+        `Share this link to earn <b>bonus entries</b>! Each person who joins the group ` +
+        `through your link gives you +1 extra chance to win ${capText}.\n\n` +
+        `Your link:\n${refLink.invite_link}`,
+      { parse_mode: "HTML" }
+    );
+
+    return true;
+  }
+
   // --- Template creation deep link: /start tmpl_CHATID ---
   const tmplMatch = payload.match(/^tmpl_(-?\d+)$/);
   if (tmplMatch) {
@@ -896,11 +964,8 @@ async function createRaffleFromWizard(
   cancelWizard(state.userId);
 
   const lang = db.getChatLanguage(state.targetChatId);
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-    .row()
-    .text(`👥 ${t(lang, "btn.entries", { count: 0 })}`, `entries_${raffle.id}`);
+  const botUsername = ctx.me.username;
+  const keyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
 
   const msgId = await sendRafflePost(
     ctx.api,
@@ -1445,13 +1510,11 @@ async function updateRafflePostById(
   if (!raffle || !raffle.message_id) return;
 
   const count = db.getEntryCount(raffleId);
+  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
   const lang = db.getChatLanguage(chatId);
+  const botUsername = ctx.me.username;
 
-  const keyboard = new InlineKeyboard()
-    .text(`🎟 ${t(lang, "btn.enter")}`, `enter_${raffle.id}`)
-    .text(`❌ ${t(lang, "btn.leave")}`, `leave_${raffle.id}`)
-    .row()
-    .text(`👥 ${t(lang, "btn.entries", { count })}`, `entries_${raffle.id}`);
+  const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
 
   try {
     await ctx.api.editMessageText(

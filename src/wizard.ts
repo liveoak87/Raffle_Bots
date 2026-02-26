@@ -1280,16 +1280,18 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
   }
 
   if (data === "edit_time") {
+    state.editingField = "ends";
     const kb = new InlineKeyboard()
-      .text("15 min", "edit_time_15m")
       .text("30 min", "edit_time_30m")
       .text("1 hour", "edit_time_1h")
-      .row()
       .text("2 hours", "edit_time_2h")
+      .row()
       .text("6 hours", "edit_time_6h")
       .text("1 day", "edit_time_1d")
+      .text("3 days", "edit_time_3d")
       .row()
-      .text("⏱ Custom", "edit_time_custom")
+      .text("7 days", "edit_time_7d")
+      .text("14 days", "edit_time_14d")
       .text("❌ No limit", "edit_time_none")
       .row()
       .text("⬅️ Back", "edit_back");
@@ -1297,7 +1299,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     await ctx.editMessageText(
       `⏰ <b>Edit End Time</b>\n\n` +
         `Current: <b>${raffle.ends_at ? formatCountdown(new Date(raffle.ends_at + "Z")) : "No limit"}</b>\n\n` +
-        `Pick a new duration:`,
+        `Pick a new duration or type one (e.g. <code>5d</code>, <code>12h</code>):`,
       { parse_mode: "HTML", reply_markup: kb }
     );
     return;
@@ -1305,16 +1307,6 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
 
   if (data.startsWith("edit_time_")) {
     const timeValue = data.replace("edit_time_", "");
-
-    if (timeValue === "custom") {
-      state.editingField = "ends";
-      await ctx.editMessageText(
-        `⏱ <b>Custom End Time</b>\n\n` +
-          `Type a duration like: <code>45m</code>, <code>3h</code>, <code>12h</code>, <code>2d</code>`,
-        { parse_mode: "HTML" }
-      );
-      return;
-    }
 
     if (timeValue === "none") {
       db.updateRaffleFields(state.raffleId, { ends_at: null });
@@ -1327,6 +1319,9 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
         case "2h": ms = 2 * 60 * 60 * 1000; break;
         case "6h": ms = 6 * 60 * 60 * 1000; break;
         case "1d": ms = 24 * 60 * 60 * 1000; break;
+        case "3d": ms = 3 * 24 * 60 * 60 * 1000; break;
+        case "7d": ms = 7 * 24 * 60 * 60 * 1000; break;
+        case "14d": ms = 14 * 24 * 60 * 60 * 1000; break;
       }
       const endDate = new Date(Date.now() + ms);
       const endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];

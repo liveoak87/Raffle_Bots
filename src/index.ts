@@ -780,6 +780,12 @@ bot.on("my_chat_member", async (ctx) => {
 
 // --- Error handling ---
 bot.catch((err) => {
+  const errObj = err as unknown as Record<string, unknown>;
+  const innerErr = errObj?.error as Record<string, unknown> | undefined;
+  const msg =
+    innerErr?.description ?? errObj?.message ?? String(err);
+  // Silently ignore stale callback queries (buttons pressed during restart)
+  if (typeof msg === "string" && msg.includes("query is too old")) return;
   console.error("Bot error:", err);
 });
 

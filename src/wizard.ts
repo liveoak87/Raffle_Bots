@@ -12,7 +12,6 @@ import {
 } from "./helpers";
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
-import { notifyOwnerNewRaffle } from "./helpers";
 
 interface WizardState {
   step:
@@ -1010,7 +1009,6 @@ async function createRaffleFromWizard(
     { parse_mode: "HTML" }
   );
 
-  await notifyOwnerNewRaffle(ctx.api, raffle, state.targetChatTitle);
 }
 
 // ===================================================================

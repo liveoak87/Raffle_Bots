@@ -43,7 +43,6 @@ import {
   buildMessageLink,
   buildRaffleKeyboard,
   sleep,
-  notifyOwnerNewRaffle,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -568,8 +567,6 @@ async function checkRecurringTemplates(): Promise<void> {
         if (msgId) {
           db.updateRaffleMessageId(raffle.id, msgId);
         }
-
-        await notifyOwnerNewRaffle(bot.api, raffle);
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
       }
@@ -929,6 +926,52 @@ async function main(): Promise<void> {
     }
   }
   setInterval(checkWeeklyReport, WEEKLY_REPORT_INTERVAL);
+
+  // Daily new-raffle digest to bot owner
+  const DAILY_DIGEST_INTERVAL = 60_000; // check every minute
+  let lastDailyDigest = 0;
+
+  async function checkDailyDigest(): Promise<void> {
+    const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+    if (ownerId === 0) return;
+
+    const now = new Date();
+    // Send every day at 21:00 UTC (4 PM EST / 5 PM EDT)
+    if (now.getUTCHours() !== 21 || now.getUTCMinutes() !== 0) return;
+
+    // Prevent duplicate sends within the same minute
+    const minuteKey = Math.floor(now.getTime() / 60_000);
+    if (minuteKey === lastDailyDigest) return;
+    lastDailyDigest = minuteKey;
+
+    // Get raffles created in the last 24 hours
+    const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const sinceUtc = since.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+    const newRaffles = db.getRafflesCreatedSince(sinceUtc);
+
+    if (newRaffles.length === 0) return; // Nothing to report
+
+    const groups = db.getActiveBotGroups();
+    const groupMap = new Map(groups.map((g) => [g.chat_id, g.title]));
+
+    let msg = `📋 <b>Daily Raffle Digest</b>\n\n`;
+    msg += `<b>${newRaffles.length}</b> new raffle${newRaffles.length !== 1 ? "s" : ""} created today:\n\n`;
+
+    for (const r of newRaffles) {
+      const groupName = groupMap.get(r.chat_id) || `Chat ${r.chat_id}`;
+      const status = r.status === "open" ? "🟢" : r.status === "drawn" ? "🏆" : "🔴";
+      msg += `${status} <b>${escapeHtml(r.title)}</b>\n`;
+      msg += `   👤 ${escapeHtml(r.creator_name)} · 💬 ${escapeHtml(groupName)}\n`;
+    }
+
+    try {
+      await bot.api.sendMessage(ownerId, msg, { parse_mode: "HTML" });
+      console.log(`Daily digest sent: ${newRaffles.length} new raffle(s)`);
+    } catch (err) {
+      console.error("Failed to send daily digest:", err);
+    }
+  }
+  setInterval(checkDailyDigest, DAILY_DIGEST_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
   await bot.start({

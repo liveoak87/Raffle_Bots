@@ -278,6 +278,14 @@ export function getRecentRafflesForChat(
     .all(chatId, limit) as Raffle[];
 }
 
+export function getRafflesCreatedSince(sinceUtc: string): Raffle[] {
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffles WHERE created_at >= ? ORDER BY created_at ASC"
+    )
+    .all(sinceUtc) as Raffle[];
+}
+
 export function updateRaffleMessageId(
   raffleId: number,
   messageId: number

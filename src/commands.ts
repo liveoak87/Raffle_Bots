@@ -2197,18 +2197,9 @@ export async function notifyWinnersAndCreator(
     }
   }
 
-  // Notify in group if any winners couldn't be DM'd
+  // Log failed DMs silently — don't post warnings in the group
   if (failedDmWinners.length > 0) {
-    try {
-      const names = failedDmWinners.map((n) => `<b>${escapeHtml(n)}</b>`).join(", ");
-      await api.sendMessage(
-        raffle.chat_id,
-        `⚠️ ${names} — I couldn't send you a DM! Please start a conversation with me to receive your prize details.`,
-        { parse_mode: "HTML" }
-      );
-    } catch {
-      // Can't post in group either
-    }
+    console.log(`Could not DM winners: ${failedDmWinners.join(", ")}`);
   }
 
   // DM the creator with full results

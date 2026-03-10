@@ -183,13 +183,15 @@ export async function sendRafflePost(
   bannerType: BannerType,
   caption: string,
   keyboard: InlineKeyboard,
-  customImageFileId?: string | null
+  customImageFileId?: string | null,
+  threadId?: number | null
 ): Promise<number | null> {
+  const threadOpts = threadId ? { message_thread_id: threadId } : {};
   try {
     // 1. Send custom image first (above the raffle) if provided
     if (customImageFileId) {
       try {
-        await api.sendPhoto(chatId, customImageFileId);
+        await api.sendPhoto(chatId, customImageFileId, threadOpts);
       } catch (err) {
         console.error(`Failed to send custom image to chat ${chatId}:`, err);
         // Non-fatal — continue with raffle post
@@ -202,11 +204,12 @@ export async function sendRafflePost(
     // 3. Check caption length — if too long, send banner then text separately
     if (caption.length > MAX_CAPTION_LENGTH) {
       // Send banner without caption
-      await api.sendPhoto(chatId, bannerSource);
+      await api.sendPhoto(chatId, bannerSource, threadOpts);
       // Send text message with buttons
       const msg = await api.sendMessage(chatId, caption, {
         parse_mode: "HTML",
         reply_markup: keyboard,
+        ...threadOpts,
       });
       return msg.message_id;
     }
@@ -216,6 +219,7 @@ export async function sendRafflePost(
       caption,
       parse_mode: "HTML",
       reply_markup: keyboard,
+      ...threadOpts,
     });
 
     // Cache the file_id if we uploaded a new one
@@ -274,12 +278,15 @@ export async function sendWheelSpin(
     ) => Promise<unknown>;
     deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
   },
-  chatId: number
+  chatId: number,
+  threadId?: number | null
 ): Promise<void> {
+  const threadOpts = threadId ? { message_thread_id: threadId } : {};
   try {
     // Send initial countdown message
     const msg = await api.sendMessage(chatId, `🎰 <b>Drawing winner in 5...</b>`, {
       parse_mode: "HTML",
+      ...threadOpts,
     });
 
     // Countdown from 4 to 1
@@ -332,9 +339,11 @@ export async function sendWinnerPost(
     deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
   },
   chatId: number,
-  winnerText: string
+  winnerText: string,
+  threadId?: number | null
 ): Promise<void> {
   const MAX_CAPTION_LENGTH = 1024;
+  const threadOpts = threadId ? { message_thread_id: threadId } : {};
 
   // Get or upload the "drawn" banner
   let fileId = getCachedBannerFileId("drawn");
@@ -343,7 +352,7 @@ export async function sendWinnerPost(
     // Upload to get file_id
     const filePath = getAssetPath(BANNER_FILES["drawn"]);
     try {
-      const msg = await api.sendPhoto(chatId, new InputFile(filePath));
+      const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts);
       if (msg.photo && msg.photo.length > 0) {
         fileId = msg.photo[msg.photo.length - 1].file_id;
         setCachedBannerFileId("drawn", fileId);
@@ -363,6 +372,7 @@ export async function sendWinnerPost(
       await api.sendPhoto(chatId, fileId, {
         caption: winnerText,
         parse_mode: "HTML",
+        ...threadOpts,
       });
       return;
     } catch (err) {
@@ -372,7 +382,7 @@ export async function sendWinnerPost(
 
   // Fallback: just send text
   try {
-    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML" });
+    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML", ...threadOpts });
   } catch (err) {
     console.error("Failed to send winner text:", err);
   }

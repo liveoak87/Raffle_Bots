@@ -216,6 +216,20 @@ function migrateDatabase(): void {
     );
   }
 
+  if (!raffleColumns.includes("thread_id")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN thread_id INTEGER DEFAULT NULL");
+  }
+
+  // Add thread_id to raffle_templates if the table exists
+  try {
+    const templateColumns = tableInfo("raffle_templates").map((c) => c.name);
+    if (!templateColumns.includes("thread_id")) {
+      getDb().exec("ALTER TABLE raffle_templates ADD COLUMN thread_id INTEGER DEFAULT NULL");
+    }
+  } catch {
+    // Table may not exist yet
+  }
+
   // Create referral_links table if it doesn't exist
   getDb().exec(`
     CREATE TABLE IF NOT EXISTS referral_links (
@@ -246,8 +260,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
-    VALUES (@chat_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
+    INSERT INTO raffles (chat_id, thread_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
+    VALUES (@chat_id, @thread_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -543,6 +557,7 @@ export function getOpenRafflesWithEndTime(): Raffle[] {
 
 export function createTemplate(input: {
   chat_id: number;
+  thread_id: number | null;
   creator_id: number;
   name: string;
   title: string;
@@ -556,8 +571,8 @@ export function createTemplate(input: {
   recurring_interval_minutes: number | null;
 }): RaffleTemplate {
   const stmt = getDb().prepare(`
-    INSERT INTO raffle_templates (chat_id, creator_id, name, title, prize, prizes, max_entries, max_winners, duration_minutes, sponsor_name, anonymous, recurring_interval_minutes, recurring_active, next_run_at)
-    VALUES (@chat_id, @creator_id, @name, @title, @prize, @prizes, @max_entries, @max_winners, @duration_minutes, @sponsor_name, @anonymous, @recurring_interval_minutes, 0, NULL)
+    INSERT INTO raffle_templates (chat_id, thread_id, creator_id, name, title, prize, prizes, max_entries, max_winners, duration_minutes, sponsor_name, anonymous, recurring_interval_minutes, recurring_active, next_run_at)
+    VALUES (@chat_id, @thread_id, @creator_id, @name, @title, @prize, @prizes, @max_entries, @max_winners, @duration_minutes, @sponsor_name, @anonymous, @recurring_interval_minutes, 0, NULL)
   `);
   const result = stmt.run(input);
   return getDb()
@@ -833,6 +848,7 @@ export function updateRaffleFields(
     "referral_enabled",
     "max_referral_entries",
     "revoke_referral_links",
+    "thread_id",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];

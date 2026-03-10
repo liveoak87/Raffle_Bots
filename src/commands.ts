@@ -247,8 +247,11 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     ctx.from!.last_name
   );
 
+  const threadId = ctx.message?.message_thread_id ?? null;
+
   const raffle = db.createRaffle({
     chat_id: ctx.chat.id,
+    thread_id: threadId,
     creator_id: userId,
     creator_name: displayName,
     title,
@@ -284,7 +287,9 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     ctx.chat.id,
     "open",
     formatRaffleMessage(raffle, 0, lang),
-    keyboard
+    keyboard,
+    null,
+    raffle.thread_id
   );
 
   if (msgId) {
@@ -405,11 +410,11 @@ export async function handleDraw(ctx: Context): Promise<void> {
 
   // Countdown animation (if animation enabled and at least 1 entry)
   if (entryNames.length >= 1 && raffle.show_animation) {
-    await sendWheelSpin(ctx.api, ctx.chat!.id);
+    await sendWheelSpin(ctx.api, ctx.chat!.id, raffle.thread_id);
   }
 
   // Announce winners with embedded "WINNERS DRAWN" banner
-  await sendWinnerPost(ctx.api, ctx.chat!.id, formatWinnersMessage(raffle, winners, lang));
+  await sendWinnerPost(ctx.api, ctx.chat!.id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
 
   // Mark as drawn after successful announcement
   db.markRaffleDrawn(raffle.id);
@@ -555,7 +560,8 @@ export async function handleRepostCallback(ctx: Context): Promise<void> {
     "open",
     caption,
     keyboard,
-    raffle.image_file_id
+    raffle.image_file_id,
+    raffle.thread_id
   );
 
   if (!newMsgId) {
@@ -961,6 +967,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     // Create a new raffle with the same settings
     const newRaffle = db.createRaffle({
       chat_id: chatId,
+      thread_id: sourceRaffle.thread_id,
       creator_id: ctx.from.id,
       creator_name: displayName,
       title: `${sourceRaffle.title} (Re-run)`,
@@ -1010,7 +1017,8 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       "open",
       caption,
       raffleKeyboard,
-      newRaffle.image_file_id
+      newRaffle.image_file_id,
+      newRaffle.thread_id
     );
 
     if (msgId) {
@@ -1204,6 +1212,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
     const raffle = db.createRaffle({
       chat_id: chatId,
+      thread_id: tmpl.thread_id,
       creator_id: ctx.from.id,
       creator_name: displayName,
       title: tmpl.title,
@@ -1239,7 +1248,9 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       chatId,
       "open",
       formatRaffleMessage(raffle, 0, lang),
-      raffleKeyboard
+      raffleKeyboard,
+      null,
+      raffle.thread_id
     );
 
     if (msgId) {
@@ -1484,6 +1495,7 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
   try {
     const template = db.createTemplate({
       chat_id: ctx.chat.id,
+      thread_id: ctx.message?.message_thread_id ?? null,
       creator_id: userId,
       name: templateName,
       title,
@@ -1614,8 +1626,11 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
       .split(".")[0];
   }
 
+  const threadId = ctx.message?.message_thread_id ?? template.thread_id;
+
   const raffle = db.createRaffle({
     chat_id: ctx.chat.id,
+    thread_id: threadId,
     creator_id: userId,
     creator_name: displayName,
     title: template.title,
@@ -1651,7 +1666,9 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     ctx.chat.id,
     "open",
     formatRaffleMessage(raffle, 0, lang),
-    keyboard
+    keyboard,
+    null,
+    raffle.thread_id
   );
 
   if (msgId) {
@@ -1912,11 +1929,11 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
 
         // Countdown animation (if animation enabled)
         if (entryNames.length >= 1 && raffle.show_animation) {
-          await sendWheelSpin(ctx.api, raffle.chat_id);
+          await sendWheelSpin(ctx.api, raffle.chat_id, raffle.thread_id);
         }
 
         // Announce winners with embedded "WINNERS DRAWN" banner
-        await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang));
+        await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
 
         db.markRaffleDrawn(raffleId);
         await revokeReferralInviteLinks(ctx.api, raffleId);

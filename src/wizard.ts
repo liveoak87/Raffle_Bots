@@ -28,6 +28,7 @@ interface WizardState {
     | "options_cooldown"
     | "options_referral_max";
   targetChatId: number;
+  targetThreadId: number | null;
   targetChatTitle: string;
   dmChatId: number;
   userId: number;
@@ -98,6 +99,7 @@ export async function startWizard(ctx: Context): Promise<void> {
     wizards.set(userId, {
       step: "title",
       targetChatId: groupChatId,
+      targetThreadId: ctx.message?.message_thread_id ?? null,
       targetChatTitle: groupTitle,
       dmChatId: dmMsg.chat.id,
       userId,
@@ -276,6 +278,7 @@ export async function handleStartDeepLink(
   wizards.set(userId, {
     step: "title",
     targetChatId: groupChatId,
+    targetThreadId: null,
     targetChatTitle: groupTitle,
     dmChatId: ctx.chat!.id,
     userId,
@@ -936,6 +939,7 @@ async function createRaffleFromWizard(
 
   const raffle = db.createRaffle({
     chat_id: state.targetChatId,
+    thread_id: state.targetThreadId,
     creator_id: state.userId,
     creator_name: displayName,
     title: state.title || "Raffle",
@@ -973,7 +977,8 @@ async function createRaffleFromWizard(
     "open",
     formatRaffleMessage(raffle, 0, lang),
     keyboard,
-    raffle.image_file_id
+    raffle.image_file_id,
+    raffle.thread_id
   );
 
   if (!msgId) {
@@ -2032,6 +2037,7 @@ async function createTemplateFromWizard(
   try {
     db.createTemplate({
       chat_id: state.targetChatId,
+      thread_id: null,
       creator_id: state.userId,
       name: state.name || "Template",
       title: state.title || state.name || "Raffle",

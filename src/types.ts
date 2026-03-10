@@ -15,6 +15,8 @@ export interface Raffle {
   starts_at: string | null;
   status: "open" | "closed" | "drawn";
   message_id: number | null;
+  /** Forum topic/thread ID (null = general/main thread) */
+  thread_id: number | null;
   /** Chat ID that users must be a member of to enter */
   required_chat_id: number | null;
   /** Display title for the required chat */
@@ -68,6 +70,7 @@ export interface RaffleWinner {
 
 export interface CreateRaffleInput {
   chat_id: number;
+  thread_id: number | null;
   creator_id: number;
   creator_name: string;
   title: string;
@@ -96,6 +99,7 @@ export interface CreateRaffleInput {
 export interface RaffleTemplate {
   id: number;
   chat_id: number;
+  thread_id: number | null;
   creator_id: number;
   name: string;
   title: string;

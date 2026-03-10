@@ -304,11 +304,11 @@ async function checkExpiredRaffles(): Promise<void> {
         const isRecent = staleness < 2 * 60 * 1000;
 
         if (isRecent && entryNames.length >= 1 && raffle.show_animation) {
-          await sendWheelSpin(bot.api, raffle.chat_id);
+          await sendWheelSpin(bot.api, raffle.chat_id, raffle.thread_id);
         }
 
         // Announce winners with embedded "WINNERS DRAWN" banner
-        await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang));
+        await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
 
         // DM winners and creator
         await notifyWinnersAndCreator(bot.api, raffle, winners);
@@ -525,6 +525,7 @@ async function checkRecurringTemplates(): Promise<void> {
 
       const raffle = db.createRaffle({
         chat_id: template.chat_id,
+        thread_id: template.thread_id,
         creator_id: template.creator_id,
         creator_name: "Recurring Raffle",
         title: template.title,
@@ -561,7 +562,9 @@ async function checkRecurringTemplates(): Promise<void> {
           template.chat_id,
           "open",
           formatRaffleMessage(raffle, 0, recLang),
-          keyboard
+          keyboard,
+          null,
+          raffle.thread_id
         );
 
         if (msgId) {

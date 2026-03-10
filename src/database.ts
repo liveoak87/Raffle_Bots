@@ -1092,9 +1092,14 @@ function cryptoShuffle<T>(array: T[]): T[] {
   const shuffled = [...array];
   const crypto = require("crypto");
   for (let i = shuffled.length - 1; i > 0; i--) {
-    const randomBytes = crypto.randomBytes(4);
-    const randomValue = randomBytes.readUInt32BE(0);
-    const j = randomValue % (i + 1);
+    // Rejection sampling to eliminate modulo bias
+    const range = i + 1;
+    const maxValid = Math.floor(0x100000000 / range) * range;
+    let randomValue: number;
+    do {
+      randomValue = crypto.randomBytes(4).readUInt32BE(0);
+    } while (randomValue >= maxValid);
+    const j = randomValue % range;
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   return shuffled;

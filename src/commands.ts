@@ -2328,24 +2328,15 @@ export async function handleStats(ctx: Context): Promise<void> {
   }
 }
 
-// /active — List all active raffles across all groups (owner only, hidden)
+// /active — List all active raffles across all groups (hidden, not in BotFather menu)
 export async function handleActive(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
-  if (ownerId === 0 || userId !== ownerId) {
-    return;
-  }
-
   const groups = db.getActiveRafflesByGroup();
 
   if (groups.length === 0) {
-    try {
-      await ctx.api.sendMessage(userId, "📭 No active raffles right now.", { parse_mode: "HTML" });
-    } catch {
-      await ctx.reply("📭 No active raffles right now.");
-    }
+    await ctx.reply("📭 No active raffles right now.");
     return;
   }
 
@@ -2400,11 +2391,7 @@ export async function handleActive(ctx: Context): Promise<void> {
   const header = `📊 <b>Active Raffles: ${totalRaffles} across ${groups.length} group${groups.length === 1 ? "" : "s"}</b>\n\n`;
   const msg = header + sections.join("\n");
 
-  try {
-    await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
-  } catch {
-    await ctx.reply(msg, { parse_mode: "HTML" });
-  }
+  await ctx.reply(msg, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
 }
 
 // /referralstats — Show referral link stats for active raffles (owner only)

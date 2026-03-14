@@ -2328,6 +2328,85 @@ export async function handleStats(ctx: Context): Promise<void> {
   }
 }
 
+// /active — List all active raffles across all groups (owner only, hidden)
+export async function handleActive(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) {
+    return;
+  }
+
+  const groups = db.getActiveRafflesByGroup();
+
+  if (groups.length === 0) {
+    try {
+      await ctx.api.sendMessage(userId, "📭 No active raffles right now.", { parse_mode: "HTML" });
+    } catch {
+      await ctx.reply("📭 No active raffles right now.");
+    }
+    return;
+  }
+
+  let totalRaffles = 0;
+  const sections: string[] = [];
+
+  for (const group of groups) {
+    let groupTitle = `Chat ${group.chat_id}`;
+    try {
+      const chat = await ctx.api.getChat(group.chat_id);
+      if ("title" in chat && chat.title) {
+        groupTitle = chat.title;
+      }
+    } catch {
+      // Can't resolve name — use chat ID
+    }
+
+    let section = `<b>📍 ${escapeHtml(groupTitle)}</b>\n`;
+
+    for (const raffle of group.raffles) {
+      totalRaffles++;
+      const entryCount = db.getEntryCount(raffle.id);
+      const totalCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : entryCount;
+
+      let line = `  🎟 <b>${escapeHtml(raffle.title)}</b> — ${totalCount} entries`;
+      if (raffle.max_winners > 1) {
+        line += ` (${raffle.max_winners} winners)`;
+      }
+      if (raffle.ends_at) {
+        const endsDate = new Date(raffle.ends_at + "Z");
+        const remaining = endsDate.getTime() - Date.now();
+        if (remaining > 0) {
+          line += ` — ${formatCountdown(endsDate)} left`;
+        } else {
+          line += ` — <i>expired, pending draw</i>`;
+        }
+      } else {
+        line += ` — no end time`;
+      }
+      if (raffle.message_id) {
+        const link = buildMessageLink(raffle.chat_id, raffle.message_id);
+        if (link) {
+          line += ` (<a href="${link}">view</a>)`;
+        }
+      }
+      section += line + "\n";
+    }
+
+    sections.push(section);
+  }
+
+  const header = `📊 <b>Active Raffles: ${totalRaffles} across ${groups.length} group${groups.length === 1 ? "" : "s"}</b>\n\n`;
+  const msg = header + sections.join("\n");
+
+  try {
+    await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  } catch {
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  }
+}
+
 // /referralstats — Show referral link stats for active raffles (owner only)
 export async function handleReferralStats(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;

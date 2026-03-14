@@ -28,6 +28,7 @@ import {
   handleEditRaffle,
   handleLanguage,
   handleStats,
+  handleActive,
   handleReferralStats,
   handleGroupStats,
   handleBugReport,
@@ -138,6 +139,7 @@ bot.command("recurring", handleRecurring);
 bot.command("editraffle", handleEditRaffle);
 bot.command("language", handleLanguage);
 bot.command("stats", handleStats);
+bot.command("active", handleActive);
 bot.command("referralstats", handleReferralStats);
 bot.command("groupstats", handleGroupStats);
 bot.command("bugreport", handleBugReport);

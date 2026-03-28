@@ -867,28 +867,28 @@ bot.catch((err) => {
 });
 
 // --- Seed bot_groups on startup ---
+
+// Refresh a group's title and bot status. NEVER removes groups —
+// if we can't reach the group, we just skip it and keep the old data.
+// Groups are only removed via the my_chat_member handler when the bot is explicitly kicked.
 async function refreshGroup(
   botId: number,
   chatId: number,
   title: string
-): Promise<"refreshed" | "removed"> {
+): Promise<"refreshed" | "skipped"> {
   try {
     const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
     const chatTitle = chat.title ? String(chat.title) : title;
     const member = await bot.api.getChatMember(chatId, botId);
-    if (member.status === "administrator") {
-      db.upsertBotGroup(chatId, chatTitle, "administrator");
+    if (member.status === "administrator" || member.status === "member") {
+      db.upsertBotGroup(chatId, chatTitle, member.status);
       return "refreshed";
-    } else if (member.status === "member") {
-      db.upsertBotGroup(chatId, chatTitle, "member");
-      return "refreshed";
-    } else {
-      db.removeBotGroup(chatId);
-      return "removed";
     }
+    // Bot was kicked/left but don't remove — keep historical record
+    return "skipped";
   } catch {
-    db.removeBotGroup(chatId);
-    return "removed";
+    // API error (rate limit, timeout, network) — keep the group as-is
+    return "skipped";
   }
 }
 
@@ -898,13 +898,35 @@ async function seedBotGroups(): Promise<void> {
   const existing = db.getActiveBotGroups();
   if (existing.length > 0) {
     console.log(`Refreshing ${existing.length} tracked groups...`);
-    // Process in parallel batches of 5
-    const BATCH_SIZE = 5;
+    // Process in batches of 3 with a delay between batches to respect rate limits
+    const BATCH_SIZE = 3;
     for (let i = 0; i < existing.length; i += BATCH_SIZE) {
       await Promise.all(
         existing.slice(i, i + BATCH_SIZE).map((g) => refreshGroup(botId, g.chat_id, g.title))
       );
+      if (i + BATCH_SIZE < existing.length) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
     }
+    // Also check for groups in raffle history that aren't tracked yet (recovery)
+    const allKnownChatIds = db.getAllGroupChatIds();
+    const trackedIds = new Set(existing.map((g) => g.chat_id));
+    const missingIds = allKnownChatIds.filter((id) => !trackedIds.has(id));
+    if (missingIds.length > 0) {
+      console.log(`Recovering ${missingIds.length} untracked groups from raffle history...`);
+      let recovered = 0;
+      for (let i = 0; i < missingIds.length; i += BATCH_SIZE) {
+        const results = await Promise.all(
+          missingIds.slice(i, i + BATCH_SIZE).map((id) => refreshGroup(botId, id, ""))
+        );
+        recovered += results.filter((r) => r === "refreshed").length;
+        if (i + BATCH_SIZE < missingIds.length) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+      if (recovered > 0) console.log(`Recovered ${recovered} groups`);
+    }
+
     const after = db.getActiveBotGroups();
     console.log(`Group refresh complete: ${after.length} active groups`);
     return;
@@ -916,12 +938,15 @@ async function seedBotGroups(): Promise<void> {
 
   console.log(`Seeding bot_groups from ${chatIds.length} known groups...`);
   let added = 0;
-  const BATCH_SIZE = 5;
+  const BATCH_SIZE = 3;
   for (let i = 0; i < chatIds.length; i += BATCH_SIZE) {
     const results = await Promise.all(
       chatIds.slice(i, i + BATCH_SIZE).map((id) => refreshGroup(botId, id, ""))
     );
     added += results.filter((r) => r === "refreshed").length;
+    if (i + BATCH_SIZE < chatIds.length) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
   }
   console.log(`Seeded ${added} active groups (${chatIds.length - added} skipped)`);
 }

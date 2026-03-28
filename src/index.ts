@@ -144,6 +144,22 @@ bot.command("referralstats", handleReferralStats);
 bot.command("groupstats", handleGroupStats);
 bot.command("bugreport", handleBugReport);
 
+// --- Callback query safety net ---
+// Ensures every callback query gets answered even if the handler throws.
+// Telegram penalizes bots that leave callback queries unanswered.
+bot.on("callback_query:data", async (ctx, next) => {
+  try {
+    await next();
+  } catch (err) {
+    console.error("Callback query handler error:", err);
+    try {
+      await ctx.answerCallbackQuery({ text: "⚠️ Something went wrong. Please try again.", show_alert: true });
+    } catch {
+      // answerCallbackQuery itself failed (e.g. query too old) — nothing more we can do
+    }
+  }
+});
+
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
 bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
@@ -176,6 +192,12 @@ bot.callbackQuery("bugreport_skip", handleBugReportSkip);
 bot.callbackQuery(/^twiz_winners_\d+$/, handleTmplWinnersCallback);
 bot.callbackQuery(/^twiz_time_/, handleTmplTimeCallback);
 bot.callbackQuery(/^twiz_opt_/, handleTmplOptionsCallback);
+
+// --- Catch-all for unmatched callback queries ---
+// Prevents Telegram from flagging unanswered callbacks for old/unknown button patterns
+bot.on("callback_query:data", async (ctx) => {
+  await ctx.answerCallbackQuery();
+});
 
 // --- Detect forwarded raffle posts and reply with redirect ---
 bot.on("message", async (ctx, next) => {

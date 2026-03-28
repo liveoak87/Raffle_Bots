@@ -117,12 +117,25 @@ bot.use(sequentialize((ctx) => {
   return chatId ? [String(chatId)] : undefined;
 }));
 
-// --- Auto-delete command messages in group chats ---
+// --- Auto-track groups + auto-delete command messages ---
 bot.use(async (ctx, next) => {
   const isGroup =
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
-  const isCommand = ctx.message?.text?.startsWith("/");
 
+  // Auto-track: any activity from a group ensures it's in bot_groups
+  if (isGroup && ctx.chat) {
+    const chatId = ctx.chat.id;
+    const title = ctx.chat.title || "";
+    const existing = db.getBotGroup(chatId);
+    if (!existing) {
+      db.upsertBotGroup(chatId, title, "member");
+    } else if (title && existing.title !== title) {
+      // Update title if it changed
+      db.upsertBotGroup(chatId, title, existing.bot_status);
+    }
+  }
+
+  const isCommand = ctx.message?.text?.startsWith("/");
   if (isGroup && isCommand) {
     try {
       await ctx.deleteMessage();

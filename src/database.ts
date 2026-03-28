@@ -967,6 +967,12 @@ export function upsertBotGroup(chatId: number, title: string, botStatus: "member
     .run(chatId, title, botStatus);
 }
 
+export function getBotGroup(chatId: number): BotGroup | undefined {
+  return getDb()
+    .prepare("SELECT * FROM bot_groups WHERE chat_id = ?")
+    .get(chatId) as BotGroup | undefined;
+}
+
 export function removeBotGroup(chatId: number): void {
   getDb().prepare("DELETE FROM bot_groups WHERE chat_id = ?").run(chatId);
 }

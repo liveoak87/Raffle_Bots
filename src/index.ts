@@ -165,7 +165,11 @@ bot.on("callback_query:data", async (ctx, next) => {
   try {
     await next();
   } catch (err) {
-    console.error("Callback query handler error:", err);
+    // Silently ignore stale callbacks from before restart
+    const errMsg = String((err as Record<string, unknown>)?.description ?? err);
+    if (!errMsg.includes("query is too old")) {
+      console.error("Callback query handler error:", err);
+    }
     try {
       await ctx.answerCallbackQuery({ text: "⚠️ Something went wrong. Please try again.", show_alert: true });
     } catch {

@@ -1913,7 +1913,8 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
 
   if (result.success) {
     await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
-    await updateRafflePost(ctx, raffleId);
+    // Fire-and-forget — don't block callback response on post update
+    updateRafflePost(ctx, raffleId).catch((err) => console.error("Failed to update raffle post:", err));
 
     // Referral link is now handled via the "Get Referral Link" button on the raffle post
     // which deep-links to the bot DM where the link is generated on demand
@@ -1970,7 +1971,7 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
 
   if (removed) {
     await ctx.answerCallbackQuery({ text: t(leaveLang, "entry.left") });
-    await updateRafflePost(ctx, raffleId);
+    updateRafflePost(ctx, raffleId).catch((err) => console.error("Failed to update raffle post:", err));
   } else {
     await ctx.answerCallbackQuery({
       text: t(leaveLang, "entry.not_in"),
@@ -2048,6 +2049,9 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
 
 // --- Utility ---
 
+// Track which raffles are photo-based vs text-only to avoid wasted API calls
+const raffleIsPhotoMsg = new Map<number, boolean>();
+
 async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
   const raffle = db.getRaffleById(raffleId);
   if (!raffle || !raffle.message_id) return;
@@ -2061,22 +2065,23 @@ async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
   try {
     if (raffle.status === "open") {
       const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
+      const caption = formatRaffleMessage(raffle, count, lang);
+      const isPhoto = raffleIsPhotoMsg.get(raffleId);
+
+      if (isPhoto === false) {
+        // Known text-only — skip editMessageCaption entirely
+        await ctx.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
+        return;
+      }
 
       try {
-        // Try editMessageCaption first (for photo messages with embedded banner)
-        await ctx.api.editMessageCaption(
-          raffle.chat_id,
-          raffle.message_id,
-          { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
-        );
+        await ctx.api.editMessageCaption(raffle.chat_id, raffle.message_id, { caption, parse_mode: "HTML", reply_markup: keyboard });
+        raffleIsPhotoMsg.set(raffleId, true);
       } catch {
-        // Fallback to editMessageText (for old text-only messages without banner)
-        await ctx.api.editMessageText(
-          raffle.chat_id,
-          raffle.message_id,
-          formatRaffleMessage(raffle, count, lang),
-          { parse_mode: "HTML", reply_markup: keyboard }
-        );
+        try {
+          await ctx.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
+          raffleIsPhotoMsg.set(raffleId, false);
+        } catch { /* unchanged or deleted */ }
       }
     } else {
       // Raffle is closed or drawn - remove entry buttons and swap banner to "closed"
@@ -2150,14 +2155,15 @@ export async function revokeReferralInviteLinks(
   const links = db.getReferralLinksForRaffle(raffleId);
   if (links.length === 0) return;
 
+  // Revoke in parallel batches of 5 to avoid rate limits
   let revoked = 0;
-  for (const link of links) {
-    try {
-      await api.revokeChatInviteLink(link.chat_id, link.invite_link);
-      revoked++;
-    } catch {
-      // Link may already be revoked, expired, or bot lost admin — skip
-    }
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < links.length; i += BATCH_SIZE) {
+    const batch = links.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map((link) => api.revokeChatInviteLink(link.chat_id, link.invite_link))
+    );
+    revoked += results.filter((r) => r.status === "fulfilled").length;
   }
 
   if (revoked > 0) {
@@ -2197,10 +2203,9 @@ export async function notifyWinnersAndCreator(
     contactLine = `\n\n📍 Won in <b>${escapeHtml(groupTitle)}</b>`;
   }
 
-  // DM each winner
-  const failedDmWinners: string[] = [];
-  for (const w of winners) {
-    try {
+  // DM all winners concurrently
+  const dmResults = await Promise.allSettled(
+    winners.map(async (w) => {
       let winnerMsg = `🎉 <b>Congratulations!</b>\n\n`;
       winnerMsg += `You won in the raffle <b>${title}</b>!`;
       if (w.prize) {
@@ -2208,13 +2213,14 @@ export async function notifyWinnersAndCreator(
       }
       winnerMsg += contactLine;
       await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
-    } catch {
-      // Winner hasn't started the bot — track for group notification
-      failedDmWinners.push(w.user_display_name);
-    }
-  }
+      return w.user_display_name;
+    })
+  );
 
-  // Log failed DMs silently — don't post warnings in the group
+  const failedDmWinners = dmResults
+    .map((r, i) => r.status === "rejected" ? winners[i].user_display_name : null)
+    .filter((name): name is string => name !== null);
+
   if (failedDmWinners.length > 0) {
     console.log(`Could not DM winners: ${failedDmWinners.join(", ")}`);
   }

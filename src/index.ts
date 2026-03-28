@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { Bot, InlineKeyboard } from "grammy";
+import { autoRetry } from "@grammyjs/auto-retry";
+import { run, sequentialize } from "@grammyjs/runner";
 import { initDatabase } from "./database";
 import * as db from "./database";
 import {
@@ -43,7 +45,6 @@ import {
   getUserDisplayName,
   buildMessageLink,
   buildRaffleKeyboard,
-  sleep,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -102,6 +103,19 @@ if (DATA_RETENTION_HOURS > 0) {
 
 // Create bot
 const bot = new Bot(BOT_TOKEN);
+
+// Auto-retry on rate limits (429) with exponential backoff
+bot.api.config.use(autoRetry({
+  maxRetryAttempts: 3,
+  maxDelaySeconds: 10,
+}));
+
+// Sequentialize updates per chat to prevent race conditions,
+// but allow different chats to be processed concurrently
+bot.use(sequentialize((ctx) => {
+  const chatId = ctx.chat?.id;
+  return chatId ? [String(chatId)] : undefined;
+}));
 
 // --- Auto-delete command messages in group chats ---
 bot.use(async (ctx, next) => {
@@ -294,108 +308,126 @@ bot.on("message:photo", async (ctx) => {
 // --- Auto-draw expired raffles ---
 const EXPIRY_CHECK_INTERVAL = 10_000; // 10 seconds - check more frequently for quicker auto-draw
 
+async function processExpiredRaffle(raffle: Raffle): Promise<void> {
+  console.log(`Auto-drawing expired raffle: ${raffle.id} - ${raffle.title}`);
+
+  // Mark as drawn IMMEDIATELY to prevent double-processing
+  db.markRaffleDrawn(raffle.id);
+  // Revoke referral links in background — don't block the draw
+  revokeReferralInviteLinks(bot.api, raffle.id).catch((err) =>
+    console.error(`Failed to revoke referral links for raffle ${raffle.id}:`, err)
+  );
+
+  const entryCount = db.getEntryCount(raffle.id);
+  const lang = db.getChatLanguage(raffle.chat_id);
+  const threadOpts = raffle.thread_id ? { message_thread_id: raffle.thread_id } : {};
+
+  if (entryCount === 0) {
+    try {
+      await bot.api.sendMessage(
+        raffle.chat_id,
+        `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. ${t(lang, "winner.no_entries")}`,
+        { parse_mode: "HTML", ...threadOpts }
+      );
+    } catch (err) {
+      console.error(`Failed to announce empty raffle ${raffle.id}:`, err);
+    }
+  } else {
+    const entries = db.getEntriesForRaffle(raffle.id);
+    const entryNames = entries.map((e) => e.user_display_name);
+    const winners = db.selectWinners(raffle.id);
+
+    // Only show countdown if raffle expired recently (within 2 minutes) and animation is enabled
+    const expiredAt = new Date(raffle.ends_at + "Z");
+    const staleness = Date.now() - expiredAt.getTime();
+    const isRecent = staleness < 2 * 60 * 1000;
+
+    if (isRecent && entryNames.length >= 1 && raffle.show_animation) {
+      await sendWheelSpin(bot.api, raffle.chat_id, raffle.thread_id);
+    }
+
+    // Announce winners with embedded "WINNERS DRAWN" banner
+    await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
+
+    // DM winners and creator in background — don't block post update
+    notifyWinnersAndCreator(bot.api, raffle, winners).catch((err) =>
+      console.error(`Failed to notify winners for raffle ${raffle.id}:`, err)
+    );
+  }
+
+  // Update the original raffle post with "closed" banner
+  if (raffle.message_id) {
+    try {
+      const updatedRaffle = db.getRaffleById(raffle.id);
+      if (updatedRaffle) {
+        let text = formatRaffleMessage(updatedRaffle, entryCount, lang);
+
+        const drawnWinners = db.getWinnersForRaffle(raffle.id);
+        if (drawnWinners.length > 0) {
+          const winnerLabel = drawnWinners.length > 1
+            ? t(lang, "winner.label_plural")
+            : t(lang, "winner.label");
+          text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
+          drawnWinners.forEach((w) => {
+            const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
+            if (w.prize) {
+              text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
+            } else {
+              text += `  • ${mention}\n`;
+            }
+          });
+        }
+
+        // Try to swap the banner to "closed"
+        const closedBannerFileId = await getBannerFileId(bot.api, raffle.chat_id, "closed");
+        if (closedBannerFileId) {
+          try {
+            await bot.api.editMessageMedia(
+              raffle.chat_id,
+              raffle.message_id,
+              {
+                type: "photo",
+                media: closedBannerFileId,
+                caption: text,
+                parse_mode: "HTML",
+              }
+            );
+          } catch (err) {
+            console.error(`Failed to swap banner to closed:`, err);
+            // Fallback to just caption update
+            await bot.api.editMessageCaption(
+              raffle.chat_id,
+              raffle.message_id,
+              { caption: text, parse_mode: "HTML" }
+            );
+          }
+        } else {
+          await bot.api.editMessageCaption(
+            raffle.chat_id,
+            raffle.message_id,
+            { caption: text, parse_mode: "HTML" }
+          );
+        }
+      }
+    } catch {
+      // Message may be too old or deleted
+    }
+  }
+}
+
 async function checkExpiredRaffles(): Promise<void> {
   try {
     const expired = db.getExpiredOpenRaffles();
-    for (const raffle of expired) {
-      console.log(`Auto-drawing expired raffle: ${raffle.id} - ${raffle.title}`);
-
-      // Mark as drawn IMMEDIATELY to prevent double-processing
-      db.markRaffleDrawn(raffle.id);
-      await revokeReferralInviteLinks(bot.api, raffle.id);
-
-      const entryCount = db.getEntryCount(raffle.id);
-      const lang = db.getChatLanguage(raffle.chat_id);
-
-      if (entryCount === 0) {
-        try {
-          await bot.api.sendMessage(
-            raffle.chat_id,
-            `🎟 <b>${escapeHtml(raffle.title)}</b>\n\n⏰ Raffle ended. ${t(lang, "winner.no_entries")}`,
-            { parse_mode: "HTML" }
-          );
-        } catch (err) {
-          console.error(`Failed to announce empty raffle ${raffle.id}:`, err);
-        }
-      } else {
-        const entries = db.getEntriesForRaffle(raffle.id);
-        const entryNames = entries.map((e) => e.user_display_name);
-        const winners = db.selectWinners(raffle.id);
-
-        // Only show countdown if raffle expired recently (within 2 minutes) and animation is enabled
-        const expiredAt = new Date(raffle.ends_at + "Z");
-        const staleness = Date.now() - expiredAt.getTime();
-        const isRecent = staleness < 2 * 60 * 1000;
-
-        if (isRecent && entryNames.length >= 1 && raffle.show_animation) {
-          await sendWheelSpin(bot.api, raffle.chat_id, raffle.thread_id);
-        }
-
-        // Announce winners with embedded "WINNERS DRAWN" banner
-        await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
-
-        // DM winners and creator
-        await notifyWinnersAndCreator(bot.api, raffle, winners);
-      }
-
-      // Update the original raffle post with "closed" banner
-      if (raffle.message_id) {
-        try {
-          const updatedRaffle = db.getRaffleById(raffle.id);
-          if (updatedRaffle) {
-            let text = formatRaffleMessage(updatedRaffle, entryCount, lang);
-
-            const drawnWinners = db.getWinnersForRaffle(raffle.id);
-            if (drawnWinners.length > 0) {
-              const winnerLabel = drawnWinners.length > 1
-                ? t(lang, "winner.label_plural")
-                : t(lang, "winner.label");
-              text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
-              drawnWinners.forEach((w) => {
-                const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
-                if (w.prize) {
-                  text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
-                } else {
-                  text += `  • ${mention}\n`;
-                }
-              });
-            }
-
-            // Try to swap the banner to "closed"
-            const closedBannerFileId = await getBannerFileId(bot.api, raffle.chat_id, "closed");
-            if (closedBannerFileId) {
-              try {
-                await bot.api.editMessageMedia(
-                  raffle.chat_id,
-                  raffle.message_id,
-                  {
-                    type: "photo",
-                    media: closedBannerFileId,
-                    caption: text,
-                    parse_mode: "HTML",
-                  }
-                );
-              } catch (err) {
-                console.error(`Failed to swap banner to closed:`, err);
-                // Fallback to just caption update
-                await bot.api.editMessageCaption(
-                  raffle.chat_id,
-                  raffle.message_id,
-                  { caption: text, parse_mode: "HTML" }
-                );
-              }
-            } else {
-              await bot.api.editMessageCaption(
-                raffle.chat_id,
-                raffle.message_id,
-                { caption: text, parse_mode: "HTML" }
-              );
-            }
-          }
-        } catch {
-          // Message may be too old or deleted
-        }
-      }
+    // Process expired raffles concurrently in batches of 3
+    const BATCH_SIZE = 3;
+    for (let i = 0; i < expired.length; i += BATCH_SIZE) {
+      await Promise.all(
+        expired.slice(i, i + BATCH_SIZE).map((raffle) =>
+          processExpiredRaffle(raffle).catch((err) =>
+            console.error(`Error processing expired raffle ${raffle.id}:`, err)
+          )
+        )
+      );
     }
   } catch (err) {
     console.error("Error checking expired raffles:", err);
@@ -407,6 +439,9 @@ const COUNTDOWN_REFRESH_INTERVAL = 60_000; // 1 minute
 const ENDING_SOON_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 const endingSoonSent = new Set<number>(); // raffle IDs that already got a reminder
 
+// Track which raffles are photo-based vs text-only to avoid wasted API calls
+const raffleIsPhoto = new Map<number, boolean>();
+
 async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   if (!raffle.message_id) return;
 
@@ -416,26 +451,27 @@ async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
   const botUsername = bot.botInfo.username;
 
   const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
+  const caption = formatRaffleMessage(raffle, count, lang);
+
+  const isPhoto = raffleIsPhoto.get(raffle.id);
+
+  if (isPhoto === false) {
+    // Known text-only — skip editMessageCaption entirely
+    try {
+      await bot.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
+    } catch { /* unchanged or deleted */ }
+    return;
+  }
 
   try {
-    // Try editMessageCaption first (for photo messages with embedded banner)
-    await bot.api.editMessageCaption(
-      raffle.chat_id,
-      raffle.message_id,
-      { caption: formatRaffleMessage(raffle, count, lang), parse_mode: "HTML", reply_markup: keyboard }
-    );
+    await bot.api.editMessageCaption(raffle.chat_id, raffle.message_id, { caption, parse_mode: "HTML", reply_markup: keyboard });
+    raffleIsPhoto.set(raffle.id, true);
   } catch {
-    // Fallback to editMessageText (for old text-only messages without banner)
+    // Might be text-only — try editMessageText
     try {
-      await bot.api.editMessageText(
-        raffle.chat_id,
-        raffle.message_id,
-        formatRaffleMessage(raffle, count, lang),
-        { parse_mode: "HTML", reply_markup: keyboard }
-      );
-    } catch {
-      // Message unchanged or deleted — ignore
-    }
+      await bot.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
+      raffleIsPhoto.set(raffle.id, false);
+    } catch { /* unchanged or deleted */ }
   }
 }
 
@@ -460,6 +496,9 @@ async function refreshCountdowns(): Promise<void> {
     const now = Date.now();
     let refreshedCount = 0;
 
+    // Collect tasks to run in parallel batches
+    const refreshTasks: Array<() => Promise<void>> = [];
+
     for (const raffle of raffles) {
       const endsAt = new Date(raffle.ends_at + "Z");
       const remaining = endsAt.getTime() - now;
@@ -473,19 +512,22 @@ async function refreshCountdowns(): Promise<void> {
         endingSoonSent.add(raffle.id);
         const entryCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : db.getEntryCount(raffle.id);
         const mins = Math.ceil(remaining / 60_000);
-        try {
-          await bot.api.sendMessage(
-            raffle.chat_id,
-            `⏰ <b>${escapeHtml(raffle.title)}</b> ends in ${mins} minute${mins > 1 ? "s" : ""}! ` +
-              `${entryCount} entr${entryCount === 1 ? "y" : "ies"} so far — Don't miss out!`,
-            {
-              parse_mode: "HTML",
-              reply_parameters: raffle.message_id ? { message_id: raffle.message_id } : undefined
-            }
-          );
-        } catch {
-          // Couldn't send reminder — not critical
-        }
+        refreshTasks.push(async () => {
+          try {
+            await bot.api.sendMessage(
+              raffle.chat_id,
+              `⏰ <b>${escapeHtml(raffle.title)}</b> ends in ${mins} minute${mins > 1 ? "s" : ""}! ` +
+                `${entryCount} entr${entryCount === 1 ? "y" : "ies"} so far — Don't miss out!`,
+              {
+                parse_mode: "HTML",
+                reply_parameters: raffle.message_id ? { message_id: raffle.message_id } : undefined,
+                ...(raffle.thread_id ? { message_thread_id: raffle.thread_id } : {}),
+              }
+            );
+          } catch {
+            // Couldn't send reminder — not critical
+          }
+        });
       }
 
       // Smart refresh: only update if enough time has passed based on remaining time
@@ -495,14 +537,21 @@ async function refreshCountdowns(): Promise<void> {
         const timeSinceLastRefresh = now - lastRefresh;
 
         if (timeSinceLastRefresh >= refreshInterval) {
-          await refreshRaffleMessage(raffle);
           lastRefreshTime.set(raffle.id, now);
           refreshedCount++;
+          refreshTasks.push(() => refreshRaffleMessage(raffle));
         }
       } else {
         // Clean up tracking for ended raffles
         lastRefreshTime.delete(raffle.id);
+        raffleIsPhoto.delete(raffle.id);
       }
+    }
+
+    // Run refresh tasks in parallel batches of 10 to avoid rate limits
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < refreshTasks.length; i += BATCH_SIZE) {
+      await Promise.all(refreshTasks.slice(i, i + BATCH_SIZE).map(fn => fn()));
     }
 
     if (refreshedCount > 0) {
@@ -814,35 +863,43 @@ bot.catch((err) => {
 });
 
 // --- Seed bot_groups on startup ---
+async function refreshGroup(
+  botId: number,
+  chatId: number,
+  title: string
+): Promise<"refreshed" | "removed"> {
+  try {
+    const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
+    const chatTitle = chat.title ? String(chat.title) : title;
+    const member = await bot.api.getChatMember(chatId, botId);
+    if (member.status === "administrator") {
+      db.upsertBotGroup(chatId, chatTitle, "administrator");
+      return "refreshed";
+    } else if (member.status === "member") {
+      db.upsertBotGroup(chatId, chatTitle, "member");
+      return "refreshed";
+    } else {
+      db.removeBotGroup(chatId);
+      return "removed";
+    }
+  } catch {
+    db.removeBotGroup(chatId);
+    return "removed";
+  }
+}
+
 async function seedBotGroups(): Promise<void> {
   const botId = bot.botInfo.id;
 
   const existing = db.getActiveBotGroups();
   if (existing.length > 0) {
-    // Already seeded — refresh titles and status
     console.log(`Refreshing ${existing.length} tracked groups...`);
-    let refreshed = 0;
-    for (const group of existing) {
-      try {
-        const chat = await bot.api.getChat(group.chat_id) as unknown as Record<string, unknown>;
-        const title = chat.title ? String(chat.title) : "";
-        await sleep(100);
-        const member = await bot.api.getChatMember(group.chat_id, botId);
-        if (member.status === "administrator") {
-          db.upsertBotGroup(group.chat_id, title, "administrator");
-          refreshed++;
-        } else if (member.status === "member") {
-          db.upsertBotGroup(group.chat_id, title, "member");
-          refreshed++;
-        } else {
-          db.removeBotGroup(group.chat_id);
-          console.log(`  Removed: ${group.title} (status: ${member.status})`);
-        }
-      } catch (err) {
-        db.removeBotGroup(group.chat_id);
-        console.log(`  Removed: ${group.title} — unreachable`);
-      }
-      await sleep(500);
+    // Process in parallel batches of 5
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < existing.length; i += BATCH_SIZE) {
+      await Promise.all(
+        existing.slice(i, i + BATCH_SIZE).map((g) => refreshGroup(botId, g.chat_id, g.title))
+      );
     }
     const after = db.getActiveBotGroups();
     console.log(`Group refresh complete: ${after.length} active groups`);
@@ -855,35 +912,14 @@ async function seedBotGroups(): Promise<void> {
 
   console.log(`Seeding bot_groups from ${chatIds.length} known groups...`);
   let added = 0;
-  let skipped = 0;
-  for (const chatId of chatIds) {
-    try {
-      const chat = await bot.api.getChat(chatId) as unknown as Record<string, unknown>;
-      const title = chat.title ? String(chat.title) : "";
-      await sleep(100);
-      const member = await bot.api.getChatMember(chatId, botId);
-      if (member.status === "administrator") {
-        db.upsertBotGroup(chatId, title, "administrator");
-        added++;
-        console.log(`  Added: ${title} (admin)`);
-      } else if (member.status === "member") {
-        db.upsertBotGroup(chatId, title, "member");
-        added++;
-        console.log(`  Added: ${title} (member)`);
-      } else {
-        skipped++;
-      }
-    } catch (err) {
-      skipped++;
-      const msg = err instanceof Error ? err.message : String(err);
-      // Only log non-obvious errors (skip "chat not found")
-      if (!msg.includes("chat not found")) {
-        console.log(`  Skip: chat ${chatId} — ${msg}`);
-      }
-    }
-    await sleep(500);
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < chatIds.length; i += BATCH_SIZE) {
+    const results = await Promise.all(
+      chatIds.slice(i, i + BATCH_SIZE).map((id) => refreshGroup(botId, id, ""))
+    );
+    added += results.filter((r) => r === "refreshed").length;
   }
-  console.log(`Seeded ${added} active groups (${skipped} skipped)`);
+  console.log(`Seeded ${added} active groups (${chatIds.length - added} skipped)`);
 }
 
 // --- Start bot ---
@@ -1001,15 +1037,28 @@ async function main(): Promise<void> {
   setInterval(checkDailyDigest, DAILY_DIGEST_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
-  await bot.start({
-    allowed_updates: [
-      "message",
-      "callback_query",
-      "inline_query",
-      "my_chat_member",
-      "chat_member",
-    ],
+
+  // Use grammY runner for concurrent update processing
+  // sequentialize middleware ensures updates for the same chat are processed in order,
+  // but different chats are handled concurrently
+  const runner = run(bot, {
+    runner: {
+      fetch: {
+        allowed_updates: [
+          "message",
+          "callback_query",
+          "inline_query",
+          "my_chat_member",
+          "chat_member",
+        ],
+      },
+    },
   });
+
+  // Graceful shutdown
+  const stopRunner = () => runner.isRunning() && runner.stop();
+  process.once("SIGINT", stopRunner);
+  process.once("SIGTERM", stopRunner);
 }
 
 main().catch((err) => {

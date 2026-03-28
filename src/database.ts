@@ -120,8 +120,10 @@ export function initDatabase(dbPath: string): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
+    CREATE INDEX IF NOT EXISTS idx_raffles_status_ends ON raffles(status, ends_at);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_user_id ON raffle_entries(user_id);
+    CREATE INDEX IF NOT EXISTS idx_raffle_winners_raffle_id ON raffle_winners(raffle_id);
     CREATE INDEX IF NOT EXISTS idx_templates_chat_id ON raffle_templates(chat_id);
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);

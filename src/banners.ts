@@ -157,6 +157,21 @@ export async function getBannerSource(
 const MAX_CAPTION_LENGTH = 1024;
 
 /**
+ * Detect Telegram errors that indicate the target forum topic is closed.
+ * When this happens, we should retry posting to the chat's General topic
+ * (i.e. without message_thread_id) so winners still get announced publicly.
+ */
+function isTopicClosedError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { error_code?: number; description?: string };
+  return (
+    e.error_code === 400 &&
+    typeof e.description === "string" &&
+    e.description.includes("TOPIC_CLOSED")
+  );
+}
+
+/**
  * Send a complete raffle post with the banner embedded as the photo.
  * Custom image (if any) is sent FIRST (above the raffle).
  * If caption exceeds 1024 chars, falls back to sending banner + separate text message.
@@ -313,6 +328,11 @@ export async function sendWheelSpin(
       // Delete failed (permissions) — leave it, not critical
     }
   } catch (err) {
+    if (isTopicClosedError(err) && threadId) {
+      // Topic was closed before draw — skip countdown silently;
+      // sendWinnerPost will fall back to the General topic.
+      return;
+    }
     console.error(`Failed to send countdown to chat ${chatId}:`, err);
     // Non-fatal — the draw proceeds without the animation
   }
@@ -343,7 +363,9 @@ export async function sendWinnerPost(
   threadId?: number | null
 ): Promise<void> {
   const MAX_CAPTION_LENGTH = 1024;
-  const threadOpts = threadId ? { message_thread_id: threadId } : {};
+  let activeThreadId: number | null | undefined = threadId;
+  const threadOpts = () =>
+    activeThreadId ? { message_thread_id: activeThreadId } : {};
 
   // Get or upload the "drawn" banner
   let fileId = getCachedBannerFileId("drawn");
@@ -352,7 +374,7 @@ export async function sendWinnerPost(
     // Upload to get file_id
     const filePath = getAssetPath(BANNER_FILES["drawn"]);
     try {
-      const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts);
+      const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts());
       if (msg.photo && msg.photo.length > 0) {
         fileId = msg.photo[msg.photo.length - 1].file_id;
         setCachedBannerFileId("drawn", fileId);
@@ -362,7 +384,29 @@ export async function sendWinnerPost(
         } catch {}
       }
     } catch (err) {
-      console.error("Failed to upload drawn banner:", err);
+      if (isTopicClosedError(err) && activeThreadId) {
+        // Forum topic was closed — fall back to General by clearing threadId
+        // for all subsequent attempts in this winner post.
+        console.warn(
+          `Topic ${activeThreadId} closed in chat ${chatId}; posting winners to General.`
+        );
+        activeThreadId = null;
+        // Retry banner upload to General
+        try {
+          const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts());
+          if (msg.photo && msg.photo.length > 0) {
+            fileId = msg.photo[msg.photo.length - 1].file_id;
+            setCachedBannerFileId("drawn", fileId);
+            try {
+              await api.deleteMessage(chatId, msg.message_id);
+            } catch {}
+          }
+        } catch (retryErr) {
+          console.error("Failed to upload drawn banner (General fallback):", retryErr);
+        }
+      } else {
+        console.error("Failed to upload drawn banner:", err);
+      }
     }
   }
 
@@ -372,18 +416,51 @@ export async function sendWinnerPost(
       await api.sendPhoto(chatId, fileId, {
         caption: winnerText,
         parse_mode: "HTML",
-        ...threadOpts,
+        ...threadOpts(),
       });
       return;
     } catch (err) {
-      console.error("Failed to send winner post with banner:", err);
+      if (isTopicClosedError(err) && activeThreadId) {
+        console.warn(
+          `Topic ${activeThreadId} closed in chat ${chatId}; posting winners to General.`
+        );
+        activeThreadId = null;
+        try {
+          await api.sendPhoto(chatId, fileId, {
+            caption: winnerText,
+            parse_mode: "HTML",
+            ...threadOpts(),
+          });
+          return;
+        } catch (retryErr) {
+          console.error("Failed to send winner post with banner (General fallback):", retryErr);
+        }
+      } else {
+        console.error("Failed to send winner post with banner:", err);
+      }
     }
   }
 
   // Fallback: just send text
   try {
-    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML", ...threadOpts });
+    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML", ...threadOpts() });
   } catch (err) {
-    console.error("Failed to send winner text:", err);
+    if (isTopicClosedError(err) && activeThreadId) {
+      console.warn(
+        `Topic ${activeThreadId} closed in chat ${chatId}; posting winner text to General.`
+      );
+      activeThreadId = null;
+      try {
+        await api.sendMessage(chatId, winnerText, {
+          parse_mode: "HTML",
+          ...threadOpts(),
+        });
+        return;
+      } catch (retryErr) {
+        console.error("Failed to send winner text (General fallback):", retryErr);
+      }
+    } else {
+      console.error("Failed to send winner text:", err);
+    }
   }
 }

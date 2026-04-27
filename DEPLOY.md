@@ -3,7 +3,7 @@
 ## Architecture
 
 - **Local machine**: macOS — source code, git repo, editing
-- **Remote server**: `root@100.85.220.125` (Unraid) — Docker builds and runs
+- **Remote server**: `unraid-cf` (Unraid) — Docker builds and runs
 - **No Docker locally** — all builds happen on the remote server via SSH
 
 ## Git Branches
@@ -44,27 +44,27 @@ cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && npx tsc --noEmit
 
 ### 2. Copy changed files to dev server
 ```bash
-cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && scp src/*.ts root@100.85.220.125:/mnt/user/appdata/raffle-bot-dev/src/
+cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && scp src/*.ts unraid-cf:/mnt/user/appdata/raffle-bot-dev/src/
 ```
 
 If `package.json` or `package-lock.json` changed:
 ```bash
-scp package.json package-lock.json root@100.85.220.125:/mnt/user/appdata/raffle-bot-dev/
+scp package.json package-lock.json unraid-cf:/mnt/user/appdata/raffle-bot-dev/
 ```
 
 If assets changed:
 ```bash
-scp -r assets/ root@100.85.220.125:/mnt/user/appdata/raffle-bot-dev/
+scp -r assets/ unraid-cf:/mnt/user/appdata/raffle-bot-dev/
 ```
 
 ### 3. Build and restart dev container
 ```bash
-ssh root@100.85.220.125 "cd /mnt/user/appdata/raffle-bot-dev && docker build -t raffle-bot-dev . && docker stop raffle-bot-dev && docker rm raffle-bot-dev && docker run -d --name raffle-bot-dev --restart unless-stopped --env-file .env -v /mnt/user/appdata/raffle-bot-dev/data:/data raffle-bot-dev"
+ssh unraid-cf "cd /mnt/user/appdata/raffle-bot-dev && docker build -t raffle-bot-dev . && docker stop raffle-bot-dev && docker rm raffle-bot-dev && docker run -d --name raffle-bot-dev --restart unless-stopped --env-file .env -v /mnt/user/appdata/raffle-bot-dev/data:/data raffle-bot-dev"
 ```
 
 ### 4. Verify
 ```bash
-ssh root@100.85.220.125 "docker logs raffle-bot-dev --tail 5"
+ssh unraid-cf "docker logs raffle-bot-dev --tail 5"
 ```
 
 ## Deploy to Production (Stable)
@@ -76,32 +76,32 @@ cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && git checkout stable
 
 ### 2. Copy changed files to production server
 ```bash
-cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && scp src/*.ts root@100.85.220.125:/mnt/user/appdata/raffle-bot/src/
+cd /Users/dprobinson/Desktop/Projects/telegram-raffle-app && scp src/*.ts unraid-cf:/mnt/user/appdata/raffle-bot/src/
 ```
 
 If `package.json` or `package-lock.json` changed:
 ```bash
-scp package.json package-lock.json root@100.85.220.125:/mnt/user/appdata/raffle-bot/
+scp package.json package-lock.json unraid-cf:/mnt/user/appdata/raffle-bot/
 ```
 
 If assets changed:
 ```bash
-scp -r assets/ root@100.85.220.125:/mnt/user/appdata/raffle-bot/
+scp -r assets/ unraid-cf:/mnt/user/appdata/raffle-bot/
 ```
 
 ### 3. Build and restart production container
 ```bash
-ssh root@100.85.220.125 "cd /mnt/user/appdata/raffle-bot && docker build -t raffle-bot:stable . && docker stop raffle-bot && docker rm raffle-bot && docker run -d --name raffle-bot --restart unless-stopped --env-file .env -v /mnt/user/appdata/raffle-bot/data:/data raffle-bot:stable"
+ssh unraid-cf "cd /mnt/user/appdata/raffle-bot && docker build -t raffle-bot:stable . && docker stop raffle-bot && docker rm raffle-bot && docker run -d --name raffle-bot --restart unless-stopped --env-file .env -v /mnt/user/appdata/raffle-bot/data:/data raffle-bot:stable"
 ```
 
 ### 4. Verify
 ```bash
-ssh root@100.85.220.125 "docker logs raffle-bot --tail 5"
+ssh unraid-cf "docker logs raffle-bot --tail 5"
 ```
 
 ## Quick Status Check
 ```bash
-ssh root@100.85.220.125 "docker ps --filter name=raffle -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
+ssh unraid-cf "docker ps --filter name=raffle -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
 ```
 
 ## Rollback Production

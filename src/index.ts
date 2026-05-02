@@ -785,6 +785,55 @@ bot.on("chat_member", async (ctx) => {
   }
 });
 
+// --- Owner notification when the bot is added to a group ---
+async function notifyOwnerOfNewGroup(opts: {
+  chatId: number;
+  chatTitle: string;
+  botStatus: "member" | "administrator";
+  addedBy: { id: number; first_name?: string; last_name?: string; username?: string };
+}): Promise<void> {
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0) return;
+
+  const { chatId, chatTitle, botStatus, addedBy } = opts;
+
+  // Determine first-time vs re-add by looking at raffle history for this chat.
+  // bot_groups rows are deleted on kick, so it can't tell us "have we ever seen this chat".
+  const { totalRaffles } = db.getGroupStats(chatId);
+  const isReturning = totalRaffles > 0;
+
+  const totalActiveGroups = db.getActiveBotGroups().length;
+
+  const adderName = [addedBy.first_name, addedBy.last_name]
+    .filter(Boolean)
+    .join(" ") || "Unknown";
+  const adderHandle = addedBy.username ? ` (@${escapeHtml(addedBy.username)})` : "";
+  const statusIcon = botStatus === "administrator" ? "🛡 admin" : "👤 member";
+  const headerIcon = isReturning ? "🔄" : "🆕";
+  const headerLabel = isReturning ? "Bot re-added to group" : "Bot added to new group";
+
+  const msg =
+    `${headerIcon} <b>${headerLabel}</b>\n\n` +
+    `<b>Group:</b> ${escapeHtml(chatTitle || "(no title)")}\n` +
+    `<b>Chat ID:</b> <code>${chatId}</code>\n` +
+    `<b>Bot status:</b> ${statusIcon}\n` +
+    `<b>Added by:</b> ${escapeHtml(adderName)}${adderHandle}\n` +
+    `<b>User ID:</b> <code>${addedBy.id}</code>\n` +
+    (isReturning
+      ? `<b>History:</b> ${totalRaffles} prior raffle${totalRaffles !== 1 ? "s" : ""} in this chat\n`
+      : "") +
+    `\n<i>Now tracking ${totalActiveGroups} active group${totalActiveGroups !== 1 ? "s" : ""}.</i>`;
+
+  try {
+    await bot.api.sendMessage(ownerId, msg, { parse_mode: "HTML" });
+    console.log(
+      `Owner notified of ${isReturning ? "re-add" : "new group"}: "${chatTitle}" (${chatId})`
+    );
+  } catch (err) {
+    console.error(`Failed to DM owner about new group ${chatId}:`, err);
+  }
+}
+
 // --- Welcome DM when bot is added to a new group ---
 bot.on("my_chat_member", async (ctx) => {
   const update = ctx.myChatMember;
@@ -817,6 +866,17 @@ bot.on("my_chat_member", async (ctx) => {
 
   console.log(
     `Bot added to group "${chatTitle}" (${chatId}) by user ${addedBy.id} (${addedBy.first_name})`
+  );
+
+  // DM the bot owner so they hear about every group join in real time.
+  // Best-effort — failure here must not block the welcome DM below.
+  notifyOwnerOfNewGroup({
+    chatId,
+    chatTitle,
+    botStatus: newStatus,
+    addedBy,
+  }).catch((err) =>
+    console.error(`Failed to notify owner of new group ${chatId}:`, err)
   );
 
   // Build the welcome / feature overview message

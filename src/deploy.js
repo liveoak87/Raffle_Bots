@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { REST, Routes } = require('discord.js');
-const { raffleCommand, pickCommand } = require('./commands');
+const { randomizerCommand, pickCommand, helpCommand } = require('./commands');
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
 
@@ -9,7 +9,7 @@ const rest = new REST().setToken(process.env.DISCORD_TOKEN);
     console.log('Registering slash commands...');
     await rest.put(
       Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: [raffleCommand.toJSON(), pickCommand.toJSON()] }
+      { body: [randomizerCommand.toJSON(), pickCommand.toJSON(), helpCommand.toJSON()] }
     );
     console.log('Commands registered successfully.');
   } catch (error) {

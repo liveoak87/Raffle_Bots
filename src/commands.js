@@ -1,40 +1,41 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder } = require('discord.js');
 
-const raffleCommand = new SlashCommandBuilder()
-  .setName('raffle')
-  .setDescription('Manage raffles')
+const randomizerCommand = new SlashCommandBuilder()
+  .setName('randomizer')
+  .setDescription('Manage number board randomizers')
   .addSubcommand(sub =>
     sub.setName('create')
-      .setDescription('Create a new raffle board')
-      .addStringOption(opt =>
-        opt.setName('prize')
-          .setDescription('Prize description')
-          .setRequired(true))
-      .addIntegerOption(opt =>
-        opt.setName('slots')
-          .setDescription('Number of slots on the board (2-25)')
-          .setRequired(true)
-          .setMinValue(2)
-          .setMaxValue(25))
-      .addStringOption(opt =>
-        opt.setName('price')
-          .setDescription('Price per line (e.g. "$12")')
-          .setRequired(false))
-  )
+      .setDescription('Create a new randomizer board (opens setup wizard)'))
   .addSubcommand(sub =>
     sub.setName('draw')
-      .setDescription('Randomly draw a winning number'))
+      .setDescription('Draw a random winner from the active board'))
   .addSubcommand(sub =>
     sub.setName('cancel')
-      .setDescription('Cancel the active raffle'))
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+      .setDescription('Cancel the active randomizer'))
+  .addSubcommand(sub =>
+    sub.setName('settings')
+      .setDescription('View current randomizer settings'))
+  .addSubcommand(sub =>
+    sub.setName('mark-donated')
+      .setDescription('Mark numbers as donated')
+      .addStringOption(opt =>
+        opt.setName('numbers')
+          .setDescription('Number(s) to mark donated — e.g. "5" or "3,7,12"')
+          .setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('status')
+      .setDescription('View all servers and active raffles (owner only)'));
 
 const pickCommand = new SlashCommandBuilder()
   .setName('pick')
-  .setDescription('Pick number(s) on the active raffle')
+  .setDescription('Pick number(s) on the active board')
   .addStringOption(opt =>
     opt.setName('numbers')
       .setDescription('Number(s) to pick — e.g. "5" or "3,7,12"')
       .setRequired(true));
 
-module.exports = { raffleCommand, pickCommand };
+const helpCommand = new SlashCommandBuilder()
+  .setName('help')
+  .setDescription('Learn how to use Ultimate Randomizer');
+
+module.exports = { randomizerCommand, pickCommand, helpCommand };

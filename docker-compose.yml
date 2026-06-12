@@ -1,0 +1,11 @@
+services:
+  ultimate-randomizer:
+    build: .
+    container_name: ultimate-randomizer
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "3100:3000"

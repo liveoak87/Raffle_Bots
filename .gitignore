@@ -6,4 +6,5 @@ node_modules/
 *.db.gz
 backups/
 .alert_webhook
+.alert_telegram
 .DS_Store

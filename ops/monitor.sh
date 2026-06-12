@@ -9,26 +9,38 @@ set -uo pipefail
 BASE="/mnt/user/appdata/ultimate-randomizer"
 CONTAINER="ultimate-randomizer"
 LOG="$BASE/monitor.log"
-WEBHOOK_FILE="$BASE/.alert_webhook"   # optional: first line = Discord webhook URL
+WEBHOOK_FILE="$BASE/.alert_webhook"     # optional: line 1 = Discord webhook URL
+TELEGRAM_FILE="$BASE/.alert_telegram"   # optional: line 1 = bot token, line 2 = chat id
 HOSTPORT=3100
 ALERT_STAMP="/tmp/ur-last-alert"
-ALERT_COOLDOWN=1800                   # max one webhook alert per 30 min (logs are always written)
+ALERT_COOLDOWN=1800                     # max one outbound alert per 30 min (logs are always written)
 
 ts() { date '+%F %T'; }
 
+# Alerts are sent by THIS script (the host monitor), not the bot — so they still
+# fire when the bot itself is down. Sends to Discord and/or Telegram, whichever
+# is configured. (If the whole host/its internet is down, use an external
+# dead-man's-switch heartbeat instead — see ops/README.md.)
 send_alert() {
   local msg="$1"
   echo "$(ts) ALERT: $msg" >> "$LOG"
-  [ -f "$WEBHOOK_FILE" ] || return 0
-  # de-dupe webhook spam
+  # de-dupe outbound notifications (the log line above is always written)
   if [ -f "$ALERT_STAMP" ] && [ $(( $(date +%s) - $(stat -c %Y "$ALERT_STAMP" 2>/dev/null || echo 0) )) -lt "$ALERT_COOLDOWN" ]; then
     return 0
   fi
-  local url; url=$(head -n1 "$WEBHOOK_FILE")
-  [ -n "$url" ] || return 0
-  curl -s -m 10 -H 'Content-Type: application/json' -X POST \
-    -d "{\"content\":\"🚨 **Ultimate Randomizer** ($(hostname)): $msg\"}" "$url" >/dev/null 2>&1 || true
-  touch "$ALERT_STAMP"
+  local sent=0 text="🚨 Ultimate Randomizer ($(hostname)): $msg"
+  if [ -f "$WEBHOOK_FILE" ]; then
+    local url; url=$(head -n1 "$WEBHOOK_FILE")
+    [ -n "$url" ] && curl -s -m 10 -H 'Content-Type: application/json' -X POST \
+      -d "{\"content\":\"$text\"}" "$url" >/dev/null 2>&1 && sent=1
+  fi
+  if [ -f "$TELEGRAM_FILE" ]; then
+    local tok cid; tok=$(sed -n 1p "$TELEGRAM_FILE"); cid=$(sed -n 2p "$TELEGRAM_FILE")
+    [ -n "$tok" ] && [ -n "$cid" ] && curl -s -m 10 \
+      -d "chat_id=$cid" --data-urlencode "text=$text" \
+      "https://api.telegram.org/bot$tok/sendMessage" >/dev/null 2>&1 && sent=1
+  fi
+  [ "$sent" = 1 ] && touch "$ALERT_STAMP"
 }
 
 STATUS=$(docker inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null || echo missing)

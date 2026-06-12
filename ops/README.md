@@ -13,15 +13,31 @@ persistent cron (`/boot/config/plugins/dynamix/*.cron`, reloaded with `update_cr
 - `ultimate-randomizer.cron` — the schedule installed into dynamix cron.
 
 ## Alerting
-`monitor.sh` reads the Discord webhook URL from
-`/mnt/user/appdata/ultimate-randomizer/.alert_webhook` (first line). Create the
-webhook in Discord (Server Settings → Integrations → Webhooks), then:
+Alerts are sent by `monitor.sh` (the HOST watchdog), not by the bot — so they
+still fire when the bot is down. Configure Discord and/or Telegram (either, or
+both). Without either, the monitor still auto-restarts and logs to `monitor.log`.
+
+**Discord** — create a webhook (Server Settings → Integrations → Webhooks):
 
     echo 'https://discord.com/api/webhooks/XXX/YYY' > /mnt/user/appdata/ultimate-randomizer/.alert_webhook
     chmod 600 /mnt/user/appdata/ultimate-randomizer/.alert_webhook
 
-Without it, the monitor still auto-restarts and logs to `monitor.log`; it just
-won't push a notification.
+**Telegram** — message @BotFather to make a bot (get its token), then message your
+bot once and find your chat id (e.g. via @userinfobot). Line 1 = token, line 2 = chat id:
+
+    printf '%s\n%s\n' '123456:ABC-bot-token' '987654321' > /mnt/user/appdata/ultimate-randomizer/.alert_telegram
+    chmod 600 /mnt/user/appdata/ultimate-randomizer/.alert_telegram
+
+### What alerting CAN'T catch on its own
+The host monitor can't notify you if the **whole Unraid box (or its internet) is
+down** — it'd be dead too. For that, add an external dead-man's-switch: a free
+service (healthchecks.io, Better Stack, UptimeRobot) gives you a ping URL; the box
+curls it every few minutes, and the service alerts YOU (email/SMS/Discord/Telegram)
+if the pings stop. Example cron line once you have a ping URL:
+
+    */5 * * * * curl -fsS -m 10 https://hc-ping.com/your-uuid > /dev/null 2>&1
+
+That covers "everything is down"; the in-host monitor covers "the bot is down."
 
 ## Install / refresh
     scp ops/backup-db.sh ops/monitor.sh unraid-cf:/mnt/user/appdata/ultimate-randomizer/

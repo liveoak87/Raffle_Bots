@@ -5,5 +5,11 @@
 # Hourly WAL-safe DB backup (integrity-checked, 7-day retention)
 0 * * * * /mnt/user/appdata/ultimate-randomizer/backup-db.sh >> /mnt/user/appdata/ultimate-randomizer/backup.log 2>&1
 
+# Ship backups off-site to R2 + Linode at :30 (after the :00 local backup)
+30 * * * * /mnt/user/appdata/ultimate-randomizer/ship-backups.sh > /dev/null 2>&1
+
 # Health monitor + auto-heal, every 5 minutes
 */5 * * * * /mnt/user/appdata/ultimate-randomizer/monitor.sh >/dev/null 2>&1
+
+# Weekly restore drill — verify off-site backups are actually restorable. Sunday 5:30 AM.
+30 5 * * 0 /mnt/user/appdata/ultimate-randomizer/restore-drill.sh > /dev/null 2>&1

@@ -28,6 +28,33 @@ won't push a notification.
     scp ops/ultimate-randomizer.cron unraid-cf:/boot/config/plugins/dynamix/
     ssh unraid-cf 'chmod +x /mnt/user/appdata/ultimate-randomizer/{backup-db,monitor}.sh && update_cron'
 
+## Off-site shipping (3-2-1) — OPERATOR-ACTIVATED
+
+`ship-backups.sh` (hourly) and `restore-drill.sh` (weekly) push the local backups
+to Cloudflare R2 + a Linode VPS, mirroring the raffle-bot pipeline. These egress
+user data off the host, so they must be activated by the operator (run by hand),
+not by an automated assistant. To activate:
+
+    # 1. install scripts
+    scp ops/ship-backups.sh ops/restore-drill.sh unraid-cf:/mnt/user/appdata/ultimate-randomizer/
+    ssh unraid-cf 'chmod +x /mnt/user/appdata/ultimate-randomizer/{ship-backups,restore-drill}.sh'
+
+    # 2. create off-site targets
+    ssh unraid-cf 'rclone mkdir r2:ultimate-randomizer-backups'
+    ssh unraid-cf 'ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@45.79.198.189 "mkdir -p /var/backups/ultimate-randomizer"'
+
+    # 3. first ship + verify
+    ssh unraid-cf '/mnt/user/appdata/ultimate-randomizer/ship-backups.sh'
+    ssh unraid-cf '/mnt/user/appdata/ultimate-randomizer/restore-drill.sh'
+
+    # 4. load the full cron (adds the :30 ship + weekly drill)
+    scp ops/ultimate-randomizer.cron unraid-cf:/boot/config/plugins/dynamix/
+    ssh unraid-cf 'update_cron'
+
+Until activated, backups are local-only (Unraid array, parity-protected). The
+`ultimate-randomizer.cron` here already lists the ship/drill jobs, but they no-op
+until the scripts and targets above exist.
+
 ## Restore from a backup
     gunzip -c backups/raffle-YYYYMMDD-HHMMSS.db.gz > /tmp/restore.db
     # stop the bot, replace data/raffle.db with /tmp/restore.db, remove stale -wal/-shm, start

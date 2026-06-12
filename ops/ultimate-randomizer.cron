@@ -1,0 +1,9 @@
+# Ultimate Randomizer — persistent schedule.
+# Installed at: /boot/config/plugins/dynamix/ultimate-randomizer.cron
+# Apply with: update_cron   (Unraid concatenates *.cron here into root's crontab; survives reboots)
+
+# Hourly WAL-safe DB backup (integrity-checked, 7-day retention)
+0 * * * * /mnt/user/appdata/ultimate-randomizer/backup-db.sh >> /mnt/user/appdata/ultimate-randomizer/backup.log 2>&1
+
+# Health monitor + auto-heal, every 5 minutes
+*/5 * * * * /mnt/user/appdata/ultimate-randomizer/monitor.sh >/dev/null 2>&1

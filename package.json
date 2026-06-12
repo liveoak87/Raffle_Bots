@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "deploy": "node src/deploy.js"
+    "deploy": "node src/deploy.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.90",

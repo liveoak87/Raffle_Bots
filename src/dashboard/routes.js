@@ -60,6 +60,21 @@ function setupRoutes(app, db, resolver) {
     res.redirect('/login');
   });
 
+  // Liveness/readiness probe (public, no auth). Returns 200 only when the
+  // Discord gateway is actually connected — so a "zombie" (Node up but gateway
+  // dead) reports unhealthy and the Docker HEALTHCHECK / monitor can restart it.
+  app.get('/health', (req, res) => {
+    const client = resolver.client;
+    const ready = !!(client && client.isReady());
+    const ping = client && client.ws ? Math.round(client.ws.ping) : -1;
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ok' : 'unhealthy',
+      gateway: ready ? 'connected' : 'disconnected',
+      ping_ms: ping,
+      uptime_s: Math.round(process.uptime())
+    });
+  });
+
   // Public legal pages for Discord application verification
   app.get('/terms', (req, res) => {
     res.send(views.termsPage());

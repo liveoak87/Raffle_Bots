@@ -5,26 +5,9 @@ const { buildBoardEmbed, buildComponents, buildExtensionComponents, buildWinnerE
 const { buildCreateModal, buildRulesModal, parseModalValues } = require('./wizard');
 const { generateBanner, clearBannerCache } = require('./banner');
 const dashboard = require('./dashboard/server');
-const { randomInt } = require('crypto');
+const { cryptoShuffle, cryptoRandomIndex } = require('./random');
 
 const OWNER_ID = process.env.OWNER_ID;
-
-// ── Fair, cryptographically-seeded randomness for draws ──────────────────────
-// Math.random() is biased (and predictable); a `sort(() => Math.random() - 0.5)`
-// shuffle is non-uniform. Use crypto.randomInt + Fisher–Yates so every entrant
-// has an equal, unpredictable chance of winning.
-function cryptoShuffle(array) {
-  const a = [...array];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = randomInt(i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-function cryptoRandomIndex(length) {
-  return randomInt(length);
-}
 
 // Temporary storage for raffle data between wizard pages
 const pendingRaffles = new Map();

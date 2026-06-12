@@ -65,6 +65,20 @@ function start(client, db) {
   const app = express();
   const port = parseInt(process.env.DASHBOARD_PORT, 10) || 3000;
 
+  // Behind the Cloudflare tunnel / reverse proxy: trust one proxy hop so req.ip
+  // reflects the real client (needed for the login rate limiter to work per-IP).
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  // Baseline security headers (no extra dependency).
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:");
+    next();
+  });
+
   app.use(express.urlencoded({ extended: false }));
   app.use(session({
     secret: resolveSessionSecret(),

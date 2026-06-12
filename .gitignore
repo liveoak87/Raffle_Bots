@@ -3,4 +3,7 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
+*.db.gz
+backups/
+.alert_webhook
 .DS_Store

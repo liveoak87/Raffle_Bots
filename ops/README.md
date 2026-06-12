@@ -40,7 +40,11 @@ not by an automated assistant. To activate:
     ssh unraid-cf 'chmod +x /mnt/user/appdata/ultimate-randomizer/{ship-backups,restore-drill}.sh'
 
     # 2. create off-site targets
-    ssh unraid-cf 'rclone mkdir r2:ultimate-randomizer-backups'
+    # R2: backups go to a prefix inside the EXISTING raffle-bot-backups bucket
+    #     (the rclone token can't create new buckets — 403 AccessDenied — and
+    #     rclone creates the prefix implicitly on first copy, so no mkdir needed).
+    #     To use a dedicated bucket instead, create it in the Cloudflare dashboard
+    #     and set R2_REMOTE back to r2:ultimate-randomizer-backups in both scripts.
     ssh unraid-cf 'ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@45.79.198.189 "mkdir -p /var/backups/ultimate-randomizer"'
 
     # 3. first ship + verify

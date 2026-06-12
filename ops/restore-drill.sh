@@ -8,7 +8,7 @@ set -uo pipefail
 TARGETS="${1:-all}"
 DRILL_DIR="/tmp/ur-restore-drill"
 LIVE_DB="/mnt/user/appdata/ultimate-randomizer/data/raffle.db"
-R2_REMOTE="r2:ultimate-randomizer-backups"
+R2_REMOTE="r2:raffle-bot-backups/ultimate-randomizer"   # prefix inside the existing bucket
 LINODE_HOST="root@45.79.198.189"
 LINODE_DIR="/var/backups/ultimate-randomizer"
 SSH_KEY="/root/.ssh/id_ed25519"

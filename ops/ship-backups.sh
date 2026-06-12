@@ -6,7 +6,7 @@ set -uo pipefail
 
 LOCAL_BACKUP_DIR="/mnt/user/appdata/ultimate-randomizer/backups"
 GLOB='raffle-*.db.gz'
-R2_REMOTE="r2:ultimate-randomizer-backups"
+R2_REMOTE="r2:raffle-bot-backups/ultimate-randomizer"   # prefix inside the existing bucket (token can't create new buckets)
 LINODE_HOST="root@45.79.198.189"
 LINODE_DIR="/var/backups/ultimate-randomizer"
 SSH_KEY="/root/.ssh/id_ed25519"

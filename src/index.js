@@ -4,7 +4,6 @@ const db = require('./database');
 const { buildBoardEmbed, buildComponents, buildExtensionComponents, buildWinnerEmbed, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
 const { buildCreateModal, buildRulesModal, parseModalValues } = require('./wizard');
 const { generateBanner, clearBannerCache } = require('./banner');
-// playDrawAnimation from animation.js is no longer used — all draws go through playDrawAnimationInChannel
 const dashboard = require('./dashboard/server');
 const { randomInt } = require('crypto');
 
@@ -177,11 +176,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (id.startsWith('assign_slot_')) {
         await handleAssignSlotSelect(interaction);
       }
-    }
-
-    // Select menu picks (slots 26-50)
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('select_pick_')) {
-      await handleSelectPick(interaction);
     }
 
     // Select menu remove picks
@@ -452,8 +446,9 @@ async function handleMarkPaid(interaction) {
     r.updated ? `#${r.slot} \u2014 \u2705 marked donated` : `#${r.slot} \u2014 not found or unclaimed`
   ).join('\n');
 
-  await updateBoardMessageFull(raffle);
+  // Acknowledge first (3s deadline), then update the board.
   await interaction.reply({ content: summary, ephemeral: true });
+  await updateBoardMessageFull(raffle);
 }
 
 // ── /pick command ────────────────────────────────────────────────────────────
@@ -510,8 +505,10 @@ async function handlePick(interaction) {
     }
   }
 
-  await updateBoardMessageFull(raffle);
+  // Acknowledge the interaction first (3s deadline), then do the slower board
+  // edit. Editing before replying risked a 10062 "Unknown interaction" under load.
   await interaction.reply({ content: results.join('\n'), ephemeral: true });
+  await updateBoardMessageFull(raffle);
 }
 
 // ── Button click handler ─────────────────────────────────────────────────────
@@ -600,45 +597,6 @@ async function handleButtonPick(interaction) {
     // Debounced: update extensions (coalesces rapid picks)
     debouncedExtensionUpdate(raffle);
   }
-}
-
-// ── Select menu handler ──────────────────────────────────────────────────────
-
-async function handleSelectPick(interaction) {
-  const slotNumber = parseInt(interaction.values[0], 10);
-
-  const raffle = db.getActiveRaffle(interaction.channelId);
-  if (!raffle) {
-    return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
-  }
-
-  // Block picks when board is locked (admin assign only)
-  if (raffle.assign_only && !isCreator(raffle, interaction.user.id)) {
-    return interaction.reply({ content: '\uD83D\uDD12 This board is locked. Only the admin can assign spots.', ephemeral: true });
-  }
-
-  const username = interaction.member?.displayName || interaction.user.username;
-  const result = db.pickSlotWithLimit(raffle.id, slotNumber, interaction.user.id, username, raffle.max_picks_per_user);
-
-  if (result.error === 'limit_reached') {
-    return interaction.reply({
-      content: `You've reached the maximum of ${raffle.max_picks_per_user} picks.`,
-      ephemeral: true
-    });
-  }
-
-  if (result.error === 'taken') {
-    return interaction.reply({
-      content: `Spot #${slotNumber} was just claimed by someone else.`,
-      ephemeral: true
-    });
-  }
-
-  // Update the board embed + components in place (banner already attached, no need to re-send)
-  const picks = db.getPicks(raffle.id);
-  const embed = buildBoardEmbed(raffle, picks);
-  const components = buildComponents(raffle, picks);
-  await interaction.update({ embeds: [embed], components });
 }
 
 // ── Modal submit handler ─────────────────────────────────────────────────────

@@ -1,7 +1,11 @@
+import * as fs from "fs";
+import * as path from "path";
 import { InlineKeyboard, InputFile } from "grammy";
 import type { Context } from "grammy";
 import * as db from "./database";
 import { parsePrizes } from "./types";
+import { metrics, computeLatencyStats } from "./metrics";
+import { getJobStats } from "./jobs";
 import {
   escapeHtml,
   getUserDisplayName,
@@ -17,6 +21,62 @@ import {
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+
+// --- Smart debounced post updates ---
+// Pattern: first entry refreshes the message immediately (so users see their
+// click registered), but subsequent entries within DEBOUNCE_MS are batched
+// into a single edit. After the window closes, the next entry starts a
+// fresh "immediate" cycle.
+//
+// This gives both perceived snappiness (instant feedback) AND protection
+// from API rate limits during entry bursts.
+const DEBOUNCE_MS = 2_500;
+interface PendingUpdate {
+  timer: ReturnType<typeof setTimeout>;
+  ctx: Context;
+  lastEditAt: number;
+}
+const pendingPostUpdates = new Map<number, PendingUpdate>();
+
+function debouncedUpdateRafflePost(ctx: Context, raffleId: number): void {
+  const now = Date.now();
+  const existing = pendingPostUpdates.get(raffleId);
+
+  // First entry in a fresh window — edit immediately
+  if (!existing || now - existing.lastEditAt > DEBOUNCE_MS) {
+    if (existing) clearTimeout(existing.timer);
+    pendingPostUpdates.set(raffleId, {
+      timer: setTimeout(() => {}, 0), // placeholder, replaced below
+      ctx,
+      lastEditAt: now,
+    });
+    updateRafflePost(ctx, raffleId).catch((err) =>
+      console.error("Failed to update raffle post:", err)
+    );
+    // Schedule a "trailing edge" refresh in case more entries arrive during the window
+    const trailingTimer = setTimeout(() => {
+      const e = pendingPostUpdates.get(raffleId);
+      if (e) {
+        pendingPostUpdates.delete(raffleId);
+        updateRafflePost(ctx, raffleId).catch((err) =>
+          console.error("Failed to update raffle post (trailing):", err)
+        );
+      }
+    }, DEBOUNCE_MS);
+    pendingPostUpdates.get(raffleId)!.timer = trailingTimer;
+    return;
+  }
+
+  // Subsequent entry within the debounce window — refresh the trailing timer
+  clearTimeout(existing.timer);
+  existing.ctx = ctx;
+  existing.timer = setTimeout(() => {
+    pendingPostUpdates.delete(raffleId);
+    updateRafflePost(ctx, raffleId).catch((err) =>
+      console.error("Failed to update raffle post (trailing):", err)
+    );
+  }, DEBOUNCE_MS);
+}
 
 /**
  * Estimate a Telegram account's age in days based on user ID ranges.
@@ -262,6 +322,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     max_winners: maxWinners,
     ends_at: endsAt,
     starts_at: null,
+    display_timezone: db.getChatTimezone(ctx.chat.id),
     required_chat_id: null,
     required_chat_title: null,
     sponsor_name: sponsorName,
@@ -416,8 +477,9 @@ export async function handleDraw(ctx: Context): Promise<void> {
   // Announce winners with embedded "WINNERS DRAWN" banner
   await sendWinnerPost(ctx.api, ctx.chat!.id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
 
-  // Mark as drawn after successful announcement
+  // Mark as drawn and announced after successful announcement
   db.markRaffleDrawn(raffle.id);
+  db.markRaffleAnnounced(raffle.id);
   await revokeReferralInviteLinks(ctx.api, raffle.id);
 
   await updateRafflePost(ctx, raffle.id);
@@ -978,6 +1040,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       max_winners: sourceRaffle.max_winners,
       ends_at: newEndsAt,
       starts_at: null,
+      display_timezone: db.getChatTimezone(chatId),
       required_chat_id: sourceRaffle.required_chat_id,
       required_chat_title: sourceRaffle.required_chat_title,
       sponsor_name: sourceRaffle.sponsor_name,
@@ -1223,6 +1286,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       max_winners: tmpl.max_winners,
       ends_at: endsAt,
       starts_at: null,
+      display_timezone: db.getChatTimezone(chatId),
       required_chat_id: null,
       required_chat_title: null,
       sponsor_name: tmpl.sponsor_name,
@@ -1641,6 +1705,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     max_winners: template.max_winners,
     ends_at: endsAt,
     starts_at: null,
+    display_timezone: db.getChatTimezone(ctx.chat!.id),
     required_chat_id: null,
     required_chat_title: null,
     sponsor_name: template.sponsor_name,
@@ -1854,6 +1919,64 @@ export async function handleLanguage(ctx: Context): Promise<void> {
     { parse_mode: "HTML" });
 }
 
+// /timezone - View or set the chat's timezone (admin only in groups)
+export async function handleTimezone(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+
+  const userId = ctx.from!.id;
+  const isAdmin = await isGroupAdmin(ctx, userId);
+  if (!isAdmin) {
+    await replyPrivately(ctx, "Only group admins can change the timezone.");
+    return;
+  }
+
+  const { resolveTimezone, formatInTimezone } = await import("./timezone");
+
+  const text = ctx.message?.text || "";
+  const args = text.replace(/^\/timezone(@\w+)?/i, "").trim();
+  const current = db.getChatTimezone(ctx.chat.id);
+
+  if (!args) {
+    const nowInTz = formatInTimezone(new Date(), current);
+    const msg =
+      `🕐 <b>Group timezone:</b> <code>${escapeHtml(current)}</code>\n` +
+      `Current time: <b>${escapeHtml(nowInTz)}</b>\n\n` +
+      `<b>Set with:</b> <code>/timezone &lt;name&gt;</code>\n\n` +
+      `<b>Common options:</b>\n` +
+      `• <code>/timezone UTC</code>\n` +
+      `• <code>/timezone EST</code> (or <code>America/New_York</code>)\n` +
+      `• <code>/timezone CST</code> (or <code>America/Chicago</code>)\n` +
+      `• <code>/timezone MST</code> (or <code>America/Denver</code>)\n` +
+      `• <code>/timezone PST</code> (or <code>America/Los_Angeles</code>)\n` +
+      `• <code>/timezone Europe/London</code>\n` +
+      `• <code>/timezone Asia/Tokyo</code>\n\n` +
+      `<i>Any IANA timezone name works. Daylight saving is handled automatically.</i>`;
+    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  const resolved = resolveTimezone(args);
+  if (!resolved) {
+    await replyPrivately(ctx,
+      `Timezone "<code>${escapeHtml(args)}</code>" is not recognized.\n\n` +
+        `Try a common name like <code>EST</code>, <code>PST</code>, or an IANA name like <code>America/New_York</code>.\n` +
+        `Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  db.setChatTimezone(ctx.chat.id, resolved);
+  const nowInTz = formatInTimezone(new Date(), resolved);
+  await replyPrivately(ctx,
+    `✅ Timezone set to <code>${escapeHtml(resolved)}</code>.\n` +
+      `Current time: <b>${escapeHtml(nowInTz)}</b>\n\n` +
+      `All future raffles in this group will use this timezone for scheduling and display.`,
+    { parse_mode: "HTML" });
+}
+
 // --- Callback query handlers ---
 
 export async function handleEnterCallback(ctx: Context): Promise<void> {
@@ -1913,14 +2036,18 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
 
   if (result.success) {
     await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
-    // Fire-and-forget — don't block callback response on post update
-    updateRafflePost(ctx, raffleId).catch((err) => console.error("Failed to update raffle post:", err));
+    // Debounced — batches rapid entries into one message edit
+    debouncedUpdateRafflePost(ctx, raffleId);
 
     // Referral link is now handled via the "Get Referral Link" button on the raffle post
     // which deep-links to the bot DM where the link is generated on demand
 
     // Auto-draw when max entries reached
     if (result.maxReached) {
+      // Cancel pending debounce — auto-draw does a direct update
+      const pending = pendingPostUpdates.get(raffleId);
+      if (pending) { clearTimeout(pending.timer); pendingPostUpdates.delete(raffleId); }
+
       const raffle = db.getRaffleById(raffleId);
       if (raffle && raffle.status === "open") {
         const lang = db.getChatLanguage(raffle.chat_id);
@@ -1937,6 +2064,7 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
 
         db.markRaffleDrawn(raffleId);
+        db.markRaffleAnnounced(raffleId);
         await revokeReferralInviteLinks(ctx.api, raffleId);
         await updateRafflePost(ctx, raffleId);
         await notifyWinnersAndCreator(ctx.api, raffle, winners);
@@ -1971,7 +2099,8 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
 
   if (removed) {
     await ctx.answerCallbackQuery({ text: t(leaveLang, "entry.left") });
-    updateRafflePost(ctx, raffleId).catch((err) => console.error("Failed to update raffle post:", err));
+    // Debounced — batches rapid leaves into one message edit
+    debouncedUpdateRafflePost(ctx, raffleId);
   } else {
     await ctx.answerCallbackQuery({
       text: t(leaveLang, "entry.not_in"),
@@ -2001,9 +2130,9 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  const entries = db.getEntriesForRaffle(raffleId);
+  const totalParticipants = db.getEntryCount(raffleId);
 
-  if (entries.length === 0) {
+  if (totalParticipants === 0) {
     await ctx.answerCallbackQuery({
       text: "No entries yet. Be the first!",
       show_alert: true,
@@ -2011,18 +2140,16 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // Build entries list - Telegram popup limit is ~200 chars
-  // Show most recent entries first (reverse order)
-  const reversed = [...entries].reverse();
+  // Build entries list - Telegram popup limit is ~200 chars.
+  const recentEntries = db.getRecentEntriesForRaffle(raffleId, 20);
 
   // If referrals are enabled, show bonus entries next to names
   const showBonus = raffle && raffle.referral_enabled;
-  const names = reversed.map((e, i) => {
-    const num = entries.length - i;
+  const names = recentEntries.map((e, i) => {
+    const num = totalParticipants - i;
     if (showBonus) {
-      const bonus = db.getBonusEntries(raffleId, e.user_id);
-      return bonus > 0
-        ? `${num}. ${e.user_display_name} (+${bonus})`
+      return e.bonus_entries > 0
+        ? `${num}. ${e.user_display_name} (+${e.bonus_entries})`
         : `${num}. ${e.user_display_name}`;
     }
     return `${num}. ${e.user_display_name}`;
@@ -2030,7 +2157,7 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
 
   const totalCount = raffle && raffle.referral_enabled
     ? db.getTotalEntryCount(raffleId)
-    : entries.length;
+    : totalParticipants;
   let message = `📋 Entries (${totalCount}) - Recent:\n`;
 
   for (const name of names) {
@@ -2176,32 +2303,58 @@ export async function revokeReferralInviteLinks(
  * (and sponsor info) with the full results.
  */
 export async function notifyWinnersAndCreator(
-  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown>; getChat: (chatId: number) => Promise<{ title?: string }> },
-  raffle: { id: number; chat_id: number; title: string; creator_id: number; creator_name: string; sponsor_name: string | null },
+  api: { sendMessage: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<unknown>; getChat: (chatId: number) => Promise<{ title?: string; username?: string }> },
+  raffle: { id: number; chat_id: number; title: string; creator_id: number; creator_name: string; sponsor_name: string | null; message_id: number | null },
   winners: Array<{ user_id: number; user_display_name: string; prize: string; position: number }>
 ): Promise<void> {
   const title = escapeHtml(raffle.title);
 
-  // Get group title for the "won in" message
+  // Resolve group title + public username (if any) for link building
   let groupTitle = "the group";
+  let groupUsername: string | null = null;
   try {
     const chat = await api.getChat(raffle.chat_id);
     if (chat.title) groupTitle = chat.title;
-  } catch {}
+    if (chat.username) groupUsername = chat.username;
+  } catch {
+    // Bot may have been kicked since the draw — we'll fall back to plain text
+  }
 
-  // Build sponsor contact line for winner DMs
-  let contactLine: string;
+  // Build a link straight to the raffle post.
+  //   - Public groups: https://t.me/<username>/<msgId>
+  //   - Private supergroups: https://t.me/c/<shortId>/<msgId>  (only opens for members)
+  let raffleLink: string | null = null;
+  if (raffle.message_id) {
+    if (groupUsername) {
+      raffleLink = `https://t.me/${groupUsername}/${raffle.message_id}`;
+    } else {
+      raffleLink = buildMessageLink(raffle.chat_id, raffle.message_id);
+    }
+  }
+  const groupLink: string | null = raffleLink; // same destination; both nav to the chat
+
+  // Sponsor contact line (optional, separate from group info)
+  let sponsorLine = "";
   if (raffle.sponsor_name) {
     const sponsor = raffle.sponsor_name.trim();
     if (sponsor.startsWith("@")) {
       const username = sponsor.replace(/^@/, "");
-      contactLine = `\n\n💎 <b>Sponsor:</b> <a href="https://t.me/${escapeHtml(username)}">${escapeHtml(sponsor)}</a>\nContact them to claim your prize!`;
+      sponsorLine = `\n💎 <b>Sponsor:</b> <a href="https://t.me/${escapeHtml(username)}">${escapeHtml(sponsor)}</a> — contact them to claim your prize!`;
     } else {
-      contactLine = `\n\n💎 <b>Sponsor:</b> ${escapeHtml(sponsor)}`;
+      sponsorLine = `\n💎 <b>Sponsor:</b> ${escapeHtml(sponsor)}`;
     }
-  } else {
-    contactLine = `\n\n📍 Won in <b>${escapeHtml(groupTitle)}</b>`;
   }
+
+  // Group line — ALWAYS present so winners know where they won, even when sponsored.
+  // Includes a link to the raffle post when we can build one.
+  const groupNameEsc = escapeHtml(groupTitle);
+  const groupLine = groupLink
+    ? `\n📍 <b>Group:</b> <a href="${groupLink}">${groupNameEsc}</a>`
+    : `\n📍 <b>Group:</b> ${groupNameEsc}`;
+
+  const raffleLinkLine = raffleLink
+    ? `\n🔗 <a href="${raffleLink}">View the raffle post</a>`
+    : "";
 
   // DM all winners concurrently
   const dmResults = await Promise.allSettled(
@@ -2211,8 +2364,14 @@ export async function notifyWinnersAndCreator(
       if (w.prize) {
         winnerMsg += `\n🎁 <b>Your prize:</b> ${escapeHtml(w.prize)}`;
       }
-      winnerMsg += contactLine;
-      await api.sendMessage(w.user_id, winnerMsg, { parse_mode: "HTML" });
+      winnerMsg += "\n";
+      winnerMsg += groupLine;
+      if (sponsorLine) winnerMsg += sponsorLine;
+      winnerMsg += raffleLinkLine;
+      await api.sendMessage(w.user_id, winnerMsg, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      });
       return w.user_display_name;
     })
   );
@@ -2268,24 +2427,8 @@ export function buildStatsMessage(): string {
 
   msg += `<b>Raffles:</b>\n`;
   msg += `  📋 Total: <b>${stats.totalRaffles}</b>\n`;
-  msg += `  🟢 Active: <b>${stats.activeRaffles}</b>\n`;
-  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n`;
-
-  // Show active raffles by group
-  const activeByGroup = db.getActiveRafflesByGroup();
-  if (activeByGroup.length > 0) {
-    msg += `\n<b>🟢 Active Raffles:</b>\n`;
-    for (const group of activeByGroup) {
-      const known = allGroups.find((g) => g.chat_id === group.chat_id);
-      const groupTitle = known ? known.title : `Chat ${group.chat_id}`;
-      msg += `  <b>${escapeHtml(groupTitle)}:</b>\n`;
-      for (const raffle of group.raffles) {
-        const count = db.getEntryCount(raffle.id);
-        msg += `    • ${escapeHtml(raffle.title)} (${count} entries)\n`;
-      }
-    }
-  }
-  msg += `\n`;
+  msg += `  🟢 Active: <b>${stats.activeRaffles}</b> <i>(use /active for the list)</i>\n`;
+  msg += `  🏆 Drawn: <b>${stats.drawnRaffles}</b>\n\n`;
 
   msg += `<b>Entries:</b>\n`;
   msg += `  📝 Total entries: <b>${stats.totalEntries}</b>\n`;
@@ -2313,6 +2456,34 @@ export function buildStatsMessage(): string {
   return msg;
 }
 
+/**
+ * Split a long HTML-formatted message into chunks that fit within Telegram's 4096 char limit.
+ * Splits at safe boundaries: blank-line section breaks first, then single newlines if needed.
+ */
+export function chunkMessage(text: string, maxLen = 3900): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > maxLen) {
+    // Try to split at a blank-line boundary within the limit
+    let splitAt = remaining.lastIndexOf("\n\n", maxLen);
+    if (splitAt < maxLen / 2) {
+      // Fall back to single newline if blank-line split would lose too much
+      splitAt = remaining.lastIndexOf("\n", maxLen);
+    }
+    if (splitAt < maxLen / 2) {
+      // Last resort: hard split at maxLen
+      splitAt = maxLen;
+    }
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
 // /stats - Bot-wide statistics (owner only)
 export async function handleStats(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
@@ -2325,8 +2496,237 @@ export async function handleStats(ctx: Context): Promise<void> {
   }
 
   const msg = buildStatsMessage();
+  const chunks = chunkMessage(msg);
 
-  // Send as DM to the owner
+  // Send all chunks as DMs to the owner; fall back to chat reply if DM fails
+  let useFallback = false;
+  for (const chunk of chunks) {
+    try {
+      if (useFallback) {
+        await ctx.reply(chunk, { parse_mode: "HTML" });
+      } else {
+        await ctx.api.sendMessage(userId, chunk, { parse_mode: "HTML" });
+      }
+    } catch (err) {
+      // If first send fails (DM blocked), retry the rest in chat
+      if (!useFallback) {
+        useFallback = true;
+        try {
+          await ctx.reply(chunk, { parse_mode: "HTML" });
+        } catch (err2) {
+          console.error("Stats: failed to send chunk in chat fallback:", err2);
+        }
+      } else {
+        console.error("Stats: failed to send chunk:", err);
+      }
+    }
+    // Tiny gap to avoid per-chat rate limits when chunks > 1
+    if (chunks.length > 1) await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+// /health - Bot health snapshot (owner only, hidden)
+export async function handleHealth(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) {
+    return; // Silently ignore
+  }
+
+  const health = db.getAnnouncementHealth();
+  const stats = db.getBotStats();
+  const groups = db.getActiveBotGroups();
+  const adminCount = groups.filter((g) => g.bot_status === "administrator").length;
+  const memberCount = groups.length - adminCount;
+
+  // Find the worst-stuck raffle (oldest unannounced)
+  const worst = db.getOldestUnannouncedRaffles(5);
+
+  // Bot uptime — process.uptime returns seconds
+  const uptimeSec = Math.floor(process.uptime());
+  const uptimeStr =
+    uptimeSec < 60
+      ? `${uptimeSec}s`
+      : uptimeSec < 3600
+      ? `${Math.floor(uptimeSec / 60)}m`
+      : uptimeSec < 86400
+      ? `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`
+      : `${Math.floor(uptimeSec / 86400)}d ${Math.floor((uptimeSec % 86400) / 3600)}h`;
+
+  const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+
+  const overall =
+    health.stuckOver1h > 0 || health.permanentlyFailed > 5
+      ? "🔴 <b>Issues detected</b>"
+      : health.stuckOver15min > 0
+      ? "🟡 <b>Minor issues</b>"
+      : "🟢 <b>Healthy</b>";
+
+  let msg = `${overall}\n\n`;
+  msg += `<b>🤖 Bot</b>\n`;
+  msg += `  Uptime: ${uptimeStr}\n`;
+  msg += `  Memory: ${memMb} MB\n\n`;
+
+  msg += `<b>📊 Activity</b>\n`;
+  msg += `  Active raffles: ${stats.activeRaffles}\n`;
+  msg += `  Tracked groups: ${groups.length} (${adminCount} admin / ${memberCount} member)\n\n`;
+
+  msg += `<b>📣 Announcements</b>\n`;
+  msg += `  Pending: ${health.totalUnannounced}\n`;
+  msg += `  Stuck >15 min: ${health.stuckOver15min === 0 ? "0 ✅" : `${health.stuckOver15min} ⚠️`}\n`;
+  msg += `  Stuck >1 hour: ${health.stuckOver1h === 0 ? "0 ✅" : `${health.stuckOver1h} 🔴`}\n`;
+  msg += `  Gave up on: ${health.permanentlyFailed}\n\n`;
+
+  const jobs = getJobStats();
+  msg += `<b>⚙️ Background Jobs</b>\n`;
+  msg += `  Pending: ${jobs.pending}\n`;
+  msg += `  Running: ${jobs.running}\n`;
+  msg += `  Done (24h): ${jobs.doneLast24h}\n`;
+  msg += `  Failed: ${jobs.failed === 0 ? "0 ✅" : `${jobs.failed} ⚠️`}\n\n`;
+
+  // Backup status
+  const BACKUP_DIR = "/data/backups";
+  msg += `<b>💾 Backups</b>\n`;
+  try {
+    if (fs.existsSync(BACKUP_DIR)) {
+      const files = fs
+        .readdirSync(BACKUP_DIR)
+        .filter((f) => f.startsWith("raffle.db.") && f.endsWith(".bak"))
+        .map((f) => ({
+          name: f,
+          mtime: fs.statSync(path.join(BACKUP_DIR, f)).mtimeMs,
+          size: fs.statSync(path.join(BACKUP_DIR, f)).size,
+        }))
+        .sort((a, b) => b.mtime - a.mtime);
+
+      if (files.length === 0) {
+        msg += `  ⚠️ No backups yet (waiting for first hourly run)\n`;
+      } else {
+        const latest = files[0];
+        const ageMin = Math.floor((Date.now() - latest.mtime) / 60_000);
+        const ageStr = ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago`;
+        const totalMb = (files.reduce((s, f) => s + f.size, 0) / 1024 / 1024).toFixed(1);
+        const ageIcon = ageMin > 90 ? "🔴" : ageMin > 65 ? "🟡" : "✅";
+        msg += `  Last backup: ${ageStr} ${ageIcon}\n`;
+        msg += `  Count: ${files.length} files (${totalMb} MB total)\n`;
+      }
+    } else {
+      msg += `  ⚠️ Backup directory not found\n`;
+    }
+  } catch (err) {
+    msg += `  ⚠️ Could not read backups: ${escapeHtml(String((err as Error).message || err))}\n`;
+  }
+
+  if (worst.length > 0) {
+    msg += `\n<b>🔍 Oldest pending</b>\n`;
+    for (const r of worst) {
+      msg += `  • <code>${r.id}</code> ${escapeHtml(r.title.slice(0, 40))} — ${r.announce_attempts} attempts\n`;
+      msg += `     drawn ${r.drawn_at} UTC, chat <code>${r.chat_id}</code>\n`;
+    }
+  }
+
+  const chunks = chunkMessage(msg);
+  let useFallback = false;
+  for (const chunk of chunks) {
+    try {
+      if (useFallback) {
+        await ctx.reply(chunk, { parse_mode: "HTML" });
+      } else {
+        await ctx.api.sendMessage(userId, chunk, { parse_mode: "HTML" });
+      }
+    } catch {
+      if (!useFallback) {
+        useFallback = true;
+        try {
+          await ctx.reply(chunk, { parse_mode: "HTML" });
+        } catch (err2) {
+          console.error("Health: failed chat fallback:", err2);
+        }
+      }
+    }
+    if (chunks.length > 1) await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+// /metrics - Bot activity counters since process start (owner only, hidden)
+export async function handleMetrics(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (ownerId === 0 || userId !== ownerId) return;
+
+  const snap = metrics.snapshot();
+
+  const uptimeStr =
+    snap.uptimeSec < 60
+      ? `${snap.uptimeSec}s`
+      : snap.uptimeSec < 3600
+      ? `${Math.floor(snap.uptimeSec / 60)}m`
+      : snap.uptimeSec < 86400
+      ? `${Math.floor(snap.uptimeSec / 3600)}h ${Math.floor((snap.uptimeSec % 3600) / 60)}m`
+      : `${Math.floor(snap.uptimeSec / 86400)}d ${Math.floor((snap.uptimeSec % 86400) / 3600)}h`;
+
+  // Aggregate stats
+  const totalApiCalls = Object.values(snap.apiCalls).reduce((a, b) => a + b, 0);
+  const totalErrors = Object.values(snap.apiErrors).reduce((a, b) => a + b, 0);
+  const totalCommands = Object.values(snap.commands).reduce((a, b) => a + b, 0);
+  const errorRate = totalApiCalls > 0 ? ((totalErrors / totalApiCalls) * 100).toFixed(2) : "0.00";
+
+  let msg = `📊 <b>Bot Metrics</b>\n`;
+  msg += `<i>Since process start — restart to reset</i>\n\n`;
+
+  msg += `<b>📈 Overview</b>\n`;
+  msg += `  Uptime: ${uptimeStr}\n`;
+  msg += `  Started: <code>${snap.startedAt}</code>\n`;
+  msg += `  API calls: ${totalApiCalls.toLocaleString()}\n`;
+  msg += `  API errors: ${totalErrors.toLocaleString()} (${errorRate}%)\n`;
+  msg += `  Commands: ${totalCommands.toLocaleString()}\n`;
+  msg += `  Rate-limit hits: ${snap.rateLimitHits}\n`;
+  msg += `  Owner alerts sent: ${snap.ownerAlertsSent}\n\n`;
+
+  // Top 8 API methods
+  const apiSorted = Object.entries(snap.apiCalls).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  if (apiSorted.length > 0) {
+    msg += `<b>🌐 Top API Calls</b>\n`;
+    for (const [method, count] of apiSorted) {
+      msg += `  ${method}: <b>${count.toLocaleString()}</b>\n`;
+    }
+    msg += `\n`;
+  }
+
+  // Top error codes
+  const errSorted = Object.entries(snap.apiErrors).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  if (errSorted.length > 0) {
+    msg += `<b>⚠️ API Errors by method:code</b>\n`;
+    for (const [key, count] of errSorted) {
+      msg += `  <code>${escapeHtml(key)}</code>: ${count}\n`;
+    }
+    msg += `\n`;
+  }
+
+  // Top commands
+  const cmdSorted = Object.entries(snap.commands).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  if (cmdSorted.length > 0) {
+    msg += `<b>💬 Top Commands</b>\n`;
+    for (const [cmd, count] of cmdSorted) {
+      msg += `  /${escapeHtml(cmd)}: ${count}\n`;
+    }
+    msg += `\n`;
+  }
+
+  // Latency stats
+  const lat = computeLatencyStats(snap.apiLatencyMs);
+  const latEntries = Object.entries(lat).sort((a, b) => b[1].count - a[1].count).slice(0, 5);
+  if (latEntries.length > 0) {
+    msg += `<b>⚡ API Latency (recent ${snap.apiLatencyMs.length} samples)</b>\n`;
+    for (const [method, stats] of latEntries) {
+      const warn = stats.p95 > 2000 ? " ⚠️" : "";
+      msg += `  ${method}: p50 <b>${stats.p50}ms</b>, p95 <b>${stats.p95}ms</b>${warn}\n`;
+    }
+  }
+
   try {
     await ctx.api.sendMessage(userId, msg, { parse_mode: "HTML" });
   } catch {
@@ -2397,7 +2797,15 @@ export async function handleActive(ctx: Context): Promise<void> {
   const header = `📊 <b>Active Raffles: ${totalRaffles} across ${groups.length} group${groups.length === 1 ? "" : "s"}</b>\n\n`;
   const msg = header + sections.join("\n");
 
-  await ctx.reply(msg, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  const chunks = chunkMessage(msg);
+  for (const chunk of chunks) {
+    try {
+      await ctx.reply(chunk, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    } catch (err) {
+      console.error("Active: failed to send chunk:", err);
+    }
+    if (chunks.length > 1) await new Promise((r) => setTimeout(r, 400));
+  }
 }
 
 // /referralstats — Show referral link stats for active raffles (owner only)

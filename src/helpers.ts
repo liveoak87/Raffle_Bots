@@ -2,8 +2,9 @@ import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
-import { getEntryCount, getTotalEntryCount } from "./database";
+import { getEntryCount, getTotalEntryCount, getChatTimezone } from "./database";
 import { t } from "./i18n";
+import { formatInTimezone } from "./timezone";
 
 export function escapeHtml(text: string): string {
   return text
@@ -51,15 +52,21 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
   }
   msg += `🏆 <b>${t(lang, "raffle.winners")}:</b> ${raffle.max_winners}\n`;
 
+  // Prefer the per-raffle timezone (set by the scheduling wizard), fall back
+  // to the chat's configured timezone, then UTC.
+  const tz = raffle.display_timezone || getChatTimezone(raffle.chat_id);
+
   if (raffle.ends_at) {
     const endsDate = new Date(raffle.ends_at + "Z");
-    msg += `⏰ <b>${t(lang, "raffle.ends")}:</b> ${formatCountdown(endsDate)}\n`;
+    const wall = formatInTimezone(endsDate, tz);
+    msg += `⏰ <b>${t(lang, "raffle.ends")}:</b> ${formatCountdown(endsDate)} <i>(${escapeHtml(wall)})</i>\n`;
   }
 
   if (raffle.starts_at) {
     const startsDate = new Date(raffle.starts_at + "Z");
     if (startsDate > new Date()) {
-      msg += `🕐 <b>${t(lang, "raffle.opens")}:</b> ${formatCountdown(startsDate).replace(" remaining", "")}\n`;
+      const wall = formatInTimezone(startsDate, tz);
+      msg += `🕐 <b>${t(lang, "raffle.opens")}:</b> ${formatCountdown(startsDate).replace(" remaining", "")} <i>(${escapeHtml(wall)})</i>\n`;
     }
   }
 
@@ -160,7 +167,7 @@ export async function isGroupAdmin(
 export async function replyPrivately(
   ctx: Context,
   text: string,
-  opts?: { parse_mode?: string; reply_markup?: unknown }
+  opts?: { parse_mode?: string; reply_markup?: unknown; link_preview_options?: { is_disabled?: boolean } }
 ): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;

@@ -7,5 +7,13 @@ services:
       - BOT_TOKEN=${BOT_TOKEN}
       - DATABASE_PATH=/data/raffle.db
       - DATA_RETENTION_HOURS=${DATA_RETENTION_HOURS:-24}
+      # Control-tower admin endpoint (shared key from .env). Reachable on the
+      # Docker network at http://raffle-bot:8787 — point cloudflared ingress here.
+      - ADMIN_KEY=${ADMIN_KEY:-}
+      - ADMIN_PORT=8787
+    # Host port 8788 (poll-bot uses 8787) → container 8787. Host-network
+    # cloudflared reaches it at http://localhost:8788.
+    ports:
+      - "8788:8787"
     volumes:
       - ./data:/data

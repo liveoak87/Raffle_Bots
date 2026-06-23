@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { randomInt } from "crypto";
 import type {
   Raffle,
   RaffleEntry,
@@ -122,9 +123,11 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffles_status_ends ON raffles(status, ends_at);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_raffle_id ON raffle_entries(raffle_id);
+    CREATE INDEX IF NOT EXISTS idx_raffle_entries_recent ON raffle_entries(raffle_id, entered_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_user_id ON raffle_entries(user_id);
     CREATE INDEX IF NOT EXISTS idx_raffle_winners_raffle_id ON raffle_winners(raffle_id);
     CREATE INDEX IF NOT EXISTS idx_templates_chat_id ON raffle_templates(chat_id);
+    CREATE INDEX IF NOT EXISTS idx_templates_recurring_due ON raffle_templates(recurring_active, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
   `);
@@ -143,6 +146,11 @@ function migrateDatabase(): void {
 
   const raffleColumns = tableInfo("raffles").map((c) => c.name);
   const winnerColumns = tableInfo("raffle_winners").map((c) => c.name);
+  const botGroupsColumns = tableInfo("bot_groups").map((c) => c.name);
+
+  if (!botGroupsColumns.includes("timezone")) {
+    getDb().exec("ALTER TABLE bot_groups ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'");
+  }
 
   if (!raffleColumns.includes("prizes")) {
     getDb().exec("ALTER TABLE raffles ADD COLUMN prizes TEXT");
@@ -218,8 +226,39 @@ function migrateDatabase(): void {
     );
   }
 
+  if (!raffleColumns.includes("announced")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN announced INTEGER NOT NULL DEFAULT 0"
+    );
+    // Mark all existing drawn raffles as announced (they predate this feature)
+    getDb().exec("UPDATE raffles SET announced = 1 WHERE status = 'drawn'");
+  }
+
+  if (!raffleColumns.includes("announce_attempts")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN announce_attempts INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("last_announce_at")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN last_announce_at TEXT DEFAULT NULL");
+  }
+  if (!raffleColumns.includes("announce_failed")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN announce_failed INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+  if (!raffleColumns.includes("owner_alerted")) {
+    getDb().exec(
+      "ALTER TABLE raffles ADD COLUMN owner_alerted INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+
   if (!raffleColumns.includes("thread_id")) {
     getDb().exec("ALTER TABLE raffles ADD COLUMN thread_id INTEGER DEFAULT NULL");
+  }
+
+  if (!raffleColumns.includes("display_timezone")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN display_timezone TEXT DEFAULT NULL");
   }
 
   // Add thread_id to raffle_templates if the table exists
@@ -231,6 +270,26 @@ function migrateDatabase(): void {
   } catch {
     // Table may not exist yet
   }
+
+  // Create persistent job queue table — survives bot restarts.
+  // Used for fire-and-forget background tasks (winner DMs, banner ops, etc.)
+  // that must complete even if the process dies mid-task.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      last_error TEXT,
+      run_after TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_run_after ON jobs(status, run_after);
+    CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type);
+  `);
 
   // Create referral_links table if it doesn't exist
   getDb().exec(`
@@ -249,6 +308,14 @@ function migrateDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
   `);
+
+  getDb().exec(`
+    CREATE INDEX IF NOT EXISTS idx_raffle_entries_recent ON raffle_entries(raffle_id, entered_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_templates_recurring_due ON raffle_templates(recurring_active, next_run_at);
+    CREATE INDEX IF NOT EXISTS idx_raffles_announcement_retry
+      ON raffles(status, announced, announce_failed, owner_alerted, drawn_at);
+    CREATE INDEX IF NOT EXISTS idx_raffles_created_at ON raffles(created_at);
+  `);
 }
 
 export function getDb(): Database.Database {
@@ -262,8 +329,8 @@ export function getDb(): Database.Database {
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
   const stmt = getDb().prepare(`
-    INSERT INTO raffles (chat_id, thread_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
-    VALUES (@chat_id, @thread_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
+    INSERT INTO raffles (chat_id, thread_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, display_timezone, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
+    VALUES (@chat_id, @thread_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @display_timezone, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
   `);
   const result = stmt.run(input);
   return getRaffleById(result.lastInsertRowid as number)!;
@@ -323,6 +390,133 @@ export function markRaffleDrawn(raffleId: number): void {
       "UPDATE raffles SET status = 'drawn', drawn_at = datetime('now') WHERE id = ?"
     )
     .run(raffleId);
+}
+
+export function markRaffleAnnounced(raffleId: number): void {
+  getDb()
+    .prepare("UPDATE raffles SET announced = 1 WHERE id = ?")
+    .run(raffleId);
+}
+
+export function getUnannouncedDrawnRaffles(): Raffle[] {
+  // Don't include raffles already marked as permanently failed
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffles WHERE status = 'drawn' AND announced = 0 AND announce_failed = 0"
+    )
+    .all() as Raffle[];
+}
+
+export function recordAnnounceAttempt(raffleId: number): void {
+  getDb()
+    .prepare(
+      "UPDATE raffles SET announce_attempts = announce_attempts + 1, last_announce_at = datetime('now') WHERE id = ?"
+    )
+    .run(raffleId);
+}
+
+export function markAnnounceFailed(raffleId: number): void {
+  getDb()
+    .prepare("UPDATE raffles SET announce_failed = 1 WHERE id = ?")
+    .run(raffleId);
+}
+
+export function markOwnerAlerted(raffleId: number): void {
+  getDb()
+    .prepare("UPDATE raffles SET owner_alerted = 1 WHERE id = ?")
+    .run(raffleId);
+}
+
+/** Raffles stuck unannounced for at least N minutes that the owner hasn't been alerted about. */
+export function getStuckUnnotifiedRaffles(minutesThreshold: number): Raffle[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM raffles
+       WHERE status = 'drawn'
+         AND announced = 0
+         AND announce_failed = 0
+         AND owner_alerted = 0
+         AND drawn_at <= datetime('now', '-' || ? || ' minutes')`
+    )
+    .all(minutesThreshold) as Raffle[];
+}
+
+/** Raffles that have been retried for >X hours — give up. */
+export function getRafflesToGiveUpOn(hoursThreshold: number): Raffle[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM raffles
+       WHERE status = 'drawn'
+         AND announced = 0
+         AND announce_failed = 0
+         AND drawn_at <= datetime('now', '-' || ? || ' hours')`
+    )
+    .all(hoursThreshold) as Raffle[];
+}
+
+/** Count raffles in a chat that are active (open) or have unannounced wins. Used when bot is kicked. */
+export function countActiveOrUnannouncedInChat(chatId: number): number {
+  return (
+    getDb()
+      .prepare(
+        "SELECT COUNT(*) as c FROM raffles WHERE chat_id = ? AND (status = 'open' OR (status = 'drawn' AND announced = 0))"
+      )
+      .get(chatId) as { c: number }
+  ).c;
+}
+
+/** Get up to N oldest unannounced raffles for /health "worst stuck" report. */
+export function getOldestUnannouncedRaffles(limit: number): Array<{
+  id: number;
+  title: string;
+  chat_id: number;
+  drawn_at: string;
+  announce_attempts: number;
+}> {
+  return getDb()
+    .prepare(
+      `SELECT id, title, chat_id, drawn_at, announce_attempts
+       FROM raffles
+       WHERE status = 'drawn' AND announced = 0 AND announce_failed = 0
+       ORDER BY drawn_at ASC
+       LIMIT ?`
+    )
+    .all(limit) as Array<{
+      id: number;
+      title: string;
+      chat_id: number;
+      drawn_at: string;
+      announce_attempts: number;
+    }>;
+}
+
+/** Counts of currently stuck raffles for /health command. */
+export function getAnnouncementHealth(): {
+  totalUnannounced: number;
+  stuckOver15min: number;
+  stuckOver1h: number;
+  permanentlyFailed: number;
+} {
+  const d = getDb();
+  const totalUnannounced = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffles WHERE status='drawn' AND announced=0 AND announce_failed=0"
+    ).get() as { c: number }
+  ).c;
+  const stuckOver15min = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffles WHERE status='drawn' AND announced=0 AND announce_failed=0 AND drawn_at <= datetime('now', '-15 minutes')"
+    ).get() as { c: number }
+  ).c;
+  const stuckOver1h = (
+    d.prepare(
+      "SELECT COUNT(*) as c FROM raffles WHERE status='drawn' AND announced=0 AND announce_failed=0 AND drawn_at <= datetime('now', '-1 hours')"
+    ).get() as { c: number }
+  ).c;
+  const permanentlyFailed = (
+    d.prepare("SELECT COUNT(*) as c FROM raffles WHERE announce_failed=1").get() as { c: number }
+  ).c;
+  return { totalUnannounced, stuckOver15min, stuckOver1h, permanentlyFailed };
 }
 
 export function deleteRaffle(raffleId: number): void {
@@ -402,6 +596,46 @@ export function getEntriesForRaffle(raffleId: number): RaffleEntry[] {
     .all(raffleId) as RaffleEntry[];
 }
 
+export interface RecentRaffleEntry extends RaffleEntry {
+  bonus_entries: number;
+}
+
+export function getRecentEntriesForRaffle(
+  raffleId: number,
+  limit: number
+): RecentRaffleEntry[] {
+  return getDb()
+    .prepare(
+      `SELECT e.*, COALESCE(rl.bonus_entries, 0) as bonus_entries
+       FROM raffle_entries e
+       LEFT JOIN referral_links rl
+         ON rl.raffle_id = e.raffle_id
+        AND rl.user_id = e.user_id
+       WHERE e.raffle_id = ?
+       ORDER BY e.entered_at DESC, e.id DESC
+       LIMIT ?`
+    )
+    .all(raffleId, limit) as RecentRaffleEntry[];
+}
+
+interface WeightedRaffleEntry extends RaffleEntry {
+  bonus_entries: number;
+}
+
+function getEntriesWithBonusForRaffle(raffleId: number): WeightedRaffleEntry[] {
+  return getDb()
+    .prepare(
+      `SELECT e.*, COALESCE(rl.bonus_entries, 0) as bonus_entries
+       FROM raffle_entries e
+       LEFT JOIN referral_links rl
+         ON rl.raffle_id = e.raffle_id
+        AND rl.user_id = e.user_id
+       WHERE e.raffle_id = ?
+       ORDER BY e.entered_at ASC`
+    )
+    .all(raffleId) as WeightedRaffleEntry[];
+}
+
 export function getEntryCount(raffleId: number): number {
   const row = getDb()
     .prepare(
@@ -476,32 +710,14 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
 
   const numWinners = Math.min(raffle.max_winners, entries.length);
 
-  // Build weighted entry pool if referral entries are enabled
-  let pool: RaffleEntry[];
+  let selected: RaffleEntry[];
   if (raffle.referral_enabled) {
-    pool = [];
-    for (const entry of entries) {
-      // 1 base entry
-      pool.push(entry);
-      // Add bonus entries from referrals
-      const bonus = getBonusEntries(raffleId, entry.user_id);
-      for (let i = 0; i < bonus; i++) {
-        pool.push(entry);
-      }
-    }
+    selected = selectWeightedWinners(
+      getEntriesWithBonusForRaffle(raffleId),
+      numWinners
+    );
   } else {
-    pool = entries;
-  }
-
-  // Shuffle and pick unique winners
-  const shuffled = cryptoShuffle(pool);
-  const selected: RaffleEntry[] = [];
-  const selectedIds = new Set<number>();
-  for (const entry of shuffled) {
-    if (selectedIds.has(entry.user_id)) continue;
-    selectedIds.add(entry.user_id);
-    selected.push(entry);
-    if (selected.length >= numWinners) break;
+    selected = cryptoShuffle(entries).slice(0, numWinners);
   }
 
   const insertStmt = getDb().prepare(`
@@ -647,6 +863,47 @@ export function getDueRecurringTemplates(): RaffleTemplate[] {
          AND next_run_at <= datetime('now')`
     )
     .all() as RaffleTemplate[];
+}
+
+export function claimDueRecurringTemplates(): RaffleTemplate[] {
+  const d = getDb();
+  const claimAll = d.transaction(() => {
+    const due = d
+      .prepare(
+        `SELECT * FROM raffle_templates
+         WHERE recurring_active = 1
+           AND recurring_interval_minutes IS NOT NULL
+           AND next_run_at IS NOT NULL
+           AND next_run_at <= datetime('now')
+         ORDER BY next_run_at ASC, id ASC`
+      )
+      .all() as RaffleTemplate[];
+
+    const update = d.prepare(
+      `UPDATE raffle_templates
+       SET next_run_at = ?
+       WHERE id = ?
+         AND recurring_active = 1
+         AND next_run_at = ?
+         AND next_run_at <= datetime('now')`
+    );
+
+    const claimed: RaffleTemplate[] = [];
+    for (const template of due) {
+      if (!template.recurring_interval_minutes || !template.next_run_at) continue;
+      const nextRun = new Date(
+        Date.now() + template.recurring_interval_minutes * 60 * 1000
+      );
+      const nextRunStr = formatSqlDate(nextRun);
+      const result = update.run(nextRunStr, template.id, template.next_run_at);
+      if (result.changes === 1) {
+        claimed.push({ ...template, next_run_at: nextRunStr });
+      }
+    }
+    return claimed;
+  });
+
+  return claimAll();
 }
 
 export function updateNextRunAt(
@@ -851,6 +1108,7 @@ export function updateRaffleFields(
     "max_referral_entries",
     "revoke_referral_links",
     "thread_id",
+    "display_timezone",
   ];
   const updates: string[] = [];
   const values: unknown[] = [];
@@ -950,6 +1208,8 @@ export interface BotGroup {
   chat_id: number;
   title: string;
   bot_status: "member" | "administrator";
+  /** IANA timezone (e.g. "America/New_York"). Defaults to "UTC". */
+  timezone: string;
   added_at: string;
   updated_at: string;
 }
@@ -987,6 +1247,28 @@ export function getAdminBotGroups(): BotGroup[] {
   return getDb()
     .prepare("SELECT * FROM bot_groups WHERE bot_status = 'administrator' ORDER BY title COLLATE NOCASE")
     .all() as BotGroup[];
+}
+
+/**
+ * Return the chat's configured IANA timezone (e.g. "America/New_York").
+ * Defaults to "UTC" if the chat is unknown or hasn't been configured.
+ */
+export function getChatTimezone(chatId: number): string {
+  const row = getDb()
+    .prepare("SELECT timezone FROM bot_groups WHERE chat_id = ?")
+    .get(chatId) as { timezone: string } | undefined;
+  return row?.timezone || "UTC";
+}
+
+export function setChatTimezone(chatId: number, timezone: string): void {
+  // Ensure the row exists first — chat may not have been auto-tracked yet
+  getDb()
+    .prepare(
+      `INSERT INTO bot_groups (chat_id, title, bot_status, timezone)
+       VALUES (?, '', 'member', ?)
+       ON CONFLICT(chat_id) DO UPDATE SET timezone = excluded.timezone, updated_at = datetime('now')`
+    )
+    .run(chatId, timezone);
 }
 
 export function findOpenRaffleByTitle(title: string): Raffle | null {
@@ -1114,17 +1396,42 @@ export function getReferralLinksForRaffle(raffleId: number): ReferralLink[] {
 
 function cryptoShuffle<T>(array: T[]): T[] {
   const shuffled = [...array];
-  const crypto = require("crypto");
   for (let i = shuffled.length - 1; i > 0; i--) {
-    // Rejection sampling to eliminate modulo bias
-    const range = i + 1;
-    const maxValid = Math.floor(0x100000000 / range) * range;
-    let randomValue: number;
-    do {
-      randomValue = crypto.randomBytes(4).readUInt32BE(0);
-    } while (randomValue >= maxValid);
-    const j = randomValue % range;
+    const j = randomInt(i + 1);
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   return shuffled;
+}
+
+function selectWeightedWinners(
+  entries: WeightedRaffleEntry[],
+  numWinners: number
+): RaffleEntry[] {
+  const candidates = entries.map((entry) => ({
+    entry,
+    weight: Math.max(1, 1 + entry.bonus_entries),
+  }));
+  const selected: RaffleEntry[] = [];
+
+  while (selected.length < numWinners) {
+    const totalWeight = candidates.reduce((sum, candidate) => sum + candidate.weight, 0);
+    if (totalWeight <= 0) break;
+
+    let pick = randomInt(totalWeight);
+    for (const candidate of candidates) {
+      if (candidate.weight === 0) continue;
+      if (pick < candidate.weight) {
+        selected.push(candidate.entry);
+        candidate.weight = 0;
+        break;
+      }
+      pick -= candidate.weight;
+    }
+  }
+
+  return selected;
+}
+
+function formatSqlDate(date: Date): string {
+  return date.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
 }

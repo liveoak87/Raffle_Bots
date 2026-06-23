@@ -12,18 +12,27 @@ import {
 } from "./helpers";
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
+import { formatInTimezone } from "./timezone";
 
 interface WizardState {
   step:
     | "title"
     | "prize"
     | "winners"
+    | "winners_custom"
     | "time"
     | "time_custom"
     | "options"
     | "options_sponsor"
     | "options_image"
     | "options_scheduled"
+    | "options_scheduled_time"
+    | "options_scheduled_custom_date"
+    | "options_scheduled_custom_time"
+    | "options_scheduled_cal"
+    | "options_scheduled_hour"
+    | "options_scheduled_min"
+    | "options_scheduled_tz"
     | "options_minage"
     | "options_cooldown"
     | "options_referral_max";
@@ -40,6 +49,15 @@ interface WizardState {
   anonymous?: boolean;
   imageFileId?: string | null;
   startsAt?: string | null;
+  /** Date chosen in the picker before time is selected (YYYY-MM-DD in chat's timezone) */
+  scheduledDate?: string;
+  /** Hour chosen in the clock picker (0-23, in scheduledTimezone) */
+  scheduledHour?: number;
+  /**
+   * Timezone the user is currently building the schedule in.
+   * Defaults to the chat's stored timezone, but can be overridden per-raffle via the wizard.
+   */
+  scheduledTimezone?: string;
   autoPin?: boolean;
   minAccountAgeDays?: number;
   requireUsername?: boolean;
@@ -317,14 +335,18 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleTitleStep(ctx, state, text);
     case "prize":
       return await handlePrizeStep(ctx, state, text);
+    case "winners_custom":
+      return await handleCustomWinnersStep(ctx, state, text);
     case "time_custom":
       return await handleCustomTimeStep(ctx, state, text);
     case "options_image":
       return await handleOptionsImageText(ctx, state, text);
     case "options_sponsor":
       return await handleOptionsSponsorText(ctx, state, text);
-    case "options_scheduled":
-      return await handleOptionsScheduledText(ctx, state, text);
+    case "options_scheduled_custom_date":
+      return await handleCustomScheduledDateText(ctx, state, text);
+    case "options_scheduled_custom_time":
+      return await handleCustomScheduledTimeText(ctx, state, text);
     case "options_minage":
       return await handleOptionsMinAgeText(ctx, state, text);
     case "options_cooldown":
@@ -409,18 +431,22 @@ async function handlePrizeStep(
     keyboard
       .text(`${prizes.length} (match prizes)`, `wiz_winners_${prizes.length}`)
       .row();
-    const options = [1, 2, 3, 5, 10].filter((n) => n !== prizes.length);
-    for (const n of options.slice(0, 4)) {
-      keyboard.text(`${n}`, `wiz_winners_${n}`);
-    }
-  } else {
-    keyboard
-      .text("1", "wiz_winners_1")
-      .text("2", "wiz_winners_2")
-      .text("3", "wiz_winners_3")
-      .text("5", "wiz_winners_5")
-      .text("10", "wiz_winners_10");
   }
+  // 1-10 quick picks in two rows of 5
+  keyboard
+    .text("1", "wiz_winners_1")
+    .text("2", "wiz_winners_2")
+    .text("3", "wiz_winners_3")
+    .text("4", "wiz_winners_4")
+    .text("5", "wiz_winners_5")
+    .row()
+    .text("6", "wiz_winners_6")
+    .text("7", "wiz_winners_7")
+    .text("8", "wiz_winners_8")
+    .text("9", "wiz_winners_9")
+    .text("10", "wiz_winners_10")
+    .row()
+    .text("✏️ Custom (1-50)", "wiz_winners_custom");
 
   await ctx.reply(
     `✅ Prizes:\n${prizeDisplay}\n\n` +
@@ -467,6 +493,66 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
       `The raffle will auto-draw when time runs out.`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
+}
+
+export async function handleWinnersCustomCallback(ctx: Context): Promise<void> {
+  if (!ctx.from) return;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state || state.step !== "winners") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  state.step = "winners_custom";
+  await ctx.answerCallbackQuery();
+
+  const promptText =
+    `✏️ <b>Custom number of winners</b>\n\n` +
+    `Type a number between <b>1</b> and <b>50</b>, then press send.`;
+
+  // Send a fresh message — more reliable than editing across all message types
+  try {
+    await ctx.reply(promptText, { parse_mode: "HTML" });
+  } catch (err) {
+    console.error("Failed to send custom winners prompt:", err);
+  }
+}
+
+async function handleCustomWinnersStep(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const num = parseInt(text, 10);
+  if (isNaN(num) || num < 1 || num > 50) {
+    await ctx.reply("Please enter a number between <b>1</b> and <b>50</b>.", { parse_mode: "HTML" });
+    return true;
+  }
+
+  state.maxWinners = num;
+  state.step = "time";
+
+  const keyboard = new InlineKeyboard()
+    .text("15 min", "wiz_time_15m")
+    .text("30 min", "wiz_time_30m")
+    .text("1 hour", "wiz_time_1h")
+    .row()
+    .text("2 hours", "wiz_time_2h")
+    .text("6 hours", "wiz_time_6h")
+    .text("1 day", "wiz_time_1d")
+    .row()
+    .text("⏱ Custom time", "wiz_time_custom")
+    .row()
+    .text("No time limit", "wiz_time_none");
+
+  await ctx.reply(
+    `✅ Winners: <b>${num}</b>\n\n` +
+      `Step 4 of 4: Set a <b>time limit</b>?\n\n` +
+      `The raffle will auto-draw when time runs out.`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+  return true;
 }
 
 export async function handleTimeCallback(ctx: Context): Promise<void> {
@@ -563,7 +649,9 @@ function buildOptionsText(state: WizardState): string {
 
   if (state.startsAt) {
     const startsDate = new Date(state.startsAt + "Z");
-    msg += `🕐 <b>Delayed start:</b> ${formatCountdown(startsDate).replace(" remaining", "")} ✅\n`;
+    const tz = state.scheduledTimezone || db.getChatTimezone(state.targetChatId);
+    const wall = formatInTimezone(startsDate, tz);
+    msg += `🕐 <b>Delayed start:</b> ${formatCountdown(startsDate).replace(" remaining", "")} <i>(${escapeHtml(wall)})</i> ✅\n`;
   } else {
     msg += `🕐 <b>Delayed start:</b> Opens immediately\n`;
   }
@@ -612,6 +700,11 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
     state.startsAt ? "🕐 Change Start" : "🕐 Delay Start",
     "wiz_opt_sched"
   );
+  kb.row();
+  // Timezone button — shows current TZ so admins know what their times will display in.
+  // Tapping opens the same picker used by Delay Start.
+  const effectiveTz = state.scheduledTimezone || db.getChatTimezone(state.targetChatId);
+  kb.text(`🌐 Timezone: ${effectiveTz}`, "wiz_opt_tz");
   kb.row();
   kb.text(
     state.autoPin ? "📌 Pin: On" : "📌 Pin: Off",
@@ -663,6 +756,235 @@ async function sendOptionsScreen(
   });
 }
 
+/**
+ * Handles the scheduled-start date/time picker callbacks:
+ *   wiz_sched_date:<YYYY-MM-DD>  - date selected, show time picker
+ *   wiz_sched_custom_date        - prompt for custom date text input
+ *   wiz_sched_skip               - clear start time, return to options
+ *   wiz_sched_time:<HH:MM>       - time selected (uses chat's timezone)
+ *   wiz_sched_custom_time        - prompt for custom time text input
+ */
+/**
+ * Handles the new calendar/clock/timezone picker callbacks (prefix `wsc:`):
+ *   wsc:cal:<YYYY-MM>    - render calendar for that month
+ *   wsc:day:<YYYY-MM-DD> - day selected, go to hour picker
+ *   wsc:hour:<HH>        - hour selected, go to minute picker
+ *   wsc:min:<MM>         - minute selected, compute UTC and finalize
+ *   wsc:tz               - open timezone picker
+ *   wsc:tz:<IANA>        - timezone selected, return to calendar
+ *   wsc:back:cal         - back to calendar from time/tz pickers
+ *   wsc:back:hour        - back to hour picker from minute picker
+ *   wsc:skip             - skip scheduled start
+ *   wsc:noop             - no-op (header/empty cells)
+ *   wsc:past             - tapped a past date — show toast
+ */
+export async function handleCalendarPickerCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state) {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  // Default tz if somehow missing
+  if (!state.scheduledTimezone) {
+    state.scheduledTimezone = db.getChatTimezone(state.targetChatId);
+  }
+
+  if (data === "wsc:noop") {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  if (data === "wsc:past") {
+    await ctx.answerCallbackQuery({ text: "That date is in the past — pick a future date.", show_alert: false });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  if (data === "wsc:skip") {
+    state.startsAt = null;
+    state.scheduledDate = undefined;
+    state.scheduledHour = undefined;
+    await sendOptionsScreen(ctx, state);
+    return;
+  }
+
+  if (data === "wsc:tz") {
+    await sendScheduledTimezonePicker(ctx, state);
+    return;
+  }
+
+  if (data === "wsc:back:cal") {
+    state.scheduledHour = undefined;
+    await sendScheduledCalendar(ctx, state);
+    return;
+  }
+
+  if (data === "wsc:back:hour") {
+    await sendScheduledHourPicker(ctx, state);
+    return;
+  }
+
+  // wsc:tz:<IANA>  (must check BEFORE wsc:tz prefix)
+  const tzMatch = data.match(/^wsc:tz:(.+)$/);
+  if (tzMatch) {
+    const { resolveTimezone } = await import("./timezone");
+    const resolved = resolveTimezone(tzMatch[1]);
+    if (!resolved) {
+      await ctx.reply(`Unknown timezone: ${tzMatch[1]}`);
+      return;
+    }
+    state.scheduledTimezone = resolved;
+    // After picking timezone, return to calendar (which will use the new tz)
+    await sendScheduledCalendar(ctx, state);
+    return;
+  }
+
+  // wsc:cal:<YYYY-MM>
+  const calMatch = data.match(/^wsc:cal:(\d{4})-(\d{2})$/);
+  if (calMatch) {
+    await sendScheduledCalendar(ctx, state, parseInt(calMatch[1], 10), parseInt(calMatch[2], 10));
+    return;
+  }
+
+  // wsc:day:<YYYY-MM-DD>
+  const dayMatch = data.match(/^wsc:day:(\d{4}-\d{2}-\d{2})$/);
+  if (dayMatch) {
+    state.scheduledDate = dayMatch[1];
+    state.scheduledHour = undefined;
+    await sendScheduledHourPicker(ctx, state);
+    return;
+  }
+
+  // wsc:hour:<HH>
+  const hourMatch = data.match(/^wsc:hour:(\d{2})$/);
+  if (hourMatch) {
+    state.scheduledHour = parseInt(hourMatch[1], 10);
+    await sendScheduledMinutePicker(ctx, state);
+    return;
+  }
+
+  // wsc:min:<MM>
+  const minMatch = data.match(/^wsc:min:(\d{2})$/);
+  if (minMatch) {
+    if (!state.scheduledDate || state.scheduledHour === undefined) {
+      await sendScheduledCalendar(ctx, state);
+      return;
+    }
+    const { buildUtcDateFromLocal } = await import("./timezone");
+    const tz = state.scheduledTimezone || "UTC";
+    const timeStr = `${String(state.scheduledHour).padStart(2, "0")}:${minMatch[1]}`;
+    const utc = buildUtcDateFromLocal(state.scheduledDate, timeStr, tz);
+    if (!utc) {
+      await ctx.reply(`Could not compute start time for ${state.scheduledDate} ${timeStr} in ${tz}.`);
+      return;
+    }
+    if (utc.getTime() <= Date.now()) {
+      await ctx.reply(
+        `That time has already passed in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
+        { parse_mode: "HTML" }
+      );
+      await sendScheduledHourPicker(ctx, state);
+      return;
+    }
+    state.startsAt = utc.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+    state.scheduledDate = undefined;
+    state.scheduledHour = undefined;
+    // Keep scheduledTimezone so subsequent edits reuse it
+    await sendOptionsScreen(ctx, state);
+    return;
+  }
+
+  // Unknown — silently ignore
+}
+
+export async function handleSchedPickerCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  const state = getActiveWizard(ctx.from.id);
+  if (!state) {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  if (data === "wiz_sched_skip") {
+    state.startsAt = null;
+    state.scheduledDate = undefined;
+    await sendOptionsScreen(ctx, state);
+    return;
+  }
+
+  if (data === "wiz_sched_custom_date") {
+    state.step = "options_scheduled_custom_date";
+    const tz = db.getChatTimezone(state.targetChatId);
+    await ctx.editMessageText(
+      `✏️ Type the <b>date</b> in <code>YYYY-MM-DD</code> format (e.g. <code>2026-12-31</code>).\n\n` +
+        `<i>Group timezone: ${escapeHtml(tz)}</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "wiz_sched_custom_time") {
+    if (!state.scheduledDate) {
+      await ctx.reply("Date wasn't selected. Try /newraffle again.");
+      return;
+    }
+    state.step = "options_scheduled_custom_time";
+    const tz = db.getChatTimezone(state.targetChatId);
+    await ctx.editMessageText(
+      `📅 Date: <b>${escapeHtml(state.scheduledDate)}</b>\n\n` +
+        `✏️ Type the <b>time</b> in <code>HH:MM</code> (24h, e.g. <code>18:30</code>) or <code>H:MM AM/PM</code> (e.g. <code>6:30 PM</code>).\n\n` +
+        `<i>Group timezone: ${escapeHtml(tz)}</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const dateMatch = data.match(/^wiz_sched_date:(\d{4}-\d{2}-\d{2})$/);
+  if (dateMatch) {
+    state.scheduledDate = dateMatch[1];
+    await sendScheduledTimePicker(ctx, state);
+    return;
+  }
+
+  const timeMatch = data.match(/^wiz_sched_time:(\d{2}:\d{2})$/);
+  if (timeMatch) {
+    if (!state.scheduledDate) {
+      await ctx.reply("Date wasn't selected. Try /newraffle again.");
+      return;
+    }
+    const { buildUtcDateFromLocal } = await import("./timezone");
+    const tz = db.getChatTimezone(state.targetChatId);
+    const utc = buildUtcDateFromLocal(state.scheduledDate, timeMatch[1], tz);
+    if (!utc) {
+      await ctx.reply(`Could not compute start time for ${state.scheduledDate} ${timeMatch[1]} in ${tz}.`);
+      return;
+    }
+    if (utc.getTime() <= Date.now()) {
+      await ctx.reply(
+        `That time has already passed in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
+        { parse_mode: "HTML" }
+      );
+      // Re-show the time picker
+      await sendScheduledTimePicker(ctx, state);
+      return;
+    }
+    state.startsAt = utc.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+    state.scheduledDate = undefined;
+    await sendOptionsScreen(ctx, state);
+    return;
+  }
+
+  // Unknown — silently ignore
+}
+
 export async function handleOptionsCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
   if (!data || !ctx.from) return;
@@ -711,16 +1033,25 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
       );
       break;
 
-    case "wiz_opt_sched":
-      state.step = "options_scheduled";
-      await ctx.editMessageText(
-        `🕐 When should the raffle <b>open for entries</b>?\n\n` +
-          `Type a delay like: <code>30m</code>, <code>2h</code>, <code>1d</code>\n` +
-          `Or a specific time: <code>2025-12-31 18:00</code>\n\n` +
-          `<i>Type <code>skip</code> to open immediately.</i>`,
-        { parse_mode: "HTML" }
-      );
+    case "wiz_opt_sched": {
+      // Default the per-raffle timezone to the chat's stored timezone the first time
+      if (!state.scheduledTimezone) {
+        state.scheduledTimezone = db.getChatTimezone(state.targetChatId);
+      }
+      await sendScheduledCalendar(ctx, state);
       break;
+    }
+
+    case "wiz_opt_tz": {
+      // Standalone timezone picker (no schedule flow) — admin just wants to set
+      // the display timezone for this raffle. After picking, return to options
+      // screen and save as group default too so future raffles inherit it.
+      if (!state.scheduledTimezone) {
+        state.scheduledTimezone = db.getChatTimezone(state.targetChatId);
+      }
+      await sendStandaloneTimezonePicker(ctx, state);
+      break;
+    }
 
     case "wiz_opt_requser":
       state.requireUsername = !state.requireUsername;
@@ -831,35 +1162,405 @@ async function handleOptionsSponsorText(
   return true;
 }
 
-async function handleOptionsScheduledText(
+/**
+ * Custom-date text input — accepts "YYYY-MM-DD" or short forms like "12/31",
+ * "Dec 31", "tomorrow", or "next Friday". Once we have a date, advance to time picker.
+ */
+async function handleCustomScheduledDateText(
   ctx: Context,
   state: WizardState,
   text: string
 ): Promise<boolean> {
-  if (text.toLowerCase() === "skip") {
-    state.startsAt = null;
+  const { resolveTimezone } = await import("./timezone");
+  const tz = db.getChatTimezone(state.targetChatId);
+
+  // Accept strict YYYY-MM-DD
+  const ymd = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (ymd) {
+    const m = String(ymd[2]).padStart(2, "0");
+    const d = String(ymd[3]).padStart(2, "0");
+    state.scheduledDate = `${ymd[1]}-${m}-${d}`;
+    await sendScheduledTimePicker(ctx, state);
+    return true;
+  }
+
+  await ctx.reply(
+    `Couldn't parse "<code>${escapeHtml(text)}</code>" as a date.\n\n` +
+      `Type the date in <code>YYYY-MM-DD</code> format (e.g., <code>2026-12-31</code>).\n` +
+      `<i>Group timezone: ${escapeHtml(tz)}</i>`,
+    { parse_mode: "HTML" }
+  );
+  // Silence unused-import warning (resolveTimezone reserved for future fuzzy parsing)
+  void resolveTimezone;
+  return true;
+}
+
+/**
+ * Custom-time text input — accepts "HH:MM" (24h) or "H:MM AM/PM".
+ * Combines with state.scheduledDate to compute the UTC start time.
+ */
+async function handleCustomScheduledTimeText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const { buildUtcDateFromLocal } = await import("./timezone");
+  const tz = db.getChatTimezone(state.targetChatId);
+
+  if (!state.scheduledDate) {
+    // Shouldn't happen — defensive fallback
     await sendOptionsScreen(ctx, state);
     return true;
   }
 
-  const parsed = parseEndTime(text);
-  if (!parsed) {
+  // Normalize: accept "6pm", "6 PM", "18:00", "6:30 PM", "6:30pm"
+  let normalized = text.trim().toLowerCase();
+  let hh: number | null = null;
+  let mm: number | null = null;
+
+  const hm24 = normalized.match(/^(\d{1,2}):(\d{2})$/);
+  if (hm24) {
+    hh = parseInt(hm24[1], 10);
+    mm = parseInt(hm24[2], 10);
+  } else {
+    const hm12 = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/);
+    if (hm12) {
+      let h = parseInt(hm12[1], 10);
+      const m = hm12[2] ? parseInt(hm12[2], 10) : 0;
+      const period = hm12[3];
+      if (h === 12) h = 0;
+      if (period === "pm") h += 12;
+      hh = h;
+      mm = m;
+    }
+  }
+
+  if (hh === null || mm === null || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
     await ctx.reply(
-      `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
-        `Use formats like: <code>30m</code>, <code>2h</code>, <code>1d</code>`,
+      `Couldn't parse "<code>${escapeHtml(text)}</code>" as a time.\n\n` +
+        `Use 24h <code>HH:MM</code> (e.g. <code>18:30</code>) or 12h <code>H:MM AM/PM</code> (e.g. <code>6:30 PM</code>).\n` +
+        `<i>Group timezone: ${escapeHtml(tz)}</i>`,
       { parse_mode: "HTML" }
     );
     return true;
   }
 
-  state.startsAt = parsed
-    .toISOString()
-    .replace("T", " ")
-    .replace("Z", "")
-    .split(".")[0];
+  const timeStr = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  const utc = buildUtcDateFromLocal(state.scheduledDate, timeStr, tz);
+  if (!utc) {
+    await ctx.reply(
+      `Could not compute start time for ${escapeHtml(state.scheduledDate)} ${escapeHtml(timeStr)} in ${escapeHtml(tz)}.`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
 
+  if (utc.getTime() <= Date.now()) {
+    await ctx.reply(
+      `That time is in the past in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  state.startsAt = utc.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+  state.scheduledDate = undefined;
   await sendOptionsScreen(ctx, state);
   return true;
+}
+
+/** Render the time picker keyboard after the date is chosen. */
+async function sendScheduledTimePicker(ctx: Context, state: WizardState): Promise<void> {
+  // Legacy fallback path — defer to new clock picker
+  await sendScheduledHourPicker(ctx, state);
+}
+
+// ============================================================
+// Calendar / Clock / Timezone Picker
+// ============================================================
+//
+// Three stages:
+//   1. Calendar — month grid, navigate prev/next, tap a day
+//   2. Clock — 24 hour-buttons (12 AM..11 PM) in a 3-col grid
+//   3. Minute — :00 / :05 / .. / :55 in a 4-col grid
+//
+// A "[🌐 Change timezone]" button on every screen swaps to the timezone
+// picker, which returns the user to the same stage with their pick applied.
+//
+// All callback data uses the `wsc:` (wizard schedule calendar) prefix to
+// avoid clashes with the older `wiz_sched_*` callbacks.
+
+/** Render the calendar for the given year/month (defaults to current month in user's tz). */
+async function sendScheduledCalendar(
+  ctx: Context,
+  state: WizardState,
+  year?: number,
+  month?: number
+): Promise<void> {
+  const { buildCalendar } = await import("./calendar");
+  const { getNextNDates, formatInTimezone } = await import("./timezone");
+  const tz = state.scheduledTimezone || "UTC";
+  state.step = "options_scheduled_cal";
+
+  // Determine today's wall clock in the target tz
+  const [todayYmd] = getNextNDates(tz, 1);
+  let viewYear = year;
+  let viewMonth = month;
+  if (viewYear === undefined || viewMonth === undefined) {
+    const [y, m] = todayYmd.split("-").map(Number);
+    viewYear = y;
+    viewMonth = m;
+  }
+
+  const grid = buildCalendar(viewYear, viewMonth, todayYmd, 12);
+
+  const kb = new InlineKeyboard();
+  for (const row of grid.rows) {
+    for (const cell of row) {
+      switch (cell.kind) {
+        case "nav-prev":
+          kb.text(cell.label, `wsc:cal:${cell.toYear}-${String(cell.toMonth).padStart(2, "0")}`);
+          break;
+        case "nav-next":
+          kb.text(cell.label, `wsc:cal:${cell.toYear}-${String(cell.toMonth).padStart(2, "0")}`);
+          break;
+        case "nav-title":
+          kb.text(cell.label, "wsc:noop");
+          break;
+        case "weekday-header":
+          kb.text(cell.label, "wsc:noop");
+          break;
+        case "empty":
+          kb.text(" ", "wsc:noop");
+          break;
+        case "day":
+          if (cell.inPast) {
+            kb.text("·", "wsc:past");
+          } else {
+            kb.text(cell.label, `wsc:day:${cell.date}`);
+          }
+          break;
+      }
+    }
+    kb.row();
+  }
+  kb.text("🌐 Change timezone", "wsc:tz").row();
+  kb.text("⏭ Skip (open now)", "wsc:skip");
+
+  const nowStr = formatInTimezone(new Date(), tz);
+  const body =
+    `🗓 <b>Schedule the raffle start</b>\n\n` +
+    `Timezone: <code>${escapeHtml(tz)}</code> (now: ${escapeHtml(nowStr)})\n\n` +
+    `Pick a <b>date</b>:`;
+
+  try {
+    await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
+  } catch {
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+  }
+}
+
+/** Render hour picker (24 hours in AM/PM labels, 3 columns). */
+async function sendScheduledHourPicker(ctx: Context, state: WizardState): Promise<void> {
+  if (!state.scheduledDate) {
+    await sendScheduledCalendar(ctx, state);
+    return;
+  }
+  const tz = state.scheduledTimezone || "UTC";
+  state.step = "options_scheduled_hour";
+
+  const kb = new InlineKeyboard();
+  // 24 hours in 3 columns
+  for (let h = 0; h < 24; h++) {
+    const label = formatHourLabel(h);
+    kb.text(label, `wsc:hour:${String(h).padStart(2, "0")}`);
+    if ((h + 1) % 3 === 0) kb.row();
+  }
+  kb.text("🌐 Change timezone", "wsc:tz").row();
+  kb.text("⬅️ Back to calendar", "wsc:back:cal");
+
+  const body =
+    `📅 Date: <b>${escapeHtml(state.scheduledDate)}</b>\n` +
+    `Timezone: <code>${escapeHtml(tz)}</code>\n\n` +
+    `Pick the <b>hour</b>:`;
+
+  try {
+    await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
+  } catch {
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+  }
+}
+
+/** Render minute picker (5-minute increments). */
+async function sendScheduledMinutePicker(ctx: Context, state: WizardState): Promise<void> {
+  if (!state.scheduledDate || state.scheduledHour === undefined) {
+    await sendScheduledHourPicker(ctx, state);
+    return;
+  }
+  const tz = state.scheduledTimezone || "UTC";
+  state.step = "options_scheduled_min";
+
+  const kb = new InlineKeyboard();
+  // 5-min increments in 4 columns
+  for (let m = 0; m < 60; m += 5) {
+    kb.text(`:${String(m).padStart(2, "0")}`, `wsc:min:${String(m).padStart(2, "0")}`);
+    if (((m / 5) + 1) % 4 === 0) kb.row();
+  }
+  kb.text("🌐 Change timezone", "wsc:tz").row();
+  kb.text("⬅️ Back to hour", "wsc:back:hour");
+
+  const body =
+    `📅 Date: <b>${escapeHtml(state.scheduledDate)}</b>\n` +
+    `🕐 Hour: <b>${escapeHtml(formatHourLabel(state.scheduledHour))}</b>\n` +
+    `Timezone: <code>${escapeHtml(tz)}</code>\n\n` +
+    `Pick the <b>minute</b>:`;
+
+  try {
+    await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
+  } catch {
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+  }
+}
+
+/** Render timezone picker (common ones first). */
+async function sendScheduledTimezonePicker(ctx: Context, state: WizardState): Promise<void> {
+  const { formatInTimezone } = await import("./timezone");
+  state.step = "options_scheduled_tz";
+
+  const current = state.scheduledTimezone || "UTC";
+  const commonTzs: Array<{ label: string; tz: string }> = [
+    { label: "🇺🇸 Eastern (ET)", tz: "America/New_York" },
+    { label: "🇺🇸 Central (CT)", tz: "America/Chicago" },
+    { label: "🇺🇸 Mountain (MT)", tz: "America/Denver" },
+    { label: "🇺🇸 Pacific (PT)", tz: "America/Los_Angeles" },
+    { label: "🇺🇸 Alaska (AKT)", tz: "America/Anchorage" },
+    { label: "🇺🇸 Hawaii (HST)", tz: "Pacific/Honolulu" },
+    { label: "🌍 UTC", tz: "UTC" },
+    { label: "🇬🇧 London (GMT/BST)", tz: "Europe/London" },
+    { label: "🇪🇺 Paris (CET)", tz: "Europe/Paris" },
+    { label: "🇯🇵 Tokyo (JST)", tz: "Asia/Tokyo" },
+    { label: "🇦🇺 Sydney (AET)", tz: "Australia/Sydney" },
+    { label: "🇮🇳 India (IST)", tz: "Asia/Kolkata" },
+  ];
+
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < commonTzs.length; i++) {
+    const t = commonTzs[i];
+    const marker = t.tz === current ? " ✓" : "";
+    kb.text(`${t.label}${marker}`, `wsc:tz:${t.tz}`);
+    if (i % 2 === 1) kb.row();
+  }
+  if (commonTzs.length % 2 === 1) kb.row();
+  kb.text("⬅️ Back", "wsc:back:cal");
+
+  const nowStr = formatInTimezone(new Date(), current);
+  const body =
+    `🌐 <b>Pick a timezone for this raffle</b>\n\n` +
+    `Current: <code>${escapeHtml(current)}</code> (now: ${escapeHtml(nowStr)})\n\n` +
+    `<i>Don't see yours? Set it for the whole group with /timezone.</i>`;
+
+  try {
+    await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
+  } catch {
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+  }
+}
+
+function formatHourLabel(h: number): string {
+  if (h === 0) return "12 AM";
+  if (h === 12) return "12 PM";
+  if (h < 12) return `${h} AM`;
+  return `${h - 12} PM`;
+}
+
+/**
+ * Standalone timezone picker reachable from the options screen (not from the
+ * schedule flow). After a tz is picked, also save it as the group's default
+ * so the admin doesn't need to set it again for every raffle.
+ *
+ * Callback prefix: `wotz:` (wizard options timezone) so it doesn't collide
+ * with the schedule-flow tz picker.
+ */
+async function sendStandaloneTimezonePicker(ctx: Context, state: WizardState): Promise<void> {
+  const { formatInTimezone } = await import("./timezone");
+  state.step = "options_scheduled_tz";
+
+  const current = state.scheduledTimezone || db.getChatTimezone(state.targetChatId);
+  const commonTzs: Array<{ label: string; tz: string }> = [
+    { label: "🇺🇸 Eastern (ET)", tz: "America/New_York" },
+    { label: "🇺🇸 Central (CT)", tz: "America/Chicago" },
+    { label: "🇺🇸 Mountain (MT)", tz: "America/Denver" },
+    { label: "🇺🇸 Pacific (PT)", tz: "America/Los_Angeles" },
+    { label: "🇺🇸 Alaska (AKT)", tz: "America/Anchorage" },
+    { label: "🇺🇸 Hawaii (HST)", tz: "Pacific/Honolulu" },
+    { label: "🌍 UTC", tz: "UTC" },
+    { label: "🇬🇧 London (GMT/BST)", tz: "Europe/London" },
+    { label: "🇪🇺 Paris (CET)", tz: "Europe/Paris" },
+    { label: "🇯🇵 Tokyo (JST)", tz: "Asia/Tokyo" },
+    { label: "🇦🇺 Sydney (AET)", tz: "Australia/Sydney" },
+    { label: "🇮🇳 India (IST)", tz: "Asia/Kolkata" },
+  ];
+
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < commonTzs.length; i++) {
+    const t = commonTzs[i];
+    const marker = t.tz === current ? " ✓" : "";
+    kb.text(`${t.label}${marker}`, `wotz:${t.tz}`);
+    if (i % 2 === 1) kb.row();
+  }
+  if (commonTzs.length % 2 === 1) kb.row();
+  kb.text("⬅️ Back to options", "wotz:back");
+
+  const nowStr = formatInTimezone(new Date(), current);
+  const body =
+    `🌐 <b>Group timezone</b>\n\n` +
+    `Current: <code>${escapeHtml(current)}</code> (now: ${escapeHtml(nowStr)})\n\n` +
+    `Pick a timezone — it'll apply to <b>this raffle</b> and become the group's default for future raffles.\n\n` +
+    `<i>Don't see yours? Admins can also use /timezone &lt;name&gt; in the group.</i>`;
+
+  try {
+    await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
+  } catch {
+    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+  }
+}
+
+/**
+ * Handle the `wotz:*` callbacks: pick a timezone, persist it as the group default,
+ * apply to this raffle's wizard state, and return to the options screen.
+ */
+export async function handleStandaloneTzCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+  const state = getActiveWizard(ctx.from.id);
+  if (!state) {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+  await ctx.answerCallbackQuery();
+
+  if (data === "wotz:back") {
+    await sendOptionsScreen(ctx, state);
+    return;
+  }
+
+  const m = data.match(/^wotz:(.+)$/);
+  if (!m) return;
+  const { resolveTimezone } = await import("./timezone");
+  const resolved = resolveTimezone(m[1]);
+  if (!resolved) {
+    await ctx.reply(`Unknown timezone: ${m[1]}`);
+    return;
+  }
+
+  // Apply to this raffle AND persist as the group's default
+  state.scheduledTimezone = resolved;
+  try {
+    db.setChatTimezone(state.targetChatId, resolved);
+  } catch (err) {
+    console.error("Failed to persist chat timezone:", err);
+  }
+  await sendOptionsScreen(ctx, state);
 }
 
 async function handleOptionsMinAgeText(
@@ -950,6 +1651,11 @@ async function createRaffleFromWizard(
     max_winners: state.maxWinners || 1,
     ends_at: state.endsAt || null,
     starts_at: state.startsAt || null,
+    // Snapshot the timezone the admin picked (or the group's default) onto
+    // the raffle. This way every raffle has a concrete display timezone and
+    // changing the group default later doesn't retroactively shift existing
+    // raffles' wall-clock displays.
+    display_timezone: state.scheduledTimezone || db.getChatTimezone(state.targetChatId),
     required_chat_id: null,
     required_chat_title: null,
     sponsor_name: state.sponsorName || null,
@@ -1537,6 +2243,7 @@ interface TemplateWizardState {
     | "title"
     | "prize"
     | "winners"
+    | "winners_custom"
     | "time"
     | "time_custom"
     | "options"
@@ -1647,6 +2354,8 @@ export async function handleTemplateWizardMessage(
       return await handleTmplTitleStep(ctx, state, text);
     case "prize":
       return await handleTmplPrizeStep(ctx, state, text);
+    case "winners_custom":
+      return await handleTmplCustomWinnersStep(ctx, state, text);
     case "time_custom":
       return await handleTmplCustomTimeStep(ctx, state, text);
     case "options_sponsor":
@@ -1729,18 +2438,22 @@ async function handleTmplPrizeStep(
     keyboard
       .text(`${prizes.length} (match prizes)`, `twiz_winners_${prizes.length}`)
       .row();
-    const options = [1, 2, 3, 5, 10].filter((n) => n !== prizes.length);
-    for (const n of options.slice(0, 4)) {
-      keyboard.text(`${n}`, `twiz_winners_${n}`);
-    }
-  } else {
-    keyboard
-      .text("1", "twiz_winners_1")
-      .text("2", "twiz_winners_2")
-      .text("3", "twiz_winners_3")
-      .text("5", "twiz_winners_5")
-      .text("10", "twiz_winners_10");
   }
+  // 1-10 quick picks in two rows of 5
+  keyboard
+    .text("1", "twiz_winners_1")
+    .text("2", "twiz_winners_2")
+    .text("3", "twiz_winners_3")
+    .text("4", "twiz_winners_4")
+    .text("5", "twiz_winners_5")
+    .row()
+    .text("6", "twiz_winners_6")
+    .text("7", "twiz_winners_7")
+    .text("8", "twiz_winners_8")
+    .text("9", "twiz_winners_9")
+    .text("10", "twiz_winners_10")
+    .row()
+    .text("✏️ Custom (1-50)", "twiz_winners_custom");
 
   let prizeDisplay: string;
   if (prizes.length > 1) {
@@ -1803,6 +2516,65 @@ export async function handleTmplWinnersCallback(ctx: Context): Promise<void> {
       `Each raffle created from this template will run for this long.`,
     { parse_mode: "HTML", reply_markup: keyboard }
   );
+}
+
+export async function handleTmplWinnersCustomCallback(ctx: Context): Promise<void> {
+  if (!ctx.from) return;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state || state.step !== "winners") {
+    await ctx.answerCallbackQuery({ text: "This wizard has expired.", show_alert: true });
+    return;
+  }
+
+  state.step = "winners_custom";
+  await ctx.answerCallbackQuery();
+
+  const promptText =
+    `✏️ <b>Custom number of winners</b>\n\n` +
+    `Type a number between <b>1</b> and <b>50</b>, then press send.`;
+
+  try {
+    await ctx.reply(promptText, { parse_mode: "HTML" });
+  } catch (err) {
+    console.error("Failed to send template custom winners prompt:", err);
+  }
+}
+
+async function handleTmplCustomWinnersStep(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const num = parseInt(text, 10);
+  if (isNaN(num) || num < 1 || num > 50) {
+    await ctx.reply("Please enter a number between <b>1</b> and <b>50</b>.", { parse_mode: "HTML" });
+    return true;
+  }
+
+  state.maxWinners = num;
+  state.step = "time";
+
+  const keyboard = new InlineKeyboard()
+    .text("15 min", "twiz_time_15m")
+    .text("30 min", "twiz_time_30m")
+    .text("1 hour", "twiz_time_1h")
+    .row()
+    .text("2 hours", "twiz_time_2h")
+    .text("6 hours", "twiz_time_6h")
+    .text("1 day", "twiz_time_1d")
+    .row()
+    .text("⏱ Custom time", "twiz_time_custom")
+    .row()
+    .text("No time limit", "twiz_time_none");
+
+  await ctx.reply(
+    `✅ Winners: <b>${num}</b>\n\n` +
+      `Step 5 of 5: Set a <b>default duration</b>?\n\n` +
+      `Each raffle created from this template will run for this long.`,
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+  return true;
 }
 
 export async function handleTmplTimeCallback(ctx: Context): Promise<void> {

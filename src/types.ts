@@ -13,6 +13,12 @@ export interface Raffle {
   ends_at: string | null;
   /** When the raffle opens for entry (null = immediately) */
   starts_at: string | null;
+  /**
+   * Timezone to display times in on this raffle's posts (e.g. "America/New_York").
+   * NULL means fall back to the chat's timezone (which defaults to UTC).
+   * Set when the user picks a timezone in the schedule wizard.
+   */
+  display_timezone: string | null;
   status: "open" | "closed" | "drawn";
   message_id: number | null;
   /** Forum topic/thread ID (null = general/main thread) */
@@ -45,6 +51,16 @@ export interface Raffle {
   revoke_referral_links: number;
   created_at: string;
   drawn_at: string | null;
+  /** Whether the winner announcement was successfully posted (0 = no, 1 = yes) */
+  announced: number;
+  /** How many times we've tried to send the winner announcement */
+  announce_attempts: number;
+  /** ISO timestamp of the most recent announce attempt */
+  last_announce_at: string | null;
+  /** Whether announcement has been permanently abandoned after repeated failures */
+  announce_failed: number;
+  /** Whether we've already DM'd the owner about this raffle being stuck */
+  owner_alerted: number;
 }
 
 export interface RaffleEntry {
@@ -81,6 +97,8 @@ export interface CreateRaffleInput {
   max_winners: number;
   ends_at: string | null;
   starts_at: string | null;
+  /** Per-raffle display timezone (e.g. picked in wizard). Null = use chat default. */
+  display_timezone: string | null;
   required_chat_id: number | null;
   required_chat_title: string | null;
   sponsor_name: string | null;

@@ -32,6 +32,48 @@ function setupRoutes(app, db, resolver) {
     res.redirect('/login');
   }
 
+  // ── Control tower admin API (X-Admin-Key gated; separate from dashboard login) ──
+  function adminOk(req) {
+    const k = process.env.ADMIN_KEY;
+    return !!k && req.header('x-admin-key') === k;
+  }
+  app.get('/admin/summary', (req, res) => {
+    if (!adminOk(req)) return res.status(403).json({ error: 'forbidden' });
+    const s = db.getStats() || {};
+    res.json({
+      bot: 'randomizer',
+      display: 'Ultimate Randomizer',
+      groups: s.total_guilds || 0,
+      subs: null,
+      mrr: null,
+      usage: {
+        'Servers': s.total_guilds || 0,
+        'Total raffles': s.total_raffles || 0,
+        'Active raffles': s.active_raffles || 0,
+        'Completed': s.completed_raffles || 0,
+        'Cancelled': s.cancelled_raffles || 0,
+      },
+      errors_24h: 0,
+      recent_errors: [],
+      webhook: null,
+      healthy: true,
+      generated_at: Math.floor(Date.now() / 1000),
+    });
+  });
+  app.get('/admin/groups', (req, res) => {
+    if (!adminOk(req)) return res.status(403).json({ error: 'forbidden' });
+    const rows = db.getAllGuilds() || [];
+    const groups = rows.map((g) => ({
+      chat_id: g.guild_id,
+      title: 'Server ' + g.guild_id,
+      raffles: g.raffle_count,
+      active: g.active_count,
+      completed: g.completed_count,
+      last_raffle: g.last_raffle,
+    }));
+    res.json({ count: groups.length, groups });
+  });
+
   // Login
   app.get('/login', (req, res) => {
     if (req.session && req.session.authenticated) return res.redirect('/');

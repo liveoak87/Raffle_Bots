@@ -40,14 +40,17 @@ function setupRoutes(app, db, resolver) {
   app.get('/admin/summary', (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'forbidden' });
     const s = db.getStats() || {};
+    // Live guild count (servers the bot is actually in) — matches the bot's /status,
+    // not just servers that have run a raffle (db.total_guilds).
+    const servers = resolver && resolver.client ? resolver.client.guilds.cache.size : (s.total_guilds || 0);
     res.json({
       bot: 'randomizer',
       display: 'Ultimate Randomizer',
-      groups: s.total_guilds || 0,
+      groups: servers,
       subs: null,
       mrr: null,
       usage: {
-        'Servers': s.total_guilds || 0,
+        'Servers': servers,
         'Total raffles': s.total_raffles || 0,
         'Active raffles': s.active_raffles || 0,
         'Completed': s.completed_raffles || 0,
@@ -62,15 +65,34 @@ function setupRoutes(app, db, resolver) {
   });
   app.get('/admin/groups', (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'forbidden' });
-    const rows = db.getAllGuilds() || [];
-    const groups = rows.map((g) => ({
-      chat_id: g.guild_id,
-      title: 'Server ' + g.guild_id,
-      raffles: g.raffle_count,
-      active: g.active_count,
-      completed: g.completed_count,
-      last_raffle: g.last_raffle,
-    }));
+    const dbGuilds = db.getAllGuilds() || [];
+    const dbMap = new Map(dbGuilds.map((g) => [g.guild_id, g]));
+    const groups = [];
+    const botGuilds = resolver && resolver.client ? resolver.client.guilds.cache : null;
+    if (botGuilds) {
+      for (const [guildId, guild] of botGuilds) {
+        const d = dbMap.get(guildId);
+        groups.push({
+          chat_id: guildId,
+          title: guild.name,
+          members: guild.memberCount,
+          raffles: d ? d.raffle_count : 0,
+          active: d ? d.active_count : 0,
+          completed: d ? d.completed_count : 0,
+          last_raffle: d ? d.last_raffle : '—',
+        });
+      }
+      // Servers the bot has since left but still have raffle history.
+      for (const g of dbGuilds) {
+        if (!botGuilds.has(g.guild_id)) {
+          groups.push({ chat_id: g.guild_id, title: 'Server ' + g.guild_id, raffles: g.raffle_count, active: g.active_count, completed: g.completed_count, last_raffle: g.last_raffle });
+        }
+      }
+    } else {
+      for (const g of dbGuilds) {
+        groups.push({ chat_id: g.guild_id, title: 'Server ' + g.guild_id, raffles: g.raffle_count, active: g.active_count, completed: g.completed_count, last_raffle: g.last_raffle });
+      }
+    }
     res.json({ count: groups.length, groups });
   });
 

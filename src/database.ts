@@ -361,6 +361,21 @@ export function getRecentRafflesForChat(
     .all(chatId, limit) as Raffle[];
 }
 
+/**
+ * Recent raffles created by a specific user across ALL chats — used when
+ * someone runs /exportentries in DM (no chat context available).
+ */
+export function getRecentRafflesByCreator(
+  userId: number,
+  limit: number = 20
+): Raffle[] {
+  return getDb()
+    .prepare(
+      "SELECT * FROM raffles WHERE creator_id = ? ORDER BY created_at DESC LIMIT ?"
+    )
+    .all(userId, limit) as Raffle[];
+}
+
 export function getRafflesCreatedSince(sinceUtc: string): Raffle[] {
   return getDb()
     .prepare(

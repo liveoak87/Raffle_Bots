@@ -187,7 +187,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `/draw [id] - Draw winners (admin only)\n` +
       `/editraffle [id] - Edit an active raffle (admin only)\n` +
       `/cancelraffle [id] - Cancel a raffle (admin only)\n` +
-      `/exportentries [id] - Export all participants (admin only)\n` +
+      `/exportentries [id] - Export all participants (admin only — works in group or DM)\n` +
       `/rerun [id] - Re-run a past raffle (admin only)\n` +
       `/language [code] - Set bot language (admin only)\n` +
       `/raffles - List open raffles in this chat\n` +
@@ -756,24 +756,79 @@ export async function handleRaffleHistory(ctx: Context): Promise<void> {
   await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
-// /exportentries - Export all participants for a raffle
+// /exportentries - Export all participants for a raffle.
+// Works in two contexts:
+//   - In a group: lists/exports raffles from that group (admin only)
+//   - In DM:      lists/exports raffles the user CREATED across all groups
+//                 (admin-of-chat fallback for non-creator admins)
 export async function handleExportEntries(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
-    return;
-  }
-
-  const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
-  if (!isAdmin) {
-    await replyPrivately(ctx, "Only group admins can export entries.");
-    return;
-  }
-
+  if (!ctx.from || !ctx.chat) return;
+  const userId = ctx.from.id;
   const text = ctx.message?.text || "";
   const args = text.replace(/^\/exportentries(@\w+)?/i, "").trim();
+  const inDm = ctx.chat.type === "private";
 
+  // ---- Listing branch (no raffle ID provided) ----
   if (!args) {
+    if (inDm) {
+      // DM: list raffles this user created across all groups
+      const myRaffles = db.getRecentRafflesByCreator(userId, 30);
+      if (myRaffles.length === 0) {
+        await ctx.reply(
+          "You haven't created any raffles yet.\n\n" +
+            "If you want to export a raffle from a group where you're an admin but didn't create it, " +
+            "run <code>/exportentries</code> directly in that group instead.",
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+
+      // Group by chat for readability, and look up chat titles
+      const byChat = new Map<number, typeof myRaffles>();
+      for (const r of myRaffles) {
+        if (!byChat.has(r.chat_id)) byChat.set(r.chat_id, []);
+        byChat.get(r.chat_id)!.push(r);
+      }
+
+      const groupNames = new Map<number, string>();
+      for (const chatId of byChat.keys()) {
+        const cached = db.getBotGroup(chatId);
+        if (cached?.title) {
+          groupNames.set(chatId, cached.title);
+          continue;
+        }
+        try {
+          const chat = await ctx.api.getChat(chatId);
+          if ("title" in chat && chat.title) groupNames.set(chatId, chat.title);
+        } catch {
+          // Bot may no longer be in the chat — fall through to chat-id fallback
+        }
+      }
+
+      let msg = `📋 <b>Your recent raffles</b> (across all groups)\n\n`;
+      msg += `Reply with the command for the one you want to export:\n\n`;
+      for (const [chatId, list] of byChat) {
+        const name = groupNames.get(chatId) || `Chat ${chatId}`;
+        msg += `<b>📍 ${escapeHtml(name)}</b>\n`;
+        for (const r of list) {
+          const count = db.getEntryCount(r.id);
+          msg += `<code>/exportentries ${r.id}</code> — ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
+        }
+        msg += `\n`;
+      }
+      msg += `<i>Showing up to 30 most recent raffles you created.</i>`;
+      // Send in DM (single chunk in most cases; if huge, this will fall through to a single reply
+      // and Telegram will truncate visibly — acceptable for the lister UX)
+      await ctx.reply(msg, { parse_mode: "HTML" });
+      return;
+    }
+
+    // Group: existing behavior — list raffles in this chat (admin only)
+    const isAdmin = await isGroupAdmin(ctx, userId);
+    if (!isAdmin) {
+      await replyPrivately(ctx, "Only group admins can export entries.");
+      return;
+    }
     const allRaffles = db.getRecentRafflesForChat(ctx.chat.id, 20);
     if (allRaffles.length === 0) {
       await replyPrivately(ctx, "No raffles found in this chat.");
@@ -788,43 +843,66 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     return;
   }
 
+  // ---- Export branch (raffle ID provided) ----
   const raffleId = parseInt(args, 10);
   if (isNaN(raffleId)) {
-    await replyPrivately(ctx, "Please provide a valid raffle ID.");
+    const reply = (text: string) => (inDm ? ctx.reply(text) : replyPrivately(ctx, text));
+    await reply("Please provide a valid raffle ID.");
     return;
   }
 
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.chat_id !== ctx.chat.id) {
-    await replyPrivately(ctx, "Raffle not found in this chat.");
+  if (!raffle) {
+    const reply = (text: string) => (inDm ? ctx.reply(text) : replyPrivately(ctx, text));
+    await reply("Raffle not found.");
+    return;
+  }
+
+  // Authorization: must be the creator OR an admin of the raffle's chat
+  let authorized = raffle.creator_id === userId;
+  if (!authorized) {
+    if (!inDm && raffle.chat_id !== ctx.chat.id) {
+      // In a group context, raffle has to belong to this chat
+      await replyPrivately(ctx, "Raffle not found in this chat.");
+      return;
+    }
+    // Verify they're an admin of the raffle's chat
+    try {
+      const member = await ctx.api.getChatMember(raffle.chat_id, userId);
+      authorized = member.status === "administrator" || member.status === "creator";
+    } catch {
+      authorized = false;
+    }
+  }
+  if (!authorized) {
+    const reply = (text: string) => (inDm ? ctx.reply(text) : replyPrivately(ctx, text));
+    await reply("You can only export raffles you created or that you're an admin of.");
     return;
   }
 
   const entries = db.getEntriesForRaffle(raffleId);
-
   if (entries.length === 0) {
-    await replyPrivately(ctx, `No entries found for raffle "${escapeHtml(raffle.title)}".`,
-      { parse_mode: "HTML" });
+    const reply = (text: string, opts?: { parse_mode?: string }) =>
+      inDm ? ctx.reply(text, opts as Record<string, unknown>) : replyPrivately(ctx, text, opts);
+    await reply(`No entries found for raffle "${escapeHtml(raffle.title)}".`, { parse_mode: "HTML" });
     return;
   }
 
+  // Build the message
   let msg = `📋 <b>Participants Export: ${escapeHtml(raffle.title)}</b>\n`;
   msg += `<b>Raffle ID:</b> ${raffle.id} | <b>Status:</b> ${raffle.status}\n`;
   msg += `<b>Total Entries:</b> ${entries.length}\n\n`;
-
   msg += `<b>Participant List:</b>\n`;
   entries.forEach((e, i) => {
     const username = e.user_name ? `@${e.user_name}` : `[${e.user_id}]`;
     msg += `${i + 1}. ${escapeHtml(e.user_display_name)} (${username})\n`;
   });
-
   msg += `\n<b>User IDs (for re-run):</b>\n<code>`;
   msg += entries.map((e) => e.user_id).join(", ");
   msg += `</code>`;
-
   msg += `\n\n💡 Use <code>/rerun ${raffle.id}</code> to create a new raffle with these same participants.`;
 
-  // Split if message is too long (Telegram limit is 4096)
+  // If too long, fall back to a CSV document attachment
   if (msg.length > 4000) {
     const csvLines = ["#,Display Name,Username,User ID,Entered At"];
     entries.forEach((e, i) => {
@@ -832,7 +910,6 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
         `${i + 1},"${e.user_display_name}","${e.user_name || ""}",${e.user_id},"${e.entered_at}"`
       );
     });
-
     const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
     try {
       await ctx.api.sendDocument(userId,
@@ -842,9 +919,16 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
         }
       );
     } catch {
-      // DM failed, fall back to group with auto-delete
-      await replyPrivately(ctx, `Export has ${entries.length} entries — please DM me first so I can send you the file.`);
+      const fallback = `Export has ${entries.length} entries — please DM me first so I can send you the file.`;
+      if (inDm) await ctx.reply(fallback);
+      else await replyPrivately(ctx, fallback);
     }
+    return;
+  }
+
+  // Short enough — send as a text message
+  if (inDm) {
+    await ctx.reply(msg, { parse_mode: "HTML" });
   } else {
     await replyPrivately(ctx, msg, { parse_mode: "HTML" });
   }

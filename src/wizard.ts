@@ -267,6 +267,55 @@ export async function handleStartDeepLink(
     return true;
   }
 
+  // --- Edit raffle deep link: /start editraffle_RAFFLEID_CHATID ---
+  // Fired when the group's /editraffle showed the "Start a DM with me" button
+  // because the bot couldn't DM the user yet. After they tap it and a DM exists,
+  // open the edit wizard right here in the DM.
+  const editMatch = payload.match(/^editraffle_(\d+)_(-?\d+)$/);
+  if (editMatch) {
+    const raffleId = parseInt(editMatch[1], 10);
+    const groupChatId = parseInt(editMatch[2], 10);
+    const userId = ctx.from!.id;
+
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.chat_id !== groupChatId) {
+      await ctx.reply("That raffle wasn't found.");
+      return true;
+    }
+    if (raffle.status !== "open") {
+      await ctx.reply("That raffle is no longer open — it can't be edited.");
+      return true;
+    }
+
+    // Verify the user is still an admin of the source group
+    try {
+      const member = await ctx.api.getChatMember(groupChatId, userId);
+      if (member.status !== "administrator" && member.status !== "creator") {
+        await ctx.reply("You must be an admin of that group to edit its raffles.");
+        return true;
+      }
+    } catch {
+      await ctx.reply("I couldn't verify your admin status in that group.");
+      return true;
+    }
+
+    // Set up the edit wizard state and reply right here in the DM
+    editWizards.set(userId, {
+      raffleId,
+      chatId: groupChatId,
+      dmChatId: ctx.chat!.id,
+      userId,
+      editingField: null,
+      createdAt: Date.now(),
+    });
+
+    await ctx.reply(buildEditScreenText(raffle), {
+      parse_mode: "HTML",
+      reply_markup: buildEditScreenKeyboard(raffle),
+    });
+    return true;
+  }
+
   // --- Raffle creation deep link: /start newraffle_CHATID ---
   const match = payload.match(/^newraffle_(-?\d+)$/);
   if (!match) return false;

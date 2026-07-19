@@ -1,10 +1,10 @@
-# AGENTS.md — AI Assistant Guide for redbeardpeptides
+# AGENTS.md — AI Assistant Guide for Ultimate Randomizer
 
-> Last updated: 2026-02-07
+> Last updated: 2026-07-19
 
 ## Project Overview
 
-**Repository:** `liveoak87/redbeardpeptides`
+**Repository:** `liveoak87/Raffle_Bots`
 **Status:** Active development
 **Purpose:** Discord raffle bot — "Ultimate Random" — a number board where users claim slots and admins draw a random winner.
 
@@ -19,11 +19,14 @@
 
 | Branch | Purpose |
 |--------|---------|
-| `main` | Production-ready code (protected) |
-| `Codex/*` | AI-assisted development branches |
+| `claude/discord-raffle-app-60csT` | Deployed Discord bot production lineage |
+| `codex/*` | AI-assisted development branches |
 | Feature branches | Human-initiated feature work |
 
-- Always develop on the designated feature branch, never push directly to `main`.
+- The repository's `stable` default branch is an unrelated Telegram raffle bot
+  with separate Git history. Never merge Discord production changes into it.
+- Always develop on a designated feature branch and merge through a pull request
+  targeting `claude/discord-raffle-app-60csT`.
 - Use descriptive commit messages that explain *why* a change was made, not just *what* changed.
 - Keep commits atomic — one logical change per commit.
 
@@ -55,12 +58,16 @@
 
 ```
 src/
-  index.js      — Bot entry point, event handlers, command logic
-  commands.js   — Slash command definitions (/raffle, /pick)
-  board.js      — Embed board rendering + button grid
-  database.js   — SQLite schema and queries
-  deploy.js     — One-time slash command registration script
-.env.example    — Required environment variables template
+  index.js          — Bot entry point, interactions, draw and board workflows
+  commands.js       — Slash command definitions (/randomizer, /pick, /help)
+  board.js          — Embed, component, winner, and admin-panel rendering
+  database.js       — SQLite schema, migrations, transactions, and queries
+  random.js         — Cryptographic shuffle implementation
+  update-queue.js   — Per-raffle serialized Discord board updates
+  dashboard/        — Authenticated dashboard and health endpoint
+  deploy.js         — One-time slash command registration script
+test/               — Node test runner coverage
+ops/                — Unraid backup, monitor, and restore scripts
 ```
 
 - Keep related code co-located.
@@ -77,6 +84,9 @@ npm run deploy
 
 # Start the bot
 npm start
+
+# Run the full test suite
+npm test
 ```
 
 ## Testing
@@ -99,10 +109,11 @@ npm start
 
 ## Known Issues / Notes
 
-- Bot requires `DISCORD_TOKEN` and `CLIENT_ID` in `.env` (see `.env.example`).
+- Bot requires `DISCORD_TOKEN` and `CLIENT_ID` in `.env`.
 - One active raffle per channel at a time.
-- Button grid supports up to 25 slots (Discord component limit).
-- The `raffle.db` SQLite file is created at runtime in the project root (gitignored).
+- Boards support up to 200 slots by publishing additional component messages.
+- Automatic and manual draw state is persisted transactionally for restart recovery.
+- The default SQLite path is `data/raffle.db` (gitignored).
 
 ---
 

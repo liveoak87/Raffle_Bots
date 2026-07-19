@@ -1600,7 +1600,7 @@ async function seedBotGroups(): Promise<void> {
         existing.slice(i, i + BATCH_SIZE).map((g) => refreshGroup(botId, g.chat_id, g.title))
       );
       if (i + BATCH_SIZE < existing.length) {
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 1_000));
       }
     }
     // Also check for groups in raffle history that aren't tracked yet (recovery)
@@ -1616,7 +1616,7 @@ async function seedBotGroups(): Promise<void> {
         );
         recovered += results.filter((r) => r === "refreshed").length;
         if (i + BATCH_SIZE < missingIds.length) {
-          await new Promise((r) => setTimeout(r, 300));
+          await new Promise((r) => setTimeout(r, 1_000));
         }
       }
       if (recovered > 0) console.log(`Recovered ${recovered} groups`);
@@ -1640,7 +1640,7 @@ async function seedBotGroups(): Promise<void> {
     );
     added += results.filter((r) => r === "refreshed").length;
     if (i + BATCH_SIZE < chatIds.length) {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 1_000));
     }
   }
   console.log(`Seeded ${added} active groups (${chatIds.length - added} skipped)`);
@@ -1698,8 +1698,10 @@ async function main(): Promise<void> {
   setInterval(() => purgeOldJobs(7), 60 * 60 * 1000);
   console.log("Job queue worker active: polling every 5s, retention 7 days");
 
-  // Seed bot_groups table from known groups (one-time on startup)
-  await seedBotGroups();
+  // Refresh tracked groups without delaying Telegram polling during startup.
+  void seedBotGroups().catch((err) => {
+    console.error("Background group refresh failed:", err);
+  });
 
   // Start expiry checker (with re-entry guard)
   setInterval(makeNonOverlapping(checkExpiredRaffles, "checkExpiredRaffles"), EXPIRY_CHECK_INTERVAL);

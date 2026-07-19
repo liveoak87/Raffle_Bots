@@ -1,19 +1,20 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Partials, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
 const db = require('./database');
-const { buildBoardEmbed, buildComponents, buildExtensionComponents, buildWinnerEmbed, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
+const { buildBoardEmbed, buildComponents, buildExtensionComponents, getExtensionIndexesForSlots, buildWinnerEmbeds, buildWinnerAnnouncementEmbeds, buildMentionChunks, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
 const { buildCreateModal, buildRulesModal, parseModalValues } = require('./wizard');
 const { generateBanner, clearBannerCache } = require('./banner');
 const dashboard = require('./dashboard/server');
-const { cryptoShuffle, cryptoRandomIndex } = require('./random');
+const { cryptoShuffle } = require('./random');
+const { createSingleFlightUpdateQueue } = require('./update-queue');
 
 const OWNER_ID = process.env.OWNER_ID;
 
 // Temporary storage for raffle data between wizard pages
 const pendingRaffles = new Map();
 
-// Active manual draw sessions
-const activeDraws = new Map();
+// Prevent duplicate clicks from running the same draw transition concurrently.
+const drawOperations = new Set();
 
 // Pending assignment sessions (raffleId -> { userId, username })
 const pendingAssignments = new Map();
@@ -22,63 +23,14 @@ const pendingAssignments = new Map();
 // Key: `${raffleId}_${userId}` → { headerMsgId, followUpIds: [msgId, ...] }
 const paymentPanelSessions = new Map();
 
-// ── Debounced board/extension updates ────────────────────────────────────────
-// Prevents flooding Discord API when 200 people pick rapidly
-const extUpdateRunning = new Map();  // raffleId → true if update is in progress
-const extUpdateQueued = new Map();   // raffleId → true if another update is waiting
-const boardUpdateRunning = new Map();
-const boardUpdateQueued = new Map();
-
-async function debouncedExtensionUpdate(raffle, skipIndex = -1) {
-  const key = raffle.id;
-  if (extUpdateRunning.get(key)) {
-    extUpdateQueued.set(key, true);
-    return;
-  }
-  extUpdateRunning.set(key, true);
-  try {
-    await updateExtensionMessages(raffle, skipIndex);
-  } catch (err) {
-    console.error(`[EXT] Debounced update failed — raffle=${raffle.id}:`, err.message);
-  } finally {
-    extUpdateRunning.delete(key);
-    if (extUpdateQueued.get(key)) {
-      extUpdateQueued.delete(key);
-      // Small delay then run again with fresh DB data
-      setTimeout(() => {
-        const freshRaffle = db.getRaffleById(key);
-        if (freshRaffle && freshRaffle.status === 'active') {
-          debouncedExtensionUpdate(freshRaffle);
-        }
-      }, 300);
-    }
-  }
-}
-
-async function debouncedMainBoardUpdate(raffle) {
-  const key = raffle.id;
-  if (boardUpdateRunning.get(key)) {
-    boardUpdateQueued.set(key, true);
-    return;
-  }
-  boardUpdateRunning.set(key, true);
-  try {
-    await updateMainBoard(raffle);
-  } catch (err) {
-    console.error(`[BOARD] Debounced update failed — raffle=${raffle.id}:`, err.message);
-  } finally {
-    boardUpdateRunning.delete(key);
-    if (boardUpdateQueued.get(key)) {
-      boardUpdateQueued.delete(key);
-      setTimeout(() => {
-        const freshRaffle = db.getRaffleById(key);
-        if (freshRaffle && freshRaffle.status === 'active') {
-          debouncedMainBoardUpdate(freshRaffle);
-        }
-      }, 300);
-    }
-  }
-}
+const queueRaffleUpdate = createSingleFlightUpdateQueue(async (raffle, slots) => {
+  await Promise.all([
+    updateMainBoard(raffle),
+    updateExtensionMessagesForSlots(raffle, slots)
+  ]);
+}, 250, (err, raffle) => {
+  console.error(`[BOARD] Queued update failed — raffle=${raffle.id}:`, err.message);
+});
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
@@ -88,6 +40,10 @@ const client = new Client({
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   dashboard.start(client, db);
+  const savedDraws = db.getAllDrawSessions();
+  if (savedDraws.length > 0) {
+    console.warn(`[DRAW] Recovered ${savedDraws.length} persisted draw session(s); creators can resume from Draw Winner.`);
+  }
 });
 
 // ── Event Router ─────────────────────────────────────────────────────────────
@@ -146,6 +102,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleDrawModeAuto(interaction);
       } else if (id.startsWith('draw_mode_manual_')) {
         await handleDrawModeManual(interaction);
+      } else if (id.startsWith('resume_draw_auto_')) {
+        await handleResumeAutoDraw(interaction);
       } else if (id.startsWith('manual_draw_next_')) {
         await handleManualDrawNext(interaction);
       } else if (id.startsWith('manual_draw_finish_')) {
@@ -195,7 +153,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user?.id || 'unknown';
     const customId = interaction.customId || interaction.commandName || 'unknown';
     console.error(`[ERROR] Interaction failed — type=${interaction.type} id=${customId} user=${userId}:`, err);
-    const reply = { content: 'Something went wrong. Please try again.', ephemeral: true };
+
+    // Build a user-friendly error message based on the Discord error code
+    let userMsg = 'Something went wrong. Please try again.';
+    if (err?.code === 50013 || err?.code === 50001) {
+      userMsg =
+        '⚠️ **The bot is missing permissions in this channel.**\n\n' +
+        'Please ask a server admin to grant the **Ultimate Randomizer** bot these permissions in this channel:\n' +
+        '• **View Channel**\n' +
+        '• **Send Messages**\n' +
+        '• **Embed Links**\n' +
+        '• **Attach Files**\n' +
+        '• **Read Message History**\n' +
+        '• **Manage Messages** (needed to delete extension messages after a draw)\n\n' +
+        '*Once permissions are fixed, try the command again.*';
+    } else if (err?.code === 10008) {
+      userMsg = 'The message this action refers to no longer exists. Please start over.';
+    } else if (err?.code === 50035) {
+      userMsg = 'Invalid input — please check your entries and try again.';
+    }
+
+    const reply = { content: userMsg, ephemeral: true };
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.followUp(reply);
@@ -257,6 +235,7 @@ async function handleDraw(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can draw a winner.', ephemeral: true });
   }
+  if (await showPersistedDrawSession(interaction, raffle)) return;
 
   const picks = db.getPicks(raffle.id);
   if (picks.length === 0) {
@@ -297,6 +276,9 @@ async function handleCancel(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can cancel this randomizer.', ephemeral: true });
   }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.reply({ content: 'The draw is in progress; this randomizer cannot be cancelled.', ephemeral: true });
+  }
 
   // Show confirmation prompt
   await showCancelConfirmation(interaction, raffle);
@@ -332,7 +314,7 @@ async function showCancelConfirmation(interaction, raffle) {
 // Actually perform the cancel (called after confirmation)
 async function performCancel(raffle, byUserId) {
   console.log(`[ADMIN] Cancelling raffle — id=${raffle.id} by=${byUserId}`);
-  db.cancelRaffle(raffle.id);
+  if (!db.cancelRaffle(raffle.id)) return false;
   clearBannerCache(raffle.id);
 
   try {
@@ -363,6 +345,7 @@ async function performCancel(raffle, byUserId) {
   }
 
   console.log(`[ADMIN] Raffle cancelled — id=${raffle.id}`);
+  return true;
 }
 
 async function handleCancelConfirm(interaction) {
@@ -374,9 +357,16 @@ async function handleCancelConfirm(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.update({ content: 'Only the creator can cancel this randomizer.', components: [] });
   }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.update({ content: 'The draw is in progress; this randomizer cannot be cancelled.', components: [] });
+  }
 
-  await interaction.update({ content: '✅ Randomizer cancelled.', components: [] });
-  await performCancel(raffle, interaction.user.id);
+  await interaction.update({ content: 'Cancelling randomizer...', components: [] });
+  const cancelled = await performCancel(raffle, interaction.user.id);
+  await interaction.editReply({
+    content: cancelled ? '✅ Randomizer cancelled.' : 'This randomizer changed before it could be cancelled.',
+    components: []
+  });
 }
 
 async function handleCancelAbort(interaction) {
@@ -410,12 +400,15 @@ async function handleMarkPaid(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can mark donations.', ephemeral: true });
   }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.reply({ content: 'The draw is in progress; donation changes are temporarily locked.', ephemeral: true });
+  }
 
   const input = interaction.options.getString('numbers');
-  const numbers = input
+  const numbers = [...new Set(input
     .split(/[,\s]+/)
     .map(n => parseInt(n.trim(), 10))
-    .filter(n => !isNaN(n) && n >= 1 && n <= raffle.total_slots);
+    .filter(n => !isNaN(n) && n >= 1 && n <= raffle.total_slots))];
 
   if (numbers.length === 0) {
     return interaction.reply({
@@ -430,8 +423,8 @@ async function handleMarkPaid(interaction) {
   ).join('\n');
 
   // Acknowledge first (3s deadline), then update the board.
-  await interaction.reply({ content: summary, ephemeral: true });
-  await updateBoardMessageFull(raffle);
+  await interaction.reply({ content: fitMessageContent(summary), ephemeral: true });
+  updateBoardMessage(raffle);
 }
 
 // ── /pick command ────────────────────────────────────────────────────────────
@@ -441,6 +434,9 @@ async function handlePick(interaction) {
   if (!raffle) {
     return interaction.reply({ content: 'No active randomizer in this channel.', ephemeral: true });
   }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.reply({ content: 'The draw is in progress; picks are temporarily locked.', ephemeral: true });
+  }
 
   // Block picks when board is locked (admin assign only)
   if (raffle.assign_only && !isCreator(raffle, interaction.user.id)) {
@@ -449,10 +445,10 @@ async function handlePick(interaction) {
   }
 
   const input = interaction.options.getString('numbers');
-  const numbers = input
+  const numbers = [...new Set(input
     .split(/[,\s]+/)
     .map(n => parseInt(n.trim(), 10))
-    .filter(n => !isNaN(n));
+    .filter(n => !isNaN(n)))];
 
   if (numbers.length === 0) {
     return interaction.reply({
@@ -463,6 +459,7 @@ async function handlePick(interaction) {
 
   const username = interaction.member?.displayName || interaction.user.username;
   const results = [];
+  const claimedSlots = [];
 
   console.log(`[PICK] /pick command — user=${username}(${interaction.user.id}) raffle=${raffle.id} numbers=[${numbers.join(',')}]`);
 
@@ -485,24 +482,42 @@ async function handlePick(interaction) {
     } else if (result.success) {
       console.log(`[PICK] Claimed — user=${username}(${interaction.user.id}) raffle=${raffle.id} slot=#${num}`);
       results.push(`#${num} \u2014 \u2705 claimed!`);
+      claimedSlots.push(num);
+    } else if (result.error === 'inactive') {
+      results.push('The randomizer is no longer active.');
+      break;
+    } else if (result.error === 'drawing') {
+      results.push('The draw is in progress; picks are temporarily locked.');
+      break;
     }
   }
 
   // Acknowledge the interaction first (3s deadline), then do the slower board
   // edit. Editing before replying risked a 10062 "Unknown interaction" under load.
-  await interaction.reply({ content: results.join('\n'), ephemeral: true });
-  await updateBoardMessageFull(raffle);
+  await interaction.reply({ content: fitMessageContent(results.join('\n')), ephemeral: true });
+  if (claimedSlots.length > 0) queueRaffleUpdate(raffle, claimedSlots);
 }
 
 // ── Button click handler ─────────────────────────────────────────────────────
 
 async function handleButtonPick(interaction) {
   const parts = interaction.customId.split('_');
+  const raffleId = parseInt(parts[1], 10);
   const slotNumber = parseInt(parts[2], 10);
 
-  const raffle = db.getActiveRaffle(interaction.channelId);
-  if (!raffle) {
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active' || raffle.channel_id !== interaction.channelId) {
     return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
+  }
+  const extIds = db.getExtensionMessages(raffle.id);
+  if (interaction.message.id !== raffle.message_id && !extIds.includes(interaction.message.id)) {
+    return interaction.reply({ content: 'This is an old randomizer board. Use the current board instead.', ephemeral: true });
+  }
+  if (!Number.isInteger(slotNumber) || slotNumber < 1 || slotNumber > raffle.total_slots) {
+    return interaction.reply({ content: 'That spot is invalid.', ephemeral: true });
+  }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.reply({ content: 'The draw is in progress; picks are temporarily locked.', ephemeral: true });
   }
 
   // Locked board: block regular users, show user picker for admin
@@ -553,12 +568,19 @@ async function handleButtonPick(interaction) {
     });
   }
 
+  if (result.error === 'inactive') {
+    return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
+  }
+
+  if (result.error === 'drawing') {
+    return interaction.reply({ content: 'The draw is in progress; picks are temporarily locked.', ephemeral: true });
+  }
+
   console.log(`[PICK] Button claimed — user=${username}(${interaction.user.id}) raffle=${raffle.id} slot=#${slotNumber}`);
   const picks = db.getPicks(raffle.id);
   console.log(`[PICK] Raffle ${raffle.id} progress: ${picks.length}/${raffle.total_slots} slots filled`);
 
   // Determine if this button was on the main board or an extension
-  const extIds = db.getExtensionMessages(raffle.id);
   const clickedExtIndex = extIds.indexOf(interaction.message.id);
 
   if (clickedExtIndex >= 0) {
@@ -569,16 +591,13 @@ async function handleButtonPick(interaction) {
     } else {
       await interaction.deferUpdate();
     }
-    // Debounced: update main board + other extensions (coalesces rapid picks)
-    debouncedMainBoardUpdate(raffle);
-    debouncedExtensionUpdate(raffle, clickedExtIndex);
+    // The clicked extension is current; only the summary on the main board changed.
+    queueRaffleUpdate(raffle);
   } else {
     // Clicked on main board — update main board in place, fire extension updates debounced
     const embed = buildBoardEmbed(raffle, picks);
     const components = buildComponents(raffle, picks);
     await interaction.update({ embeds: [embed], components });
-    // Debounced: update extensions (coalesces rapid picks)
-    debouncedExtensionUpdate(raffle);
   }
 }
 
@@ -743,7 +762,7 @@ async function createRaffleFromPending(interaction, pending, rules) {
   // Re-check at insert time. The "one active per channel" guard runs when the
   // modal opens, but two setup flows can race between then and here. Re-checking
   // closes that window so a channel can't end up with two live boards.
-  const alreadyActive = db.getActiveRaffle(pending.channelId);
+  const alreadyActive = db.getCreatingOrActiveRaffle(pending.channelId);
   if (alreadyActive) {
     console.log(`[CREATE] Aborted — channel already has active raffle ${alreadyActive.id} (channel=${pending.channelId})`);
     try {
@@ -773,64 +792,62 @@ async function createRaffleFromPending(interaction, pending, rules) {
     db.toggleAssignOnly(raffleId);
   }
 
-  const raffle = db.getActiveRaffle(pending.channelId);
-  const picks = db.getPicks(raffleId);
-  const embed = buildBoardEmbed(raffle, picks);
-  const components = buildComponents(raffle, picks);
-
-  const bannerPrize = prize.split('\n')[0];
-  const bannerBuffer = await generateBanner(bannerPrize, raffleId);
-  console.log('[CREATE] Banner generated, sending board...');
-  const attachment = new AttachmentBuilder(bannerBuffer, { name: 'banner.png' });
-
-  // Post the board as a new message in the channel
-  const channel = await client.channels.fetch(pending.channelId);
-  const msg = await channel.send({
-    embeds: [embed],
-    components,
-    files: [attachment]
-  });
-
-  db.setRaffleMessage(raffleId, msg.id);
-  console.log('[CREATE] Board posted, message ID:', msg.id);
-
-  // Clean up the ephemeral wizard message
+  const raffle = db.getRaffleById(raffleId);
+  const picks = [];
+  const postedIds = [];
+  let channel;
   try {
-    if (interaction.replied || interaction.deferred) {
-      await interaction.editReply({ content: 'Board created!', components: [] });
-    }
-  } catch (_) { /* ephemeral cleanup */ }
+    const embed = buildBoardEmbed(raffle, picks);
+    const components = buildComponents(raffle, picks);
+    const bannerPrize = prize.split('\n')[0];
+    const bannerBuffer = await generateBanner(bannerPrize, raffleId);
+    const attachment = new AttachmentBuilder(bannerBuffer, { name: 'banner.png' });
 
-  // Send extension messages if needed (slots 25+)
-  const extMessageSets = buildExtensionComponents(raffle, picks);
-  if (extMessageSets.length > 0) {
-    try {
-      const extIds = [];
-      for (let ei = 0; ei < extMessageSets.length; ei++) {
-        const extMsg = await channel.send({ components: extMessageSets[ei] });
-        extIds.push(extMsg.id);
-        console.log(`[CREATE] Extension ${ei + 1} posted, message ID:`, extMsg.id);
-      }
-      db.setExtensionMessages(raffleId, extIds);
-      db.setExtensionMessage(raffleId, extIds[0]);
-    } catch (err) {
-      console.error('Failed to send extension messages:', err.message);
+    channel = await client.channels.fetch(pending.channelId);
+    const msg = await channel.send({ embeds: [embed], components, files: [attachment] });
+    postedIds.push(msg.id);
+
+    const extIds = [];
+    const extMessageSets = buildExtensionComponents(raffle, picks);
+    for (let ei = 0; ei < extMessageSets.length; ei++) {
+      const extMsg = await channel.send({ components: extMessageSets[ei] });
+      extIds.push(extMsg.id);
+      postedIds.push(extMsg.id);
     }
+
+    if (!db.replaceRaffleMessages(raffleId, msg.id, extIds) || !db.activateRaffle(raffleId)) {
+      throw new Error('Could not activate the new randomizer');
+    }
+    console.log(`[CREATE] Board activated — raffle=${raffleId} message=${msg.id} extensions=${extIds.length}`);
+
+    try {
+      await interaction.editReply({ content: 'Board created!', components: [] });
+    } catch (_) { /* ephemeral cleanup */ }
+  } catch (err) {
+    db.cancelRaffle(raffleId);
+    clearBannerCache(raffleId);
+    if (channel) {
+      await Promise.allSettled(postedIds.map(messageId => channel.messages.delete(messageId)));
+    }
+    console.error(`[CREATE] Publication rolled back — raffle=${raffleId}:`, err.message);
+    try {
+      await interaction.editReply({ content: `Board creation failed: ${err.message}`, components: [] });
+    } catch (_) { /* original interaction may have expired */ }
   }
 }
 
 // ── Draw mode choice ─────────────────────────────────────────────────────────
 
-async function showDrawModeChoice(interaction, raffle) {
+async function showDrawModeChoice(interaction, raffle, drawMode = 'normal') {
   const numWinners = raffle.num_winners || 1;
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`draw_mode_auto_${raffle.id}`)
+      .setCustomId(`draw_mode_auto_${raffle.id}_${drawMode}`)
       .setLabel(`Draw All at Once (${numWinners})`)
       .setStyle(ButtonStyle.Primary)
       .setEmoji('\uD83C\uDFB0'),
     new ButtonBuilder()
-      .setCustomId(`draw_mode_manual_${raffle.id}`)
+      .setCustomId(`draw_mode_manual_${raffle.id}_${drawMode}`)
       .setLabel('Draw One at a Time')
       .setStyle(ButtonStyle.Secondary)
       .setEmoji('\uD83C\uDFB2')
@@ -854,189 +871,167 @@ async function showDrawModeChoice(interaction, raffle) {
 
 // ── Draw mode: All at Once ───────────────────────────────────────────────────
 
+async function publishCompletedDraw(raffle, picks, winners, channel) {
+  const embeds = buildWinnerEmbeds(raffle, picks, winners);
+  const boardResult = await Promise.allSettled([
+    editDiscordMessageWithRetry(channel, raffle.message_id, { embeds, components: [] }, raffle.id)
+  ]);
+  if (boardResult[0].status === 'rejected') {
+    console.error(`[DRAW] Failed to update completed board — raffle=${raffle.id}:`, boardResult[0].reason?.message);
+  }
+
+  const extIds = db.getExtensionMessages(raffle.id);
+  const deleteResults = await Promise.allSettled(extIds.map(extId => channel.messages.delete(extId)));
+  const deleteFailures = deleteResults.filter(result => result.status === 'rejected').length;
+  if (deleteFailures > 0) {
+    console.warn(`[DRAW] Failed to delete ${deleteFailures}/${extIds.length} extensions — raffle=${raffle.id}`);
+  }
+}
+
 async function handleDrawModeAuto(interaction) {
-  const raffleId = parseInt(interaction.customId.replace('draw_mode_auto_', ''), 10);
+  const { raffleId, drawMode } = parseDrawModeId(interaction.customId, 'draw_mode_auto_');
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.status !== 'active') {
+  if (!raffle || raffle.status !== 'active' || raffle.channel_id !== interaction.channelId) {
     return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
   }
-
-  console.log(`[DRAW] Auto draw started — raffle=${raffle.id} numWinners=${raffle.num_winners || 1} by=${interaction.user.id}`);
-  await interaction.update({ content: 'Drawing winners...', components: [] });
-
-  const picks = db.getPicks(raffle.id);
-  const claimedPicks = picks.filter(p => p.user_id);
-  const numWinners = Math.min(raffle.num_winners || 1, claimedPicks.length);
-  const shuffled = cryptoShuffle(claimedPicks);
-  const winners = shuffled.slice(0, numWinners);
-
-  console.log(`[DRAW] Winners selected — raffle=${raffle.id} winners=[${winners.map(w => `#${w.slot_number}(${w.username})`).join(', ')}]`);
-
-  // Play animation in channel
-  const channel = await client.channels.fetch(raffle.channel_id);
-  console.log(`[DRAW] Playing animation — raffle=${raffle.id}`);
-  await playDrawAnimationInChannel(channel, raffle, picks, winners);
-
-  // Update database
-  const winnersArray = winners.map(w => ({ slot: w.slot_number, user_id: w.user_id, username: w.username }));
-  db.completeRaffle(raffle.id, winners[0].slot_number, winners[0].user_id, winnersArray);
-  clearBannerCache(raffle.id);
-  console.log(`[DRAW] Database updated — raffle=${raffle.id} status=completed`);
-
-  // Update board message
-  try {
-    const boardMsg = await channel.messages.fetch(raffle.message_id);
-    if (boardMsg) {
-      const allPicks = db.getPicks(raffle.id);
-      const embed = buildWinnerEmbed(raffle, allPicks, winners);
-      const bannerBuffer = await generateBanner(raffle.prize, raffle.id);
-      const attachment = new AttachmentBuilder(bannerBuffer, { name: 'banner.png' });
-      await boardMsg.edit({ embeds: [embed], components: [], files: [attachment] });
-      console.log(`[DRAW] Board updated with winner embed — raffle=${raffle.id}`);
-    }
-  } catch (err) {
-    console.error(`[DRAW] Failed to update board after draw — raffle=${raffle.id}:`, err.message);
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can draw a winner.', ephemeral: true });
   }
-
-  // Delete extension messages
-  const extIds = db.getExtensionMessages(raffle.id);
-  console.log(`[DRAW] Deleting ${extIds.length} extension messages — raffle=${raffle.id}`);
-  for (const extId of extIds) {
-    try {
-      const extMsg = await channel.messages.fetch(extId);
-      if (extMsg) await extMsg.delete();
-    } catch (err) {
-      console.warn(`[DRAW] Failed to delete extension ${extId}:`, err.message);
-    }
-  }
-
-  console.log(`[DRAW] Auto draw complete — raffle=${raffle.id}`);
-  await interaction.editReply({ content: `\u2705 Drew ${winners.length} winner(s)!`, components: [] });
+  await runAutomaticDraw(interaction, raffle, drawMode);
 }
 
 // ── Draw mode: One at a Time (start manual draw) ─────────────────────────────
 
 async function handleDrawModeManual(interaction) {
-  const raffleId = parseInt(interaction.customId.replace('draw_mode_manual_', ''), 10);
+  const { raffleId, drawMode } = parseDrawModeId(interaction.customId, 'draw_mode_manual_');
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.status !== 'active') {
+  if (!raffle || raffle.status !== 'active' || raffle.channel_id !== interaction.channelId) {
     return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
   }
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can draw a winner.', ephemeral: true });
+  }
 
-  console.log(`[DRAW] Manual draw started — raffle=${raffle.id} by=${interaction.user.id}`);
-  await interaction.update({ content: 'Starting manual draw...', components: [] });
+  if (!beginDrawOperation(raffleId)) {
+    return interaction.reply({ content: 'A draw is already in progress for this randomizer.', ephemeral: true });
+  }
 
-  const picks = db.getPicks(raffle.id);
-  const claimedPicks = picks.filter(p => p.user_id);
-  console.log(`[DRAW] Total picks in pool: ${claimedPicks.length} (claimed) / ${picks.length} (total) — raffle=${raffle.id}`);
-  const shuffled = cryptoShuffle(claimedPicks);
+  try {
+    const started = db.startDrawSession(raffleId, interaction.user.id, 'manual', drawMode);
+    if (started.error && started.error !== 'already_drawing') {
+      return interaction.reply({ content: drawStartErrorMessage(started), ephemeral: true });
+    }
+    if (started.session?.kind === 'auto') {
+      return interaction.update(buildAutomaticResumePayload(raffleId));
+    }
 
-  // Draw the first winner
-  const winner = shuffled.shift();
-  const remaining = shuffled;
-  console.log(`[DRAW] 1st winner drawn — raffle=${raffle.id} slot=#${winner.slot_number} user=${winner.username}`);
+    await interaction.update({
+      content: started.success ? 'Starting manual draw...' : 'Resuming manual draw...',
+      components: []
+    });
+    let session = started.session || db.getDrawSession(raffleId);
+    let initializedNow = false;
+    const picks = started.picks || db.getPicks(raffleId);
+    if (!session?.pool) {
+      const initialized = db.initializeDrawSession(raffleId, cryptoShuffle(picks), 1);
+      if (!initialized.success) throw new Error(`Could not initialize draw session: ${initialized.error}`);
+      session = initialized.session;
+      initializedNow = !initialized.existing;
+    }
 
-  // Store the session
-  activeDraws.set(raffleId, {
-    drawnWinners: [winner],
-    remainingPicks: remaining,
-    raffle
-  });
-
-  // Auto-expire after 60 minutes
-  setTimeout(() => activeDraws.delete(raffleId), 60 * 60 * 1000);
-
-  // Play animation in channel
-  const channel = await client.channels.fetch(raffle.channel_id);
-  await playDrawAnimationInChannel(channel, raffle, picks, [winner], 1);
-
-  // Show ephemeral with drawn winners + buttons
-  const winnerList = `**1st Winner:** \uD83C\uDFC6 Spot #${winner.slot_number} — ${winner.username}`;
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`manual_draw_next_${raffleId}`)
-      .setLabel('Draw Next Winner')
-      .setStyle(ButtonStyle.Primary)
-      .setEmoji('\uD83C\uDFB0'),
-    new ButtonBuilder()
-      .setCustomId(`manual_draw_finish_${raffleId}`)
-      .setLabel('Finish')
-      .setStyle(ButtonStyle.Success)
-      .setEmoji('\u2705')
-  );
-
-  await interaction.editReply({
-    content: `**Winners Drawn:**\n${winnerList}\n\n*${remaining.length} spot(s) remaining to draw from.*`,
-    components: [row]
-  });
+    console.log(`[DRAW] Manual draw ready — raffle=${raffle.id} winners=${session.drawnWinners.length} remaining=${session.remainingPicks.length} by=${interaction.user.id}`);
+    const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
+    if (initializedNow) {
+      try {
+        await playDrawAnimationInChannel(channel, raffle, picks, [session.drawnWinners[0]], 1);
+      } catch (err) {
+        console.error(`[DRAW] First manual announcement failed — raffle=${raffleId}:`, err.message);
+      }
+    }
+    await interaction.editReply(buildManualDrawPayload(raffleId, session));
+  } catch (err) {
+    console.error(`[DRAW] Manual draw start/resume failed — raffle=${raffleId}:`, err.message);
+    try { await interaction.editReply({ content: `Draw session is saved, but Discord presentation failed: ${err.message}`, components: [] }); } catch (_) {}
+  } finally {
+    endDrawOperation(raffleId);
+  }
 }
 
 // ── Manual draw: Draw next winner ────────────────────────────────────────────
 
 async function handleManualDrawNext(interaction) {
   const raffleId = parseInt(interaction.customId.replace('manual_draw_next_', ''), 10);
-  const session = activeDraws.get(raffleId);
-  if (!session) {
-    console.warn(`[DRAW] Manual draw session expired — raffle=${raffleId}`);
-    // Session expired — let them restart immediately
-    const raffle = db.getRaffleById(raffleId);
-    if (raffle && raffle.status === 'active') {
-      await interaction.update({ content: 'Draw session expired. Restarting...', components: [] });
-      return showDrawModeChoice(interaction, raffle);
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active') {
+    return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
+  }
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can continue this draw.', ephemeral: true });
+  }
+  if (!beginDrawOperation(raffleId)) {
+    return interaction.reply({ content: 'The previous draw action is still running.', ephemeral: true });
+  }
+  try {
+    let session = db.getDrawSession(raffleId);
+    if (!session || session.kind !== 'manual') {
+      return interaction.reply({ content: 'No manual draw session is available.', ephemeral: true });
     }
-    return interaction.reply({ content: 'This draw session has expired and the raffle is no longer active.', ephemeral: true });
+    let recoveredFirstWinner = false;
+    if (!session.pool) {
+      const initialized = db.initializeDrawSession(raffleId, cryptoShuffle(db.getPicks(raffleId)), 1);
+      if (!initialized.success) throw new Error(`Could not recover draw session: ${initialized.error}`);
+      session = initialized.session;
+      recoveredFirstWinner = !initialized.existing;
+    }
+    if (!recoveredFirstWinner && session.remainingPicks.length === 0) {
+      return finishManualDraw(interaction, raffleId, true);
+    }
+
+    await interaction.update({
+      content: recoveredFirstWinner ? 'Recovering first winner...' : 'Drawing next winner...',
+      components: []
+    });
+    if (recoveredFirstWinner) {
+      const firstWinner = session.drawnWinners[0];
+      const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
+      try {
+        await playDrawAnimationInChannel(channel, raffle, session.pool, [firstWinner], 1);
+      } catch (err) {
+        console.error(`[DRAW] Recovered first winner announcement failed — raffle=${raffleId}:`, err.message);
+      }
+      if (session.remainingPicks.length === 0) {
+        await finishManualDraw(interaction, raffleId, true);
+        return;
+      }
+      await interaction.editReply(buildManualDrawPayload(raffleId, session));
+      return;
+    }
+
+    const advanced = db.advanceDrawSession(raffleId);
+    if (!advanced.success) throw new Error(`Could not persist next winner: ${advanced.error}`);
+    session = advanced.session;
+    const winner = advanced.winner;
+    console.log(`[DRAW] Winner #${session.drawnWinners.length} persisted — raffle=${raffleId} slot=#${winner.slot_number} remaining=${session.remainingPicks.length}`);
+
+    const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
+    const winnerNumber = session.drawnWinners.length;
+    try {
+      await playDrawAnimationInChannel(channel, raffle, session.pool, [winner], winnerNumber);
+    } catch (err) {
+      console.error(`[DRAW] Manual winner announcement failed — raffle=${raffleId} winner=${winnerNumber}:`, err.message);
+    }
+
+    if (session.remainingPicks.length === 0) {
+      await finishManualDraw(interaction, raffleId, true);
+      return;
+    }
+    await interaction.editReply(buildManualDrawPayload(raffleId, session));
+  } catch (err) {
+    console.error(`[DRAW] Manual next failed — raffle=${raffleId}:`, err.message);
+    try { await interaction.editReply({ content: `The draw is saved, but this action failed: ${err.message}`, components: [buildManualDrawRow(raffleId)] }); } catch (_) {}
+  } finally {
+    endDrawOperation(raffleId);
   }
-
-  if (session.remainingPicks.length === 0) {
-    console.log(`[DRAW] No picks remaining, auto-finishing — raffle=${raffleId}`);
-    // No picks left — auto-finish
-    return handleManualDrawFinish(interaction);
-  }
-
-  await interaction.update({ content: 'Drawing next winner...', components: [] });
-
-  // Pick random from remaining
-  const randomIndex = cryptoRandomIndex(session.remainingPicks.length);
-  const winner = session.remainingPicks.splice(randomIndex, 1)[0];
-  session.drawnWinners.push(winner);
-  console.log(`[DRAW] Winner #${session.drawnWinners.length} drawn — raffle=${raffleId} slot=#${winner.slot_number} user=${winner.username} remaining=${session.remainingPicks.length}`);
-
-  // Play animation in channel (previous winner messages stay visible)
-  const raffle = session.raffle;
-  const channel = await client.channels.fetch(raffle.channel_id);
-  const winnerNumber = session.drawnWinners.length; // This winner's ordinal position
-  const picks = db.getPicks(raffle.id);
-  await playDrawAnimationInChannel(channel, raffle, picks, [winner], winnerNumber);
-
-  // Build winner list
-  const winnerList = session.drawnWinners.map((w, i) =>
-    `**${getOrdinal(i + 1)} Winner:** \uD83C\uDFC6 Spot #${w.slot_number} — ${w.username}`
-  ).join('\n');
-
-  if (session.remainingPicks.length === 0) {
-    // All picks exhausted — auto-finish
-    await finishManualDraw(interaction, raffleId);
-    return;
-  }
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`manual_draw_next_${raffleId}`)
-      .setLabel('Draw Next Winner')
-      .setStyle(ButtonStyle.Primary)
-      .setEmoji('\uD83C\uDFB0'),
-    new ButtonBuilder()
-      .setCustomId(`manual_draw_finish_${raffleId}`)
-      .setLabel('Finish')
-      .setStyle(ButtonStyle.Success)
-      .setEmoji('\u2705')
-  );
-
-  await interaction.editReply({
-    content: `**Winners Drawn:**\n${winnerList}\n\n*${session.remainingPicks.length} spot(s) remaining to draw from.*`,
-    components: [row]
-  });
 }
 
 // ── Manual draw: Finish ──────────────────────────────────────────────────────
@@ -1046,72 +1041,201 @@ async function handleManualDrawFinish(interaction) {
   await finishManualDraw(interaction, raffleId);
 }
 
-async function finishManualDraw(interaction, raffleId) {
-  const session = activeDraws.get(raffleId);
-  if (!session) {
-    console.warn(`[DRAW] Finish called but session expired — raffle=${raffleId}`);
-    // Session expired — let them restart immediately
-    const raffle = db.getRaffleById(raffleId);
-    if (raffle && raffle.status === 'active') {
-      await interaction.update({ content: 'Draw session expired. Restarting...', components: [] });
-      return showDrawModeChoice(interaction, raffle);
-    }
-    return interaction.reply({ content: 'This draw session has expired and the raffle is no longer active.', ephemeral: true });
+async function finishManualDraw(interaction, raffleId, alreadyBusy = false) {
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active') {
+    return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
   }
-
-  const { drawnWinners, raffle } = session;
-  activeDraws.delete(raffleId);
-
-  console.log(`[DRAW] Finishing manual draw — raffle=${raffle.id} totalWinners=${drawnWinners.length} winners=[${drawnWinners.map(w => `#${w.slot_number}(${w.username})`).join(', ')}]`);
-
-  // Update database
-  const winnersArray = drawnWinners.map(w => ({ slot: w.slot_number, user_id: w.user_id, username: w.username }));
-  db.completeRaffle(raffle.id, drawnWinners[0].slot_number, drawnWinners[0].user_id, winnersArray);
-  clearBannerCache(raffle.id);
-  console.log(`[DRAW] Database updated — raffle=${raffle.id} status=completed`);
-
-  // Update board message
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can finish this draw.', ephemeral: true });
+  }
+  if (!alreadyBusy && !beginDrawOperation(raffleId)) {
+    return interaction.reply({ content: 'The previous draw action is still running.', ephemeral: true });
+  }
+  let committed = false;
   try {
-    const channel = await client.channels.fetch(raffle.channel_id);
-    const boardMsg = await channel.messages.fetch(raffle.message_id);
-    if (boardMsg) {
-      const allPicks = db.getPicks(raffle.id);
-      const embed = buildWinnerEmbed(raffle, allPicks, drawnWinners);
-      const bannerBuffer = await generateBanner(raffle.prize, raffle.id);
-      const attachment = new AttachmentBuilder(bannerBuffer, { name: 'banner.png' });
-      await boardMsg.edit({ embeds: [embed], components: [], files: [attachment] });
-      console.log(`[DRAW] Board updated with winner embed — raffle=${raffle.id}`);
+    const session = db.getDrawSession(raffleId);
+    if (!session || session.kind !== 'manual') {
+      return interaction.reply({ content: 'No manual draw session is available.', ephemeral: true });
+    }
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.update({ content: 'Finishing draw...', components: [] });
+    }
+    const completed = db.completeDrawSession(raffleId);
+    if (!completed.success) throw new Error(`Could not complete persisted draw: ${completed.error}`);
+    committed = true;
+    const winners = completed.winners;
+    clearBannerCache(raffleId);
+    console.log(`[DRAW] Manual draw committed — raffle=${raffle.id} winners=${winners.length}`);
+
+    try {
+      const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
+      await publishCompletedDraw(raffle, db.getPicks(raffleId), winners, channel);
+    } catch (err) {
+      console.error(`[DRAW] Manual draw committed but board publication failed — raffle=${raffleId}:`, err.message);
     }
 
-    // Delete extension messages
-    const extIds = db.getExtensionMessages(raffle.id);
-    console.log(`[DRAW] Deleting ${extIds.length} extension messages — raffle=${raffle.id}`);
-    for (const extId of extIds) {
-      try {
-        const extMsg = await channel.messages.fetch(extId);
-        if (extMsg) await extMsg.delete();
-      } catch (err) {
-        console.warn(`[DRAW] Failed to delete extension ${extId}:`, err.message);
-      }
+    const replyContent = fitMessageContent(`\u2705 **Raffle Complete!** ${winners.length} winner(s) drawn.\n\n${formatManualWinnerList(winners)}`);
+    try {
+      await interaction.editReply({ content: replyContent, components: [] });
+    } catch (err) {
+      console.error(`[DRAW] Manual draw committed but confirmation failed — raffle=${raffleId}:`, err.message);
     }
   } catch (err) {
-    console.error(`[DRAW] Failed to update board after manual draw — raffle=${raffle.id}:`, err.message);
+    console.error(`[DRAW] Failed to finish manual draw — raffle=${raffle.id} committed=${committed}:`, err.message);
+    if (!committed) {
+      try { await interaction.editReply({ content: `Could not finish draw: ${err.message}`, components: [] }); } catch (_) {}
+    }
+  } finally {
+    if (!alreadyBusy) endDrawOperation(raffleId);
+  }
+}
+
+function buildManualDrawRow(raffleId, canDrawNext = true, canFinish = true) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`manual_draw_next_${raffleId}`)
+      .setLabel('Draw Next Winner')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('\uD83C\uDFB0')
+      .setDisabled(!canDrawNext),
+    new ButtonBuilder()
+      .setCustomId(`manual_draw_finish_${raffleId}`)
+      .setLabel('Finish')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('\u2705')
+      .setDisabled(!canFinish)
+  );
+}
+
+function buildManualDrawPayload(raffleId, session) {
+  if (!session.pool) {
+    return {
+      content: 'This manual draw was saved before the first winner was finalized. Resume it to continue safely.',
+      components: [buildManualDrawRow(raffleId, true, false)]
+    };
+  }
+  return {
+    content: `**Winners Drawn:**\n${formatManualWinnerList(session.drawnWinners)}\n\n*${session.remainingPicks.length} spot(s) remaining to draw from.*`,
+    components: [buildManualDrawRow(raffleId, session.remainingPicks.length > 0)]
+  };
+}
+
+function buildAutomaticResumePayload(raffleId) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`resume_draw_auto_${raffleId}`)
+      .setLabel('Resume Automatic Draw')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('\uD83C\uDFB0')
+  );
+  return { content: 'An automatic draw is saved and ready to resume.', components: [row] };
+}
+
+async function handleResumeAutoDraw(interaction) {
+  const raffleId = parseInt(interaction.customId.replace('resume_draw_auto_', ''), 10);
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active' || raffle.channel_id !== interaction.channelId) {
+    return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
+  }
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can resume this draw.', ephemeral: true });
+  }
+  const session = db.getDrawSession(raffleId);
+  await runAutomaticDraw(interaction, raffle, session?.validation_mode || 'normal');
+}
+
+async function runAutomaticDraw(interaction, raffle, drawMode) {
+  const raffleId = raffle.id;
+  if (!beginDrawOperation(raffleId)) {
+    return interaction.reply({ content: 'The previous draw action is still running.', ephemeral: true });
   }
 
-  // Build final winner list
-  const winnerList = drawnWinners.map((w, i) =>
-    `**${getOrdinal(i + 1)} Winner:** \uD83C\uDFC6 Spot #${w.slot_number} — ${w.username}`
-  ).join('\n');
-
-  const replyContent = `\u2705 **Raffle Complete!** ${drawnWinners.length} winner(s) drawn.\n\n${winnerList}`;
-
+  let completed = false;
   try {
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: replyContent, components: [] });
-    } else {
-      await interaction.update({ content: replyContent, components: [] });
+    const started = db.startDrawSession(raffleId, interaction.user.id, 'auto', drawMode);
+    if (started.error && started.error !== 'already_drawing') {
+      return interaction.reply({ content: drawStartErrorMessage(started), ephemeral: true });
     }
-  } catch (_) { /* ephemeral cleanup */ }
+    if (started.session?.kind === 'manual') {
+      return interaction.update(buildManualDrawPayload(raffleId, started.session));
+    }
+
+    await interaction.update({
+      content: started.success ? 'Drawing winners...' : 'Resuming saved automatic draw...',
+      components: []
+    });
+    let session = started.session || db.getDrawSession(raffleId);
+    const picks = started.picks || session?.pool || db.getPicks(raffleId);
+    if (!session?.pool) {
+      const numWinners = Math.min(raffle.num_winners || 1, picks.length);
+      const initialized = db.initializeDrawSession(raffleId, cryptoShuffle(picks), numWinners);
+      if (!initialized.success) throw new Error(`Could not initialize draw session: ${initialized.error}`);
+      session = initialized.session;
+    }
+
+    const result = db.completeDrawSession(raffleId);
+    if (!result.success) throw new Error(`Could not commit draw: ${result.error}`);
+    completed = true;
+    const winners = result.winners;
+    clearBannerCache(raffleId);
+    console.log(`[DRAW] Automatic winners committed — raffle=${raffleId} winners=${winners.length}`);
+
+    const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
+    try {
+      await playDrawAnimationInChannel(channel, raffle, picks, winners);
+    } catch (err) {
+      console.error(`[DRAW] Winner announcement failed — raffle=${raffleId}:`, err.message);
+    }
+    await publishCompletedDraw(raffle, picks, winners, channel);
+    await interaction.editReply({ content: `\u2705 Drew ${winners.length} winner(s)!`, components: [] });
+  } catch (err) {
+    console.error(`[DRAW] Automatic draw failed — raffle=${raffleId} completed=${completed}:`, err.message);
+    try {
+      await interaction.editReply({
+        content: completed
+          ? '\u26A0\uFE0F Winners were recorded, but part of the Discord announcement failed. Check the completed board.'
+          : `Draw progress was saved but did not finish: ${err.message}`,
+        components: completed ? [] : buildAutomaticResumePayload(raffleId).components
+      });
+    } catch (_) { /* interaction token expired */ }
+  } finally {
+    endDrawOperation(raffleId);
+  }
+}
+
+function drawStartErrorMessage(result) {
+  switch (result.error) {
+    case 'inactive': return 'This randomizer is no longer active.';
+    case 'no_picks': return 'No numbers have been picked yet.';
+    case 'open_slots': return `Cannot draw yet — ${result.remaining} spot(s) are still open.`;
+    case 'unpaid': return `Cannot draw yet — ${result.unpaidCount} spot(s) are not marked donated.`;
+    default: return 'The draw could not be started.';
+  }
+}
+
+function beginDrawOperation(raffleId) {
+  if (drawOperations.has(raffleId)) return false;
+  drawOperations.add(raffleId);
+  return true;
+}
+
+function endDrawOperation(raffleId) {
+  drawOperations.delete(raffleId);
+}
+
+function isDrawLocked(raffleId) {
+  return drawOperations.has(raffleId) || db.hasDrawSession(raffleId);
+}
+
+async function showPersistedDrawSession(interaction, raffle) {
+  const session = db.getDrawSession(raffle.id);
+  if (!session) return false;
+  const payload = session.kind === 'manual'
+    ? buildManualDrawPayload(raffle.id, session)
+    : buildAutomaticResumePayload(raffle.id);
+  await interaction.reply({ ...payload, ephemeral: true });
+  return true;
 }
 
 // ── Admin button handlers (on the board itself) ─────────────────────────────
@@ -1123,6 +1247,25 @@ function extractRaffleId(customId) {
 
 function isCreator(raffle, userId) {
   return raffle.created_by === userId || userId === OWNER_ID;
+}
+
+function fitMessageContent(content, maxLength = 1900) {
+  if (content.length <= maxLength) return content;
+  return `${content.slice(0, maxLength - 40)}\n...additional results omitted.`;
+}
+
+function formatManualWinnerList(winners) {
+  const lines = winners.map((winner, index) =>
+    `**${getOrdinal(index + 1)} Winner:** \uD83C\uDFC6 Spot #${winner.slot_number} — ${winner.username}`
+  );
+  while (lines.join('\n').length > 1500 && lines.length > 1) lines.shift();
+  const omitted = winners.length - lines.length;
+  return `${omitted > 0 ? `*${omitted} earlier winner(s) omitted from this panel.*\n` : ''}${lines.join('\n')}`;
+}
+
+function parseDrawModeId(customId, prefix) {
+  const [raffleIdText, drawMode = 'normal'] = customId.slice(prefix.length).split('_');
+  return { raffleId: parseInt(raffleIdText, 10), drawMode: drawMode === 'early' ? 'early' : 'normal' };
 }
 
 async function handleAdminPanel(interaction) {
@@ -1148,6 +1291,7 @@ async function handleAdminDraw(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can draw a winner.', ephemeral: true });
   }
+  if (await showPersistedDrawSession(interaction, raffle)) return;
 
   const picks = db.getPicks(raffle.id);
   if (picks.length === 0) {
@@ -1186,6 +1330,7 @@ async function handleEarlyDraw(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can draw a winner.', ephemeral: true });
   }
+  if (await showPersistedDrawSession(interaction, raffle)) return;
 
   const picks = db.getPicks(raffle.id);
   const claimedPicks = picks.filter(p => p.user_id);
@@ -1196,7 +1341,7 @@ async function handleEarlyDraw(interaction) {
   console.log(`[DRAW] Early draw initiated — raffle=${raffle.id} claimed=${claimedPicks.length}/${raffle.total_slots} by=${interaction.user.id}`);
 
   // Show draw mode choice (draws from claimed picks only)
-  await showDrawModeChoice(interaction, raffle);
+  await showDrawModeChoice(interaction, raffle, 'early');
 }
 
 async function handleAdminPayments(interaction) {
@@ -1233,8 +1378,8 @@ async function handleAdminPayments(interaction) {
   const sessionKey = `${raffleId}_${interaction.user.id}`;
   paymentPanelSessions.set(sessionKey, { followUpIds, interaction });
 
-  // Auto-expire after 60 minutes
-  setTimeout(() => paymentPanelSessions.delete(sessionKey), 60 * 60 * 1000);
+  // Auto-expire after 14 minutes — Discord ephemeral webhook tokens die at 15 min
+  setTimeout(() => paymentPanelSessions.delete(sessionKey), 14 * 60 * 1000);
 }
 
 async function handleAdminSettings(interaction) {
@@ -1258,34 +1403,23 @@ async function handleAdminRepost(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can repost the board.', ephemeral: true });
   }
+  if (isDrawLocked(raffle.id)) {
+    return interaction.reply({ content: 'The draw is in progress; the board cannot be reposted.', ephemeral: true });
+  }
 
   console.log(`[ADMIN] Repost started — raffle=${raffle.id} by=${interaction.user.id}`);
   await interaction.deferUpdate();
 
+  const newMessageIds = [];
+  let channel;
   try {
-    const channel = await client.channels.fetch(raffle.channel_id);
+    channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
 
     // Save old message IDs before doing anything
     const oldMainMsgId = raffle.message_id;
     const oldExtIds = db.getExtensionMessages(raffle.id);
 
-    // Delete old messages first
-    try {
-      const oldMsg = await channel.messages.fetch(oldMainMsgId);
-      if (oldMsg) await oldMsg.delete();
-    } catch (err) {
-      console.warn(`[ADMIN] Repost: old main message already gone — raffle=${raffle.id}:`, err.message);
-    }
-    for (const oldExtId of oldExtIds) {
-      try {
-        const oldExt = await channel.messages.fetch(oldExtId);
-        if (oldExt) await oldExt.delete();
-      } catch (err) {
-        console.warn(`[ADMIN] Repost: old extension already gone — ext=${oldExtId}:`, err.message);
-      }
-    }
-
-    // Post the fresh board
+    // Publish a complete replacement before switching message IDs.
     const picks = db.getPicks(raffle.id);
     const embed = buildBoardEmbed(raffle, picks);
     const components = buildComponents(raffle, picks);
@@ -1297,9 +1431,7 @@ async function handleAdminRepost(interaction) {
       components,
       files: [attachment]
     });
-
-    db.setRaffleMessage(raffle.id, newMsg.id);
-    console.log(`[ADMIN] Repost: new board posted — raffle=${raffle.id} newMsgId=${newMsg.id}`);
+    newMessageIds.push(newMsg.id);
 
     // Post extension messages if needed
     const extMessageSets = buildExtensionComponents(raffle, picks);
@@ -1309,15 +1441,24 @@ async function handleAdminRepost(interaction) {
         const extMsg = await channel.send({ components: extSet });
         newExtIds.push(extMsg.id);
       }
-      db.setExtensionMessages(raffle.id, newExtIds);
-      db.setExtensionMessage(raffle.id, newExtIds[0]);
-      console.log(`[ADMIN] Repost: ${newExtIds.length} extensions posted — raffle=${raffle.id}`);
-    } else {
-      db.setExtensionMessages(raffle.id, []);
-      db.setExtensionMessage(raffle.id, null);
+      newMessageIds.push(...newExtIds);
+    }
+
+    const newExtIds = newMessageIds.slice(1);
+    if (!db.replaceRaffleMessages(raffle.id, newMsg.id, newExtIds)) {
+      throw new Error('The randomizer changed before the replacement was ready');
+    }
+    const oldIds = [oldMainMsgId, ...oldExtIds].filter(Boolean);
+    const cleanup = await Promise.allSettled(oldIds.map(messageId => channel.messages.delete(messageId)));
+    const cleanupFailures = cleanup.filter(result => result.status === 'rejected').length;
+    if (cleanupFailures > 0) {
+      console.warn(`[ADMIN] Repost: ${cleanupFailures}/${oldIds.length} old messages could not be deleted — raffle=${raffle.id}`);
     }
     console.log(`[ADMIN] Repost complete — raffle=${raffle.id}`);
   } catch (err) {
+    if (channel && newMessageIds.length > 0) {
+      await Promise.allSettled(newMessageIds.map(messageId => channel.messages.delete(messageId)));
+    }
     console.error(`[ADMIN] Repost failed — raffle=${raffle.id}:`, err);
     try {
       await interaction.followUp({ content: `Repost failed: ${err.message}`, ephemeral: true });
@@ -1336,6 +1477,9 @@ async function handleAdminCancel(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can cancel this randomizer.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) {
+    return interaction.reply({ content: 'The draw is in progress; this randomizer cannot be cancelled.', ephemeral: true });
+  }
 
   console.log(`[ADMIN] Admin panel cancel requested — raffle=${raffle.id} by=${interaction.user.id}`);
   await showCancelConfirmation(interaction, raffle);
@@ -1344,7 +1488,7 @@ async function handleAdminCancel(interaction) {
 // ── Donation panel button handlers (ephemeral toggle buttons) ────────────────
 
 // Helper: update all payment panel messages (header + follow-up slot messages)
-async function refreshPaymentPanel(interaction, raffle) {
+async function refreshPaymentPanel(interaction, raffle, refreshAllSlots = false) {
   const picks = db.getPicks(raffle.id);
   const sessionKey = `${raffle.id}_${interaction.user.id}`;
   const session = paymentPanelSessions.get(sessionKey);
@@ -1366,24 +1510,25 @@ async function refreshPaymentPanel(interaction, raffle) {
       await interaction.update(header);
     }
 
-    // Update all OTHER messages in background via webhook
+    // A single toggle only changes its own slot message plus the header count.
     const origInteraction = session.interaction;
-    try {
-      // Update header
-      const header = buildPaymentHeader(raffle, picks);
-      await origInteraction.editReply(header);
-    } catch (err) {
-      console.warn(`[ADMIN] Failed to update payment header:`, err.message);
+    if (followUpIndex >= 0) {
+      try {
+        await origInteraction.editReply(buildPaymentHeader(raffle, picks));
+      } catch (err) {
+        console.warn(`[ADMIN] Failed to update payment header:`, err.message);
+      }
     }
 
-    for (let i = 0; i < session.followUpIds.length; i++) {
-      const fid = session.followUpIds[i];
-      if (fid === clickedMsgId) continue; // Already updated via interaction.update()
-      if (!slotMessages[i]) continue;
-      try {
-        await origInteraction.webhook.editMessage(fid, slotMessages[i]);
-      } catch (err) {
-        console.warn(`[ADMIN] Failed to update payment follow-up ${i}:`, err.message);
+    if (refreshAllSlots) {
+      const updates = session.followUpIds.map((fid, index) => {
+        if (fid === clickedMsgId || !slotMessages[index]) return Promise.resolve();
+        return origInteraction.webhook.editMessage(fid, slotMessages[index]);
+      });
+      const results = await Promise.allSettled(updates);
+      const failed = results.filter(result => result.status === 'rejected').length;
+      if (failed > 0) {
+        console.warn(`[ADMIN] Failed to update ${failed} payment follow-up message(s)`);
       }
     }
   } else {
@@ -1399,9 +1544,10 @@ async function handleTogglePaid(interaction) {
   const slotNumber = parseInt(parts[3], 10);
 
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !isCreator(raffle, interaction.user.id)) {
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can manage donations.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.togglePaid(raffleId, slotNumber);
   console.log(`[ADMIN] Toggled donation — raffle=${raffleId} slot=#${slotNumber}`);
@@ -1413,28 +1559,30 @@ async function handleTogglePaid(interaction) {
 async function handleMarkAllPaid(interaction) {
   const raffleId = extractRaffleId(interaction.customId);
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !isCreator(raffle, interaction.user.id)) {
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can manage donations.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.markAllPaid(raffleId);
   console.log(`[ADMIN] Marked all donated — raffle=${raffleId}`);
 
-  await refreshPaymentPanel(interaction, raffle);
+  await refreshPaymentPanel(interaction, raffle, true);
   updateBoardMessage(raffle);
 }
 
 async function handleMarkAllUnpaid(interaction) {
   const raffleId = extractRaffleId(interaction.customId);
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !isCreator(raffle, interaction.user.id)) {
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can manage donations.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.markAllUnpaid(raffleId);
   console.log(`[ADMIN] Marked all not donated — raffle=${raffleId}`);
 
-  await refreshPaymentPanel(interaction, raffle);
+  await refreshPaymentPanel(interaction, raffle, true);
   updateBoardMessage(raffle);
 }
 
@@ -1474,9 +1622,10 @@ async function handleRemovePick(interaction) {
   const slotNumber = parseInt(parts[3], 10);
 
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !isCreator(raffle, interaction.user.id)) {
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can remove picks.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.removePick(raffleId, slotNumber);
   console.log(`[ADMIN] Removed pick — raffle=${raffleId} slot=#${slotNumber}`);
@@ -1491,7 +1640,7 @@ async function handleRemovePick(interaction) {
     await interaction.update(panel);
   }
 
-  updateBoardMessageFull(raffle);
+  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 async function handleRemoveSelect(interaction) {
@@ -1501,9 +1650,10 @@ async function handleRemoveSelect(interaction) {
   const slotNumber = parseInt(interaction.values[0], 10);
 
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !isCreator(raffle, interaction.user.id)) {
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can remove picks.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.removePick(raffleId, slotNumber);
   console.log(`[ADMIN] Removed pick (select) — raffle=${raffleId} slot=#${slotNumber}`);
@@ -1523,7 +1673,7 @@ async function handleRemoveSelect(interaction) {
     await interaction.update({ content: `✅ Removed #${slotNumber}. No more picks in this range.`, components: [] });
   }
 
-  updateBoardMessageFull(raffle);
+  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Admin: Assign Spot (step 1 — show user select menu) ─────────────────────
@@ -1537,6 +1687,7 @@ async function handleAdminAssign(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can assign spots.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   const userMenu = new UserSelectMenuBuilder()
     .setCustomId(`assign_user_${raffleId}`)
@@ -1561,6 +1712,10 @@ async function handleAssignUserSelect(interaction) {
   if (!raffle || raffle.status !== 'active') {
     return interaction.reply({ content: 'This randomizer is no longer active.', ephemeral: true });
   }
+  if (!isCreator(raffle, interaction.user.id)) {
+    return interaction.reply({ content: 'Only the creator can assign spots.', ephemeral: true });
+  }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   const selectedUser = interaction.users.first();
   if (!selectedUser) {
@@ -1578,7 +1733,8 @@ async function handleAssignUserSelect(interaction) {
   // Store the pending assignment
   pendingAssignments.set(raffleId, {
     userId: selectedUser.id,
-    username: displayName
+    username: displayName,
+    adminId: interaction.user.id
   });
 
   // Auto-expire after 60 minutes
@@ -1641,10 +1797,16 @@ async function handleAssignSlotConfirm(interaction) {
   if (!raffle || raffle.status !== 'active') {
     return interaction.update({ content: 'This randomizer is no longer active.', components: [] });
   }
+  if (!isCreator(raffle, interaction.user.id) || isDrawLocked(raffleId)) {
+    return interaction.update({ content: 'This assignment can no longer be completed.', components: [] });
+  }
 
   const assignment = pendingAssignments.get(raffleId);
   if (!assignment) {
     return interaction.update({ content: 'Assignment session expired. Please start over.', components: [] });
+  }
+  if (assignment.adminId !== interaction.user.id) {
+    return interaction.update({ content: 'This assignment belongs to another admin session.', components: [] });
   }
 
   // Perform the pick (bypass max_picks limit for admin assignment)
@@ -1662,7 +1824,7 @@ async function handleAssignSlotConfirm(interaction) {
   });
 
   // Update the board
-  updateBoardMessageFull(raffle);
+  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Admin: Direct assign (click number → pick member → done) ────────────────
@@ -1676,6 +1838,9 @@ async function handleAssignDirect(interaction) {
   const raffle = db.getRaffleById(raffleId);
   if (!raffle || raffle.status !== 'active') {
     return interaction.update({ content: 'This randomizer is no longer active.', components: [] });
+  }
+  if (!isCreator(raffle, interaction.user.id) || isDrawLocked(raffleId)) {
+    return interaction.update({ content: 'This assignment can no longer be completed.', components: [] });
   }
 
   const selectedUser = interaction.users.first();
@@ -1715,7 +1880,7 @@ async function handleAssignDirect(interaction) {
   }, 3000);
 
   // Update the board
-  updateBoardMessageFull(raffle);
+  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Admin: Lock/Unlock board toggle ─────────────────────────────────────────
@@ -1729,6 +1894,7 @@ async function handleAdminLock(interaction) {
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can lock/unlock the board.', ephemeral: true });
   }
+  if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
   db.toggleAssignOnly(raffleId);
   const updated = db.getRaffleById(raffleId);
@@ -1774,33 +1940,21 @@ async function playDrawAnimationInChannel(channel, raffle, picks, winners, winne
 
   await sleep(800);
 
-  const winnerEmbed = new EmbedBuilder().setColor(0xFFD700);
-  let pingContent = '';
+  const mentionChunks = buildMentionChunks(winners.map(winner => winner.user_id));
 
-  if (winners.length === 1) {
-    const w = winners[0];
-    const ordinal = getOrdinal(winnerStartNumber);
-    winnerEmbed
-      .setTitle('\uD83C\uDF89\uD83C\uDF89\uD83C\uDF89  THE WINNING NUMBER  \uD83C\uDF89\uD83C\uDF89\uD83C\uDF89')
-      .setDescription(
-        `\n\uD83C\uDFB0  **# ${w.slot_number}**  \uD83C\uDFB0\n\n` +
-        `\uD83C\uDFC6  Congratulations **${w.username}**!  \uD83C\uDFC6\n` +
-        `\nYou are the **${ordinal} winner**!`
-      );
-    pingContent = `<@${w.user_id}>`;
-  } else {
-    const winnerLines = winners.map((w, i) => {
-      const num = winnerStartNumber + i;
-      const ordinal = getOrdinal(num);
-      return `**${ordinal} Winner:** \uD83C\uDFB0 **# ${w.slot_number}** \u2014 **${w.username}**`;
-    }).join('\n');
-    winnerEmbed
-      .setTitle(`\uD83C\uDF89\uD83C\uDF89\uD83C\uDF89  THE WINNING NUMBERS  \uD83C\uDF89\uD83C\uDF89\uD83C\uDF89`)
-      .setDescription(`\n${winnerLines}\n\n\uD83C\uDFC6  Congratulations to all winners!  \uD83C\uDFC6`);
-    pingContent = winners.map(w => `<@${w.user_id}>`).join(' ');
+  const announcementEmbeds = buildWinnerAnnouncementEmbeds(winners, winnerStartNumber);
+  const firstMentions = mentionChunks.shift() || { ids: [], content: '' };
+  await animMsg.edit({
+    content: firstMentions.content,
+    embeds: [announcementEmbeds[0]],
+    allowedMentions: { users: firstMentions.ids }
+  });
+  for (const embed of announcementEmbeds.slice(1)) {
+    await channel.send({ embeds: [embed] });
   }
-
-  await animMsg.edit({ content: pingContent, embeds: [winnerEmbed], allowedMentions: { users: winners.map(w => w.user_id) } });
+  for (const mentions of mentionChunks) {
+    await channel.send({ content: mentions.content, allowedMentions: { users: mentions.ids } });
+  }
   return animMsg; // Return so callers can delete it later
 }
 
@@ -1915,126 +2069,106 @@ client.on(Events.GuildCreate, async (guild) => {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// Debounce board updates — wait 1s after last call before actually updating
-const pendingUpdates = new Map();
-
 async function updateBoardMessage(raffle) {
-  // Cancel any pending update for this raffle
-  if (pendingUpdates.has(raffle.id)) {
-    clearTimeout(pendingUpdates.get(raffle.id));
-  }
-
-  // Schedule an update 1s from now
-  pendingUpdates.set(raffle.id, setTimeout(async () => {
-    pendingUpdates.delete(raffle.id);
-    try {
-      const freshRaffle = db.getRaffleById(raffle.id);
-      if (!freshRaffle || freshRaffle.status !== 'active') return;
-
-      const channel = await client.channels.fetch(freshRaffle.channel_id);
-      if (!channel) return;
-      const msg = await channel.messages.fetch(freshRaffle.message_id);
-      if (!msg) return;
-
-      const picks = db.getPicks(freshRaffle.id);
-      const embed = buildBoardEmbed(freshRaffle, picks);
-      const components = buildComponents(freshRaffle, picks);
-
-      await msg.edit({ embeds: [embed], components });
-
-      // Debounced extension update (prevents flooding on large raffles)
-      debouncedExtensionUpdate(freshRaffle);
-    } catch (err) {
-      console.error('Failed to update board message:', err.message);
-    }
-  }, 1000));
+  queueRaffleUpdate(raffle);
 }
 
-// Full update with banner (for picks, repost, etc.)
-async function updateBoardMessageFull(raffle) {
-  const start = Date.now();
-  try {
-    const channel = await client.channels.fetch(raffle.channel_id);
-    if (!channel) return;
-    const msg = await channel.messages.fetch(raffle.message_id);
-    if (!msg) return;
-
-    const picks = db.getPicks(raffle.id);
-    const embed = buildBoardEmbed(raffle, picks);
-    const components = buildComponents(raffle, picks);
-    const bannerBuffer = await generateBanner(raffle.prize, raffle.id);
-    const attachment = new AttachmentBuilder(bannerBuffer, { name: 'banner.png' });
-
-    await msg.edit({ embeds: [embed], components, files: [attachment] });
-    console.log(`[BOARD] Main board updated — raffle=${raffle.id} picks=${picks.length}/${raffle.total_slots} took=${Date.now() - start}ms`);
-
-    // Debounced extension update (prevents flooding on large raffles)
-    debouncedExtensionUpdate(raffle);
-  } catch (err) {
-    console.error(`[BOARD] Failed to update board — raffle=${raffle.id} took=${Date.now() - start}ms:`, err.message);
-  }
+async function updateBoardMessageFull(raffle, slotNumbers = []) {
+  await Promise.all([
+    updateMainBoard(raffle),
+    updateExtensionMessagesForSlots(raffle, slotNumbers)
+  ]);
 }
 
 // Update just the main board embed + components (no banner)
 async function updateMainBoard(raffle) {
+  const start = Date.now();
   try {
     const freshRaffle = db.getRaffleById(raffle.id);
     if (!freshRaffle || freshRaffle.status !== 'active') return;
 
-    const channel = await client.channels.fetch(freshRaffle.channel_id);
+    const channel = client.channels.cache.get(freshRaffle.channel_id) || await client.channels.fetch(freshRaffle.channel_id);
     if (!channel) return;
-    const msg = await channel.messages.fetch(freshRaffle.message_id);
-    if (!msg) return;
 
     const picks = db.getPicks(freshRaffle.id);
     const embed = buildBoardEmbed(freshRaffle, picks);
     const components = buildComponents(freshRaffle, picks);
 
-    await msg.edit({ embeds: [embed], components });
+    await editDiscordMessageWithRetry(
+      channel,
+      freshRaffle.message_id,
+      { embeds: [embed], components },
+      freshRaffle.id
+    );
+    console.log(`[BOARD] Main update — raffle=${freshRaffle.id} took=${Date.now() - start}ms`);
   } catch (err) {
-    console.error('Failed to update main board:', err.message);
+    console.error(`[BOARD] Main update failed — raffle=${raffle.id} took=${Date.now() - start}ms:`, err.message);
+    throw err;
   }
 }
 
-// Update all extension messages (or all except skipIndex)
-async function updateExtensionMessages(raffle, skipIndex = -1) {
+// A slot occurs on exactly one overflow message, so unrelated messages never need edits.
+async function updateExtensionMessagesForSlots(raffle, slotNumbers) {
   const start = Date.now();
   try {
+    const indexes = getExtensionIndexesForSlots(slotNumbers);
+    if (indexes.length === 0) return;
+
     const freshRaffle = db.getRaffleById(raffle.id);
     if (!freshRaffle || freshRaffle.status !== 'active') return;
 
     const extIds = db.getExtensionMessages(freshRaffle.id);
     if (extIds.length === 0) return;
 
-    const channel = await client.channels.fetch(freshRaffle.channel_id);
+    const channel = client.channels.cache.get(freshRaffle.channel_id) || await client.channels.fetch(freshRaffle.channel_id);
     if (!channel) return;
 
     const picks = db.getPicks(freshRaffle.id);
     const allExtSets = buildExtensionComponents(freshRaffle, picks);
 
-    console.log(`[EXT] Updating ${extIds.length} extension messages (skip=${skipIndex}) — raffle=${raffle.id}`);
-
-    // Update all extension messages in parallel for speed
-    const results = await Promise.allSettled(extIds.map(async (extId, i) => {
-      if (i === skipIndex) return 'skipped';
-      if (!allExtSets[i]) return 'no-components';
-
-      const extMsg = await channel.messages.fetch(extId);
-      if (extMsg) {
-        await extMsg.edit({ components: allExtSets[i] });
-        return 'updated';
-      }
-      return 'not-found';
+    const results = await Promise.allSettled(indexes.map(index => {
+      if (!extIds[index] || !allExtSets[index]) return Promise.resolve('missing');
+      return editDiscordMessageWithRetry(
+        channel,
+        extIds[index],
+        { components: allExtSets[index] },
+        freshRaffle.id
+      );
     }));
 
     const failed = results.filter(r => r.status === 'rejected');
     if (failed.length > 0) {
-      console.warn(`[EXT] ${failed.length}/${extIds.length} extension updates failed — raffle=${raffle.id}`);
-      failed.forEach((f, i) => console.warn(`[EXT]   ext[${i}]: ${f.reason?.message || f.reason}`));
+      throw new Error(`${failed.length}/${indexes.length} targeted extension updates failed`, {
+        cause: failed[0].reason
+      });
     }
-    console.log(`[EXT] Extensions updated — raffle=${raffle.id} took=${Date.now() - start}ms`);
+    console.log(`[EXT] Targeted ${indexes.length} extension(s) — raffle=${raffle.id} took=${Date.now() - start}ms`);
   } catch (err) {
-    console.error(`[EXT] Failed to update extension messages — raffle=${raffle.id} took=${Date.now() - start}ms:`, err.message);
+    console.error(`[EXT] Targeted update failed — raffle=${raffle.id} took=${Date.now() - start}ms:`, err.message);
+    throw err;
+  }
+}
+
+const PERMANENT_DISCORD_EDIT_CODES = new Set([10003, 10008, 50001, 50013, 50035]);
+const TRANSIENT_NETWORK_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT']);
+
+function isTransientDiscordEditError(err) {
+  const discordCode = Number(err?.rawError?.code ?? err?.code);
+  if (PERMANENT_DISCORD_EDIT_CODES.has(discordCode)) return false;
+
+  const status = Number(err?.status);
+  if (status === 429 || status >= 500) return true;
+  return TRANSIENT_NETWORK_CODES.has(err?.code) || err?.name === 'AbortError';
+}
+
+async function editDiscordMessageWithRetry(channel, messageId, payload, raffleId) {
+  try {
+    return await channel.messages.edit(messageId, payload);
+  } catch (err) {
+    if (!isTransientDiscordEditError(err)) throw err;
+    console.warn(`[DISCORD] Retrying message edit — raffle=${raffleId} message=${messageId} error=${err.code || err.status || err.name}`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    return channel.messages.edit(messageId, payload);
   }
 }
 

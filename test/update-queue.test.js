@@ -75,3 +75,39 @@ test('a main-board-only update queued during a running edit is not lost', async 
 
   assert.equal(calls, 2);
 });
+
+test('continuous traffic cannot postpone the first update indefinitely', async () => {
+  const calls = [];
+  const enqueue = createSingleFlightUpdateQueue(async (_raffle, slots) => {
+    calls.push(slots);
+  }, 15);
+
+  enqueue({ id: 1 }, [1]);
+  for (let slot = 2; slot <= 8; slot++) {
+    await wait(5);
+    enqueue({ id: 1 }, [slot]);
+  }
+  await wait(40);
+
+  assert.ok(calls.length >= 2);
+  assert.deepEqual(calls[0], [1, 2, 3]);
+  assert.deepEqual(calls.flat().sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test('flush drains scheduled and follow-up updates before shutdown', async () => {
+  const first = deferred();
+  const calls = [];
+  const enqueue = createSingleFlightUpdateQueue(async (_raffle, slots) => {
+    calls.push(slots);
+    if (calls.length === 1) await first.promise;
+  }, 1000);
+
+  enqueue({ id: 1 }, [1]);
+  const flushing = enqueue.flush(1);
+  await wait(5);
+  enqueue({ id: 1 }, [2]);
+  first.resolve();
+  await flushing;
+
+  assert.deepEqual(calls, [[1], [2]]);
+});

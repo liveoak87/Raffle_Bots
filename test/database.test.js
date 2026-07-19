@@ -15,6 +15,7 @@ test.after(() => {
 });
 
 test('new raffles are not active until every message is published', () => {
+  assert.equal(db.healthCheck(), true);
   const raffleId = db.createRaffle('guild', 'channel', 'Prize', '$5', 50, 'owner');
   assert.equal(db.getActiveRaffle('channel'), undefined);
   assert.equal(db.getCreatingOrActiveRaffle('channel').id, raffleId);
@@ -82,6 +83,10 @@ test('manual draw progress is persisted and blocks every raffle mutation', () =>
   assert.deepEqual(completed.winners.map(winner => winner.slot_number), [2, 1]);
   assert.equal(db.hasDrawSession(raffleId), false);
   assert.equal(db.getRaffleById(raffleId).status, 'completed');
+  const publication = db.getPendingDrawPublications().find(item => item.raffle_id === raffleId);
+  assert.deepEqual(publication.winners.map(winner => winner.slot_number), [2, 1]);
+  assert.equal(db.markDrawPublished(raffleId), true);
+  assert.equal(db.getPendingDrawPublications().some(item => item.raffle_id === raffleId), false);
 });
 
 test('an interrupted automatic draw resumes from its persisted winner order', () => {
@@ -113,6 +118,17 @@ test('an interrupted automatic draw resumes from its persisted winner order', ()
   const completed = db.completeDrawSession(raffleId);
   assert.deepEqual(completed.winners.map(winner => winner.slot_number), [2, 1]);
   assert.equal(db.getRaffleById(raffleId).status, 'completed');
+
+  const publicationRecoveryScript = `
+    process.env.DATABASE_PATH = ${JSON.stringify(process.env.DATABASE_PATH)};
+    const db = require(${JSON.stringify(databaseModule)});
+    const publication = db.getPendingDrawPublications().find(item => item.raffle_id === ${raffleId});
+    process.stdout.write(JSON.stringify(publication.winners.map(winner => winner.slot_number)));
+    db.close();
+  `;
+  const restartedPublication = JSON.parse(execFileSync(process.execPath, ['-e', publicationRecoveryScript], { encoding: 'utf8' }));
+  assert.deepEqual(restartedPublication, [2, 1]);
+  assert.equal(db.markDrawPublished(raffleId), true);
 });
 
 test('early draw validation is explicit and transactional', () => {

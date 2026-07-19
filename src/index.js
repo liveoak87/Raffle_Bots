@@ -16,6 +16,9 @@ const pendingRaffles = new Map();
 // Prevent duplicate clicks from running the same draw transition concurrently.
 const drawOperations = new Set();
 
+// Reposts publish multiple Discord messages before atomically switching IDs.
+const repostOperations = new Set();
+
 // Pending assignment sessions (raffleId -> { userId, username })
 const pendingAssignments = new Map();
 
@@ -34,7 +37,8 @@ const queueRaffleUpdate = createSingleFlightUpdateQueue(async (raffle, slots) =>
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
-  partials: [Partials.Channel] // Required for DM interactions
+  partials: [Partials.Channel], // Required for DM interactions
+  allowedMentions: { parse: [], repliedUser: false }
 });
 
 client.once(Events.ClientReady, (c) => {
@@ -44,6 +48,9 @@ client.once(Events.ClientReady, (c) => {
   if (savedDraws.length > 0) {
     console.warn(`[DRAW] Recovered ${savedDraws.length} persisted draw session(s); creators can resume from Draw Winner.`);
   }
+  recoverPendingDrawPublications().catch(err => {
+    console.error('[DRAW] Pending publication recovery failed:', err.message);
+  });
 });
 
 // ── Event Router ─────────────────────────────────────────────────────────────
@@ -580,25 +587,11 @@ async function handleButtonPick(interaction) {
   const picks = db.getPicks(raffle.id);
   console.log(`[PICK] Raffle ${raffle.id} progress: ${picks.length}/${raffle.total_slots} slots filled`);
 
-  // Determine if this button was on the main board or an extension
-  const clickedExtIndex = extIds.indexOf(interaction.message.id);
-
-  if (clickedExtIndex >= 0) {
-    // Clicked on an extension — update that extension in place, fire other updates in background
-    const allExtSets = buildExtensionComponents(raffle, picks);
-    if (allExtSets[clickedExtIndex]) {
-      await interaction.update({ components: allExtSets[clickedExtIndex] });
-    } else {
-      await interaction.deferUpdate();
-    }
-    // The clicked extension is current; only the summary on the main board changed.
-    queueRaffleUpdate(raffle);
-  } else {
-    // Clicked on main board — update main board in place, fire extension updates debounced
-    const embed = buildBoardEmbed(raffle, picks);
-    const components = buildComponents(raffle, picks);
-    await interaction.update({ embeds: [embed], components });
-  }
+  // Acknowledge immediately, then route every board edit through the per-raffle
+  // queue. Mixing interaction.update() edits with queued REST edits allowed an
+  // older payload to land last under concurrent picks.
+  await interaction.deferUpdate();
+  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Modal submit handler ─────────────────────────────────────────────────────
@@ -616,16 +609,19 @@ async function handleCreateModalSubmit(interaction) {
 
   // Store pending data for page 2
   const pendingKey = `${interaction.guildId}_${interaction.channelId}_${interaction.user.id}`;
-  pendingRaffles.set(pendingKey, {
+  const pending = {
     guildId: interaction.guildId,
     channelId: interaction.channelId,
     userId: interaction.user.id,
     prize, totalSlots, price, maxPicksPerUser, numWinners,
     timestamp: Date.now()
-  });
+  };
+  pendingRaffles.set(pendingKey, pending);
 
   // Auto-expire after 60 minutes
-  setTimeout(() => pendingRaffles.delete(pendingKey), 60 * 60 * 1000);
+  setTimeout(() => {
+    if (pendingRaffles.get(pendingKey) === pending) pendingRaffles.delete(pendingKey);
+  }, 60 * 60 * 1000).unref?.();
 
   // Show page 2: Add Rules, Lock toggle, or Create
   const isLocked = false; // Fresh creation is always unlocked
@@ -873,18 +869,34 @@ async function showDrawModeChoice(interaction, raffle, drawMode = 'normal') {
 
 async function publishCompletedDraw(raffle, picks, winners, channel) {
   const embeds = buildWinnerEmbeds(raffle, picks, winners);
-  const boardResult = await Promise.allSettled([
-    editDiscordMessageWithRetry(channel, raffle.message_id, { embeds, components: [] }, raffle.id)
-  ]);
-  if (boardResult[0].status === 'rejected') {
-    console.error(`[DRAW] Failed to update completed board — raffle=${raffle.id}:`, boardResult[0].reason?.message);
-  }
+  await editDiscordMessageWithRetry(channel, raffle.message_id, { embeds, components: [] }, raffle.id);
 
   const extIds = db.getExtensionMessages(raffle.id);
   const deleteResults = await Promise.allSettled(extIds.map(extId => channel.messages.delete(extId)));
   const deleteFailures = deleteResults.filter(result => result.status === 'rejected').length;
   if (deleteFailures > 0) {
     console.warn(`[DRAW] Failed to delete ${deleteFailures}/${extIds.length} extensions — raffle=${raffle.id}`);
+  }
+}
+
+async function recoverPendingDrawPublications() {
+  const pending = db.getPendingDrawPublications();
+  if (pending.length === 0) return;
+
+  console.warn(`[DRAW] Recovering ${pending.length} completed board publication(s).`);
+  for (const publication of pending) {
+    try {
+      if (!Array.isArray(publication.winners) || publication.winners.length === 0) {
+        throw new Error('saved winner payload is invalid');
+      }
+      const channel = client.channels.cache.get(publication.channel_id)
+        || await client.channels.fetch(publication.channel_id);
+      await publishCompletedDraw(publication, db.getPicks(publication.raffle_id), publication.winners, channel);
+      db.markDrawPublished(publication.raffle_id);
+      console.log(`[DRAW] Recovered completed board publication — raffle=${publication.raffle_id}`);
+    } catch (err) {
+      console.error(`[DRAW] Completed board publication remains pending — raffle=${publication.raffle_id}:`, err.message);
+    }
   }
 }
 
@@ -925,6 +937,7 @@ async function handleDrawModeManual(interaction) {
       return interaction.update(buildAutomaticResumePayload(raffleId));
     }
 
+    await queueRaffleUpdate.flush(raffleId);
     await interaction.update({
       content: started.success ? 'Starting manual draw...' : 'Resuming manual draw...',
       components: []
@@ -1071,8 +1084,9 @@ async function finishManualDraw(interaction, raffleId, alreadyBusy = false) {
     try {
       const channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
       await publishCompletedDraw(raffle, db.getPicks(raffleId), winners, channel);
+      db.markDrawPublished(raffleId);
     } catch (err) {
-      console.error(`[DRAW] Manual draw committed but board publication failed — raffle=${raffleId}:`, err.message);
+      console.error(`[DRAW] Manual draw committed; board publication remains pending — raffle=${raffleId}:`, err.message);
     }
 
     const replyContent = fitMessageContent(`\u2705 **Raffle Complete!** ${winners.length} winner(s) drawn.\n\n${formatManualWinnerList(winners)}`);
@@ -1161,6 +1175,7 @@ async function runAutomaticDraw(interaction, raffle, drawMode) {
       return interaction.update(buildManualDrawPayload(raffleId, started.session));
     }
 
+    await queueRaffleUpdate.flush(raffleId);
     await interaction.update({
       content: started.success ? 'Drawing winners...' : 'Resuming saved automatic draw...',
       components: []
@@ -1188,6 +1203,7 @@ async function runAutomaticDraw(interaction, raffle, drawMode) {
       console.error(`[DRAW] Winner announcement failed — raffle=${raffleId}:`, err.message);
     }
     await publishCompletedDraw(raffle, picks, winners, channel);
+    db.markDrawPublished(raffleId);
     await interaction.editReply({ content: `\u2705 Drew ${winners.length} winner(s)!`, components: [] });
   } catch (err) {
     console.error(`[DRAW] Automatic draw failed — raffle=${raffleId} completed=${completed}:`, err.message);
@@ -1376,10 +1392,13 @@ async function handleAdminPayments(interaction) {
 
   // Store session so toggle/mark-all can update all messages
   const sessionKey = `${raffleId}_${interaction.user.id}`;
-  paymentPanelSessions.set(sessionKey, { followUpIds, interaction });
+  const session = { followUpIds, interaction };
+  paymentPanelSessions.set(sessionKey, session);
 
   // Auto-expire after 14 minutes — Discord ephemeral webhook tokens die at 15 min
-  setTimeout(() => paymentPanelSessions.delete(sessionKey), 14 * 60 * 1000);
+  setTimeout(() => {
+    if (paymentPanelSessions.get(sessionKey) === session) paymentPanelSessions.delete(sessionKey);
+  }, 14 * 60 * 1000).unref?.();
 }
 
 async function handleAdminSettings(interaction) {
@@ -1406,13 +1425,19 @@ async function handleAdminRepost(interaction) {
   if (isDrawLocked(raffle.id)) {
     return interaction.reply({ content: 'The draw is in progress; the board cannot be reposted.', ephemeral: true });
   }
+  if (repostOperations.has(raffle.id)) {
+    return interaction.reply({ content: 'A repost is already in progress for this randomizer.', ephemeral: true });
+  }
 
+  repostOperations.add(raffle.id);
   console.log(`[ADMIN] Repost started — raffle=${raffle.id} by=${interaction.user.id}`);
-  await interaction.deferUpdate();
 
   const newMessageIds = [];
   let channel;
+  let switched = false;
   try {
+    await interaction.deferUpdate();
+    await queueRaffleUpdate.flush(raffle.id);
     channel = client.channels.cache.get(raffle.channel_id) || await client.channels.fetch(raffle.channel_id);
 
     // Save old message IDs before doing anything
@@ -1448,6 +1473,18 @@ async function handleAdminRepost(interaction) {
     if (!db.replaceRaffleMessages(raffle.id, newMsg.id, newExtIds)) {
       throw new Error('The randomizer changed before the replacement was ready');
     }
+    switched = true;
+
+    // Re-read after the ID switch so picks made while the replacement messages
+    // were being posted cannot leave the new board stale.
+    try {
+      const freshRaffle = db.getRaffleById(raffle.id);
+      const freshPicks = db.getPicks(raffle.id);
+      await updateBoardMessageFull(freshRaffle, freshPicks.map(pick => pick.slot_number));
+    } catch (err) {
+      console.warn(`[ADMIN] Repost switched successfully but refresh failed — raffle=${raffle.id}:`, err.message);
+    }
+
     const oldIds = [oldMainMsgId, ...oldExtIds].filter(Boolean);
     const cleanup = await Promise.allSettled(oldIds.map(messageId => channel.messages.delete(messageId)));
     const cleanupFailures = cleanup.filter(result => result.status === 'rejected').length;
@@ -1456,7 +1493,7 @@ async function handleAdminRepost(interaction) {
     }
     console.log(`[ADMIN] Repost complete — raffle=${raffle.id}`);
   } catch (err) {
-    if (channel && newMessageIds.length > 0) {
+    if (!switched && channel && newMessageIds.length > 0) {
       await Promise.allSettled(newMessageIds.map(messageId => channel.messages.delete(messageId)));
     }
     console.error(`[ADMIN] Repost failed — raffle=${raffle.id}:`, err);
@@ -1465,6 +1502,8 @@ async function handleAdminRepost(interaction) {
     } catch (e2) {
       console.error(`[ADMIN] Repost: couldn't send error followUp:`, e2.message);
     }
+  } finally {
+    repostOperations.delete(raffle.id);
   }
 }
 
@@ -1731,14 +1770,17 @@ async function handleAssignUserSelect(interaction) {
   } catch (_) { /* fallback to username */ }
 
   // Store the pending assignment
-  pendingAssignments.set(raffleId, {
+  const assignment = {
     userId: selectedUser.id,
     username: displayName,
     adminId: interaction.user.id
-  });
+  };
+  pendingAssignments.set(raffleId, assignment);
 
   // Auto-expire after 60 minutes
-  setTimeout(() => pendingAssignments.delete(raffleId), 60 * 60 * 1000);
+  setTimeout(() => {
+    if (pendingAssignments.get(raffleId) === assignment) pendingAssignments.delete(raffleId);
+  }, 60 * 60 * 1000).unref?.();
 
   // Build available slots dropdown(s)
   const picks = db.getPicks(raffleId);
@@ -2172,30 +2214,48 @@ async function editDiscordMessageWithRetry(channel, messageId, payload, raffleId
   }
 }
 
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-});
-
 // Graceful shutdown. Docker/compose sends SIGTERM on stop/recreate; only SIGINT
 // was handled before, so container swaps killed the process without closing the
 // DB or the Discord connection. Handle both, and guard against double-invocation.
 let shuttingDown = false;
-function gracefulShutdown(signal) {
-  if (shuttingDown) return;
+let shutdownPromise = null;
+function gracefulShutdown(signal, exitCode = 0) {
+  if (shuttingDown) return shutdownPromise;
   shuttingDown = true;
   console.log(`[SHUTDOWN] Received ${signal} — closing dashboard, DB, and Discord client...`);
-  try { dashboard.stop(); } catch (err) { console.error('[SHUTDOWN] dashboard.stop failed:', err.message); }
-  try { db.close(); } catch (err) { console.error('[SHUTDOWN] db.close failed:', err.message); }
-  try { client.destroy(); } catch (err) { console.error('[SHUTDOWN] client.destroy failed:', err.message); }
-  // Force-exit if something hangs so the container doesn't wait for SIGKILL.
-  setTimeout(() => process.exit(0), 2000).unref();
-  process.exit(0);
+  client.removeAllListeners(Events.InteractionCreate);
+
+  const forceExit = setTimeout(() => {
+    console.error('[SHUTDOWN] Timed out; forcing process exit.');
+    process.exit(exitCode);
+  }, 8000);
+
+  shutdownPromise = (async () => {
+    try {
+      await Promise.race([
+        queueRaffleUpdate.flush(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('board update drain timed out')), 5000))
+      ]);
+    } catch (err) {
+      console.error('[SHUTDOWN] Board update drain failed:', err.message);
+    }
+    try { await dashboard.stop(); } catch (err) { console.error('[SHUTDOWN] dashboard.stop failed:', err.message); }
+    try { db.close(); } catch (err) { console.error('[SHUTDOWN] db.close failed:', err.message); }
+    try { await client.destroy(); } catch (err) { console.error('[SHUTDOWN] client.destroy failed:', err.message); }
+    clearTimeout(forceExit);
+    process.exit(exitCode);
+  })();
+  return shutdownPromise;
 }
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+  gracefulShutdown('unhandledRejection', 1);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  gracefulShutdown('uncaughtException', 1);
+});
 
 client.login(process.env.DISCORD_TOKEN);

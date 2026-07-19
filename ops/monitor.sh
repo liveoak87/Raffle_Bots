@@ -14,8 +14,14 @@ TELEGRAM_FILE="$BASE/.alert_telegram"   # optional: line 1 = bot token, line 2 =
 HOSTPORT=3100
 ALERT_STAMP="/tmp/ur-last-alert"
 ALERT_COOLDOWN=1800                     # max one outbound alert per 30 min (logs are always written)
+MAINTENANCE_FILE="$BASE/.maintenance"  # present only during an intentional container swap
 
 ts() { date '+%F %T'; }
+
+if [ -f "$MAINTENANCE_FILE" ]; then
+  echo "$(ts) maintenance mode: monitor restart checks skipped" >> "$LOG"
+  exit 0
+fi
 
 # Alerts are sent by THIS script (the host monitor), not the bot — so they still
 # fire when the bot itself is down. Sends to Discord and/or Telegram, whichever

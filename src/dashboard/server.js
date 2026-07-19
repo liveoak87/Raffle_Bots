@@ -84,7 +84,7 @@ function start(client, db) {
     secret: resolveSessionSecret(),
     resave: false,
     saveUninitialized: false,
-    cookie: { maxAge: 24 * 60 * 60 * 1000, httpOnly: true, sameSite: 'lax' } // 24 hours
+    cookie: { maxAge: 24 * 60 * 60 * 1000, httpOnly: true, sameSite: 'lax', secure: 'auto' } // 24 hours
   }));
 
   const resolver = new NameResolver(client);
@@ -96,10 +96,23 @@ function start(client, db) {
 }
 
 function stop() {
-  if (httpServer) {
-    httpServer.close();
-    httpServer = null;
-  }
+  if (!httpServer) return Promise.resolve();
+  const server = httpServer;
+  httpServer = null;
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    server.close(finish);
+    server.closeIdleConnections?.();
+    setTimeout(() => {
+      server.closeAllConnections?.();
+      finish();
+    }, 2000).unref?.();
+  });
 }
 
 module.exports = { start, stop };

@@ -44,6 +44,19 @@ That covers "everything is down"; the in-host monitor covers "the bot is down."
     scp ops/ultimate-randomizer.cron unraid-cf:/boot/config/plugins/dynamix/
     ssh unraid-cf 'chmod +x /mnt/user/appdata/ultimate-randomizer/{backup-db,monitor}.sh && update_cron'
 
+## Planned container maintenance
+
+The host monitor will restart a deliberately stopped container unless maintenance
+mode is enabled. Create the sentinel immediately before a controlled swap and
+remove it as soon as the replacement is healthy:
+
+    touch /mnt/user/appdata/ultimate-randomizer/.maintenance
+    # stop/recreate/verify the container
+    rm /mnt/user/appdata/ultimate-randomizer/.maintenance
+
+Never leave the sentinel in place after maintenance; while it exists, automatic
+recovery checks are intentionally disabled.
+
 ## Off-site shipping (3-2-1) — OPERATOR-ACTIVATED
 
 `ship-backups.sh` (hourly) and `restore-drill.sh` (weekly) push the local backups

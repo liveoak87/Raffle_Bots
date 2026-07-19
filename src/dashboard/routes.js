@@ -1,5 +1,3 @@
-const { spawn } = require('child_process');
-const path = require('path');
 const views = require('./views');
 
 function setupRoutes(app, db, resolver) {
@@ -129,11 +127,15 @@ function setupRoutes(app, db, resolver) {
   // dead) reports unhealthy and the Docker HEALTHCHECK / monitor can restart it.
   app.get('/health', (req, res) => {
     const client = resolver.client;
-    const ready = !!(client && client.isReady());
+    let databaseReady = false;
+    try { databaseReady = db.healthCheck(); } catch (_) { /* report unhealthy below */ }
+    const gatewayReady = !!(client && client.isReady());
+    const ready = gatewayReady && databaseReady;
     const ping = client && client.ws ? Math.round(client.ws.ping) : -1;
     res.status(ready ? 200 : 503).json({
       status: ready ? 'ok' : 'unhealthy',
-      gateway: ready ? 'connected' : 'disconnected',
+      gateway: gatewayReady ? 'connected' : 'disconnected',
+      database: databaseReady ? 'connected' : 'unavailable',
       ping_ms: ping,
       uptime_s: Math.round(process.uptime())
     });
@@ -151,16 +153,8 @@ function setupRoutes(app, db, resolver) {
   // Restart bot
   app.post('/restart', requireAuth, (req, res) => {
     res.send(views.restartingPage());
-    console.log('[DASHBOARD] Restart requested — spawning new process...');
-    const entry = path.resolve(__dirname, '..', 'index.js');
-    const child = spawn(process.execPath, [entry], {
-      cwd: path.resolve(__dirname, '..', '..'),
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env }
-    });
-    child.unref();
-    setTimeout(() => process.exit(0), 500);
+    console.log('[DASHBOARD] Restart requested — beginning graceful container restart...');
+    setTimeout(() => process.kill(process.pid, 'SIGTERM'), 500).unref?.();
   });
 
   // Home

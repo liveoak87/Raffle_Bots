@@ -65,6 +65,14 @@ db.exec(`
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (raffle_id) REFERENCES raffles(id)
   );
+
+  CREATE TABLE IF NOT EXISTS draw_publications (
+    raffle_id INTEGER PRIMARY KEY,
+    winners_json TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (raffle_id) REFERENCES raffles(id)
+  );
 `);
 
 // ── Migrations (safe for existing databases) ─────────────────────────────────
@@ -416,11 +424,38 @@ module.exports = {
       `).run(winners[0].slot_number, winners[0].user_id, JSON.stringify(winnersArray), raffleId);
       if (info.changes !== 1) return { error: 'inactive' };
 
+      db.prepare(`
+        INSERT INTO draw_publications (raffle_id, winners_json)
+        VALUES (?, ?)
+        ON CONFLICT(raffle_id) DO UPDATE SET
+          winners_json = excluded.winners_json,
+          updated_at = CURRENT_TIMESTAMP
+      `).run(raffleId, JSON.stringify(winners));
       db.prepare('DELETE FROM draw_sessions WHERE raffle_id = ?').run(raffleId);
       console.log(`[DB] Draw session completed — id=${raffleId} winnersCount=${winners.length}`);
       return { success: true, winners, session };
     });
     return complete();
+  },
+
+  getPendingDrawPublications() {
+    return db.prepare(`
+      SELECT p.raffle_id, p.winners_json AS publication_winners_json,
+             p.created_at AS publication_created_at, p.updated_at AS publication_updated_at,
+             r.*
+      FROM draw_publications p
+      JOIN raffles r ON r.id = p.raffle_id
+      WHERE r.status = 'completed'
+      ORDER BY p.created_at
+    `).all().map(row => {
+      let winners = [];
+      try { winners = JSON.parse(row.publication_winners_json); } catch (_) { /* reported by caller */ }
+      return { ...row, winners };
+    });
+  },
+
+  markDrawPublished(raffleId) {
+    return db.prepare('DELETE FROM draw_publications WHERE raffle_id = ?').run(raffleId).changes === 1;
   },
 
   completeRaffle(raffleId, winnerSlot, winnerUserId, winnersArray = null) {
@@ -489,6 +524,10 @@ module.exports = {
         SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_raffles
       FROM raffles
     `).get();
+  },
+
+  healthCheck() {
+    return db.prepare('SELECT 1 AS ok').get().ok === 1;
   },
 
   toggleAssignOnly(raffleId) {

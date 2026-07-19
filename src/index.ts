@@ -353,6 +353,34 @@ bot.use(async (ctx, next) => {
 
 // Legacy group commands route into private workflows. Creation can start
 // immediately; other actions retain a private button until their picker opens.
+const GROUP_MEMBER_COMMANDS = [
+  { command: "raffles", description: "View open raffles privately" },
+  { command: "myentries", description: "See your active entries privately" },
+  { command: "bugreport", description: "Open the bug report wizard" },
+  { command: "help", description: "Open raffle bot help" },
+];
+
+const GROUP_ADMIN_COMMANDS = [
+  { command: "newraffle", description: "Start a new raffle wizard" },
+  { command: "raffles", description: "View open raffles privately" },
+  { command: "draw", description: "Draw raffle winners privately" },
+  { command: "templates", description: "Manage raffle templates privately" },
+  { command: "editraffle", description: "Edit an active raffle privately" },
+  { command: "cancelraffle", description: "Cancel a raffle privately" },
+  { command: "rerun", description: "Re-run a past raffle privately" },
+  { command: "exportentries", description: "Export participant list privately" },
+  { command: "myentries", description: "See your active entries privately" },
+  { command: "rafflehistory", description: "View raffle history privately" },
+  { command: "groupstats", description: "View group raffle stats privately" },
+  { command: "defaults", description: "Set raffle defaults privately" },
+  { command: "setupcheck", description: "Check bot setup privately" },
+  { command: "referrals", description: "View referral stats privately" },
+  { command: "bugreport", description: "Open the bug report wizard" },
+  { command: "language", description: "Set the bot language privately" },
+  { command: "timezone", description: "Set the group timezone privately" },
+  { command: "help", description: "Open raffle bot help" },
+];
+
 const PRIVATE_ADMIN_ACTIONS: Record<string, string> = {
   newraffle: "create",
   draw: "draw",
@@ -1660,11 +1688,18 @@ async function main(): Promise<void> {
   // Admin/stats HTTP endpoint for the control tower (mode-independent).
   startAdminServer();
 
-  // All user-facing navigation is button-based in private chat. Keep command
-  // handlers for old deep links, but do not publish slash-command menus.
+  // Group chats expose useful launch commands, while private navigation stays
+  // button-based. Admin scope overrides the shorter member command list.
   await bot.api.deleteMyCommands();
   await bot.api.deleteMyCommands({ scope: { type: "all_group_chats" } });
+  await bot.api.deleteMyCommands({ scope: { type: "all_chat_administrators" } });
   await bot.api.deleteMyCommands({ scope: { type: "all_private_chats" } });
+  await bot.api.setMyCommands(GROUP_MEMBER_COMMANDS, {
+    scope: { type: "all_group_chats" },
+  });
+  await bot.api.setMyCommands(GROUP_ADMIN_COMMANDS, {
+    scope: { type: "all_chat_administrators" },
+  });
 
   // Initialize bot info (needed for bot.botInfo.id before bot.start())
   await bot.init();

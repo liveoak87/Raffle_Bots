@@ -25,12 +25,14 @@ import {
   handleNewRaffle,
   handleListRaffles,
   handleDraw,
+  handleDrawCallback,
   handleCancelRaffle,
   handleCancelCallback,
   handleRepostCallback,
   handleMyEntries,
   handleRaffleHistory,
   handleExportEntries,
+  handleExportCallback,
   handleRerun,
   handleRerunCallback,
   handleEnterCallback,
@@ -44,13 +46,20 @@ import {
   handleTemplateCallback,
   handleEditRaffle,
   handleLanguage,
+  handleLanguageCallback,
   handleStats,
   handleHealth,
   handleMetrics,
   handleActive,
   handleTimezone,
+  handleTimezoneCallback,
   handleReferralStats,
   handleGroupStats,
+  handleDefaults,
+  handleDefaultsCallback,
+  handleSetupCheck,
+  handleReferrals,
+  handleReferralsCallback,
   handleBugReport,
   notifyWinnersAndCreator,
   revokeReferralInviteLinks,
@@ -80,10 +89,12 @@ import {
   getActiveWizard,
   handleEditCallback,
   handleEditTextMessage,
+  handleEditPhotoMessage,
   getActiveEditWizard,
   startEditWizard,
   getActiveTemplateWizard,
   handleTemplateWizardMessage,
+  handleTemplateWizardPhoto,
   handleTmplWinnersCallback,
   handleTmplWinnersCustomCallback,
   handleTmplTimeCallback,
@@ -360,6 +371,9 @@ bot.command("metrics", handleMetrics);
 bot.command("active", handleActive);
 bot.command("referralstats", handleReferralStats);
 bot.command("groupstats", handleGroupStats);
+bot.command("defaults", handleDefaults);
+bot.command("setupcheck", handleSetupCheck);
+bot.command("referrals", handleReferrals);
 bot.command("bugreport", handleBugReport);
 
 // --- Callback query safety net ---
@@ -386,6 +400,8 @@ bot.on("callback_query:data", async (ctx, next) => {
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
 bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
 bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
+bot.callbackQuery(/^draw_/, handleDrawCallback);
+bot.callbackQuery(/^export_/, handleExportCallback);
 
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
@@ -413,6 +429,12 @@ bot.callbackQuery(/^repost_\d+$/, handleRepostCallback);
 
 // --- Bug report callback ---
 bot.callbackQuery("bugreport_skip", handleBugReportSkip);
+
+// --- Group admin management callbacks ---
+bot.callbackQuery(/^def_/, handleDefaultsCallback);
+bot.callbackQuery(/^refdash_-?\d+_\d+$/, handleReferralsCallback);
+bot.callbackQuery(/^langset_/, handleLanguageCallback);
+bot.callbackQuery(/^tzset_/, handleTimezoneCallback);
 
 // --- Template wizard callback queries ---
 bot.callbackQuery(/^twiz_winners_\d+$/, handleTmplWinnersCallback);
@@ -508,6 +530,18 @@ bot.on("message:photo", async (ctx) => {
   const bugState = getActiveBugReport(ctx.from.id);
   if (bugState) {
     await handleBugReportPhoto(ctx);
+    return;
+  }
+
+  const editState = getActiveEditWizard(ctx.from.id);
+  if (editState) {
+    await handleEditPhotoMessage(ctx);
+    return;
+  }
+
+  const templateState = getActiveTemplateWizard(ctx.from.id);
+  if (templateState) {
+    await handleTemplateWizardPhoto(ctx);
     return;
   }
 
@@ -1110,6 +1144,11 @@ async function checkRecurringTemplates(): Promise<void> {
           .replace("Z", "")
           .split(".")[0];
       }
+      let startsAt: string | null = null;
+      if (template.starts_after_minutes) {
+        const startDate = new Date(Date.now() + template.starts_after_minutes * 60 * 1000);
+        startsAt = startDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      }
 
       const raffle = db.createRaffle({
         chat_id: template.chat_id,
@@ -1117,27 +1156,27 @@ async function checkRecurringTemplates(): Promise<void> {
         creator_id: template.creator_id,
         creator_name: "Recurring Raffle",
         title: template.title,
-        description: "",
+        description: template.description || "",
         prize: template.prize,
         prizes: template.prizes,
         max_entries: template.max_entries,
         max_winners: template.max_winners,
         ends_at: endsAt,
-        starts_at: null,
-        display_timezone: db.getChatTimezone(template.chat_id),
-        required_chat_id: null,
-        required_chat_title: null,
+        starts_at: startsAt,
+        display_timezone: template.display_timezone || db.getChatTimezone(template.chat_id),
+        required_chat_id: template.required_chat_id,
+        required_chat_title: template.required_chat_title,
         sponsor_name: template.sponsor_name,
         anonymous: template.anonymous,
-        image_file_id: null,
-        auto_pin: 0,
-        min_account_age_days: 0,
-        require_username: 0,
-        winner_cooldown: 0,
-        show_animation: 1,
-        referral_enabled: 0,
-        max_referral_entries: 0,
-        revoke_referral_links: 0,
+        image_file_id: template.image_file_id,
+        auto_pin: template.auto_pin,
+        min_account_age_days: template.min_account_age_days,
+        require_username: template.require_username,
+        winner_cooldown: template.winner_cooldown,
+        show_animation: template.show_animation,
+        referral_enabled: template.referral_enabled,
+        max_referral_entries: template.max_referral_entries,
+        revoke_referral_links: template.revoke_referral_links,
       });
 
       try {
@@ -1152,12 +1191,17 @@ async function checkRecurringTemplates(): Promise<void> {
           "open",
           formatRaffleMessage(raffle, 0, recLang),
           keyboard,
-          null,
+          raffle.image_file_id,
           raffle.thread_id
         );
 
         if (msgId) {
           db.updateRaffleMessageId(raffle.id, msgId);
+          if (raffle.auto_pin) {
+            try {
+              await bot.api.pinChatMessage(template.chat_id, msgId, { disable_notification: true });
+            } catch {}
+          }
         }
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
@@ -1199,7 +1243,7 @@ bot.on("inline_query", async (ctx) => {
         description: "Add me to a group first, then use /newraffle",
         input_message_content: {
           message_text:
-            `🎟 <b>${escapeHtml(query)}</b>\n\nTo create this raffle, add @${(await bot.api.getMe()).username} to your group and use:\n<code>/newraffle ${escapeHtml(query)}</code>`,
+            `🎟 <b>${escapeHtml(query)}</b>\n\nTo create a raffle, add @${(await bot.api.getMe()).username} to your group and open the /newraffle setup wizard.`,
           parse_mode: "HTML" as const,
         },
       });
@@ -1412,7 +1456,6 @@ bot.on("my_chat_member", async (ctx) => {
     `Here's everything I can do:\n\n` +
     `<b>🎰 Raffle Creation</b>\n` +
     `• Interactive wizard — step-by-step in your DMs\n` +
-    `• Quick inline: <code>/newraffle Title | Prize | ends:2h</code>\n` +
     `• Multiple prizes per raffle (1st, 2nd, 3rd place)\n` +
     `• Custom banner images per raffle\n` +
     `• Delayed start & auto-close timers\n` +
@@ -1569,6 +1612,9 @@ async function main(): Promise<void> {
     { command: "myentries", description: "See your active entries" },
     { command: "rafflehistory", description: "View past raffles" },
     { command: "groupstats", description: "View group raffle stats" },
+    { command: "defaults", description: "Set group raffle defaults" },
+    { command: "setupcheck", description: "Check bot setup and permissions" },
+    { command: "referrals", description: "View group referral stats" },
     { command: "bugreport", description: "Report a bug" },
     { command: "language", description: "Set bot language" },
     { command: "timezone", description: "Set group timezone (admin)" },

@@ -23,6 +23,9 @@ interface WizardState {
     | "time"
     | "time_custom"
     | "options"
+    | "options_description"
+    | "options_maxentries"
+    | "options_startafter"
     | "options_sponsor"
     | "options_image"
     | "options_scheduled"
@@ -35,6 +38,7 @@ interface WizardState {
     | "options_scheduled_tz"
     | "options_minage"
     | "options_cooldown"
+    | "options_required_group"
     | "options_referral_max";
   targetChatId: number;
   targetThreadId: number | null;
@@ -42,7 +46,9 @@ interface WizardState {
   dmChatId: number;
   userId: number;
   title?: string;
+  description?: string;
   prizes?: string[];
+  maxEntries?: number | null;
   maxWinners?: number;
   endsAt?: string | null;
   sponsorName?: string | null;
@@ -61,6 +67,8 @@ interface WizardState {
   autoPin?: boolean;
   minAccountAgeDays?: number;
   requireUsername?: boolean;
+  requiredChatId?: number | null;
+  requiredChatTitle?: string | null;
   winnerCooldown?: number;
   showAnimation?: boolean;
   referralEnabled?: boolean;
@@ -94,6 +102,41 @@ export function cancelWizard(userId: number): void {
   wizards.delete(userId);
 }
 
+function applyGroupDefaults(state: WizardState): WizardState {
+  const defaults = db.getGroupDefaults(state.targetChatId);
+  if (!defaults) return state;
+
+  state.maxEntries = defaults.max_entries;
+  if (defaults.max_winners && defaults.max_winners > 0) {
+    state.maxWinners = defaults.max_winners;
+  }
+  if (defaults.duration_minutes && defaults.duration_minutes > 0) {
+    const endDate = new Date(Date.now() + defaults.duration_minutes * 60 * 1000);
+    state.endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+  }
+  state.sponsorName = defaults.sponsor_name;
+  if (defaults.anonymous !== null) state.anonymous = defaults.anonymous === 1;
+  if (defaults.auto_pin !== null) state.autoPin = defaults.auto_pin === 1;
+  if (defaults.min_account_age_days !== null) {
+    state.minAccountAgeDays = defaults.min_account_age_days;
+  }
+  if (defaults.require_username !== null) {
+    state.requireUsername = defaults.require_username === 1;
+  }
+  if (defaults.winner_cooldown !== null) state.winnerCooldown = defaults.winner_cooldown;
+  if (defaults.show_animation !== null) state.showAnimation = defaults.show_animation === 1;
+  if (defaults.referral_enabled !== null) state.referralEnabled = defaults.referral_enabled === 1;
+  if (defaults.max_referral_entries !== null) {
+    state.maxReferralEntries = defaults.max_referral_entries;
+  }
+  if (defaults.revoke_referral_links !== null) {
+    state.revokeReferralLinks = defaults.revoke_referral_links === 1;
+  }
+  state.requiredChatId = defaults.required_chat_id;
+  state.requiredChatTitle = defaults.required_chat_title;
+  return state;
+}
+
 export async function startWizard(ctx: Context): Promise<void> {
   const groupChatId = ctx.chat!.id;
   const groupTitle = ctx.chat!.title || "this group";
@@ -114,7 +157,7 @@ export async function startWizard(ctx: Context): Promise<void> {
       { parse_mode: "HTML" }
     );
 
-    wizards.set(userId, {
+    wizards.set(userId, applyGroupDefaults({
       step: "title",
       targetChatId: groupChatId,
       targetThreadId: ctx.message?.message_thread_id ?? null,
@@ -122,7 +165,7 @@ export async function startWizard(ctx: Context): Promise<void> {
       dmChatId: dmMsg.chat.id,
       userId,
       createdAt: Date.now(),
-    });
+    }));
 
     const notice = await ctx.reply(
       `📝 Check your DMs @${ctx.from!.username || ctx.from!.first_name} — I sent you the raffle setup there.`
@@ -342,7 +385,7 @@ export async function handleStartDeepLink(
     }
   } catch {}
 
-  wizards.set(userId, {
+  wizards.set(userId, applyGroupDefaults({
     step: "title",
     targetChatId: groupChatId,
     targetThreadId: null,
@@ -350,7 +393,7 @@ export async function handleStartDeepLink(
     dmChatId: ctx.chat!.id,
     userId,
     createdAt: Date.now(),
-  });
+  }));
 
   await ctx.reply(
     `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
@@ -388,6 +431,10 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleCustomWinnersStep(ctx, state, text);
     case "time_custom":
       return await handleCustomTimeStep(ctx, state, text);
+    case "options_description":
+      return await handleOptionsDescriptionText(ctx, state, text);
+    case "options_maxentries":
+      return await handleOptionsMaxEntriesText(ctx, state, text);
     case "options_image":
       return await handleOptionsImageText(ctx, state, text);
     case "options_sponsor":
@@ -400,6 +447,8 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
       return await handleOptionsMinAgeText(ctx, state, text);
     case "options_cooldown":
       return await handleOptionsCooldownText(ctx, state, text);
+    case "options_required_group":
+      return await handleOptionsRequiredGroupText(ctx, state, text);
     case "options_referral_max":
       return await handleOptionsReferralMaxText(ctx, state, text);
     default:
@@ -476,6 +525,9 @@ async function handlePrizeStep(
 
   const keyboard = new InlineKeyboard();
 
+  if (state.maxWinners && state.maxWinners > 0) {
+    keyboard.text(`Use default (${state.maxWinners})`, `wiz_winners_${state.maxWinners}`).row();
+  }
   if (prizes.length > 1) {
     keyboard
       .text(`${prizes.length} (match prizes)`, `wiz_winners_${prizes.length}`)
@@ -523,7 +575,11 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
 
   await ctx.answerCallbackQuery();
 
-  const keyboard = new InlineKeyboard()
+  const keyboard = new InlineKeyboard();
+  if (state.endsAt) {
+    keyboard.text("Use default duration", "wiz_time_default").row();
+  }
+  keyboard
     .text("15 min", "wiz_time_15m")
     .text("30 min", "wiz_time_30m")
     .text("1 hour", "wiz_time_1h")
@@ -582,7 +638,11 @@ async function handleCustomWinnersStep(
   state.maxWinners = num;
   state.step = "time";
 
-  const keyboard = new InlineKeyboard()
+  const keyboard = new InlineKeyboard();
+  if (state.endsAt) {
+    keyboard.text("Use default duration", "wiz_time_default").row();
+  }
+  keyboard
     .text("15 min", "wiz_time_15m")
     .text("30 min", "wiz_time_30m")
     .text("1 hour", "wiz_time_1h")
@@ -629,6 +689,12 @@ export async function handleTimeCallback(ctx: Context): Promise<void> {
         `<i>Or type /cancel to stop.</i>`,
       { parse_mode: "HTML" }
     );
+    return;
+  }
+
+  if (timeValue === "default") {
+    await ctx.answerCallbackQuery();
+    await sendOptionsScreen(ctx, state);
     return;
   }
 
@@ -687,6 +753,10 @@ async function handleCustomTimeStep(
 function buildOptionsText(state: WizardState): string {
   let msg = `⚙️ <b>Options</b> — tap to change, then Create:\n\n`;
 
+  msg += `📝 <b>Rules/description:</b> ${state.description ? "Added ✅" : "None"}\n`;
+
+  msg += `👥 <b>Max entries:</b> ${state.maxEntries ? state.maxEntries : "No limit"}\n`;
+
   const sponsor = state.sponsorName
     ? `${escapeHtml(state.sponsorName)} ✅`
     : "None";
@@ -711,6 +781,9 @@ function buildOptionsText(state: WizardState): string {
   if (state.requireUsername) {
     msg += `📛 <b>Require username:</b> Yes ✅\n`;
   }
+  if (state.requiredChatId) {
+    msg += `🔒 <b>Required group:</b> ${escapeHtml(state.requiredChatTitle || String(state.requiredChatId))} ✅\n`;
+  }
   if (state.minAccountAgeDays && state.minAccountAgeDays > 0) {
     msg += `📅 <b>Min account age:</b> ${state.minAccountAgeDays} day${state.minAccountAgeDays > 1 ? "s" : ""} ✅\n`;
   }
@@ -732,6 +805,15 @@ function buildOptionsText(state: WizardState): string {
 function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
   const kb = new InlineKeyboard();
 
+  kb.text(
+    state.description ? "📝 Edit Rules" : "📝 Add Rules",
+    "wiz_opt_description"
+  );
+  kb.text(
+    state.maxEntries ? `👥 Max: ${state.maxEntries}` : "👥 Max Entries",
+    "wiz_opt_maxentries"
+  );
+  kb.row();
   kb.text(
     state.sponsorName ? "💎 Change Sponsor" : "💎 Set Sponsor",
     "wiz_opt_sponsor"
@@ -764,6 +846,11 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
     state.requireUsername ? "📛 Username: Required" : "📛 Username: Off",
     "wiz_opt_requser"
   );
+  kb.text(
+    state.requiredChatId ? "🔒 Group Gate: On" : "🔒 Group Gate: Off",
+    "wiz_opt_required_group"
+  );
+  kb.row();
   kb.text(
     state.minAccountAgeDays ? `📅 Age: ${state.minAccountAgeDays}d` : "📅 Min Age: Off",
     "wiz_opt_minage"
@@ -1047,6 +1134,27 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
   await ctx.answerCallbackQuery();
 
   switch (data) {
+    case "wiz_opt_description":
+      state.step = "options_description";
+      await ctx.editMessageText(
+        `📝 <b>Rules / Description</b>\n\n` +
+          `Type the public rules or notes to show on the raffle post.\n\n` +
+          `Examples: eligibility, claim instructions, shipping limits, sponsor notes.\n\n` +
+          `<i>Type <code>skip</code> to remove it.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "wiz_opt_maxentries":
+      state.step = "options_maxentries";
+      await ctx.editMessageText(
+        `👥 <b>Max Entries</b>\n\n` +
+          `Type the maximum number of participants. The raffle auto-draws when full.\n\n` +
+          `<i>Type <code>0</code>, <code>none</code>, or <code>skip</code> for no limit.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
     case "wiz_opt_sponsor":
       state.step = "options_sponsor";
       await ctx.editMessageText(
@@ -1108,6 +1216,18 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
         parse_mode: "HTML",
         reply_markup: buildOptionsKeyboard(state),
       });
+      break;
+
+    case "wiz_opt_required_group":
+      state.step = "options_required_group";
+      await ctx.editMessageText(
+        `🔒 <b>Required Group Membership</b>\n\n` +
+          `Users must be members of another group/channel to enter.\n\n` +
+          `Send the required chat as <code>@publicusername</code> or numeric chat ID.\n` +
+          `The bot must be able to read membership in that chat.\n\n` +
+          `<i>Type <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
       break;
 
     case "wiz_opt_minage":
@@ -1194,6 +1314,43 @@ async function handleOptionsImageText(
     `Please send a <b>photo</b>, or type <code>skip</code> to continue without an image.`,
     { parse_mode: "HTML" }
   );
+  return true;
+}
+
+async function handleOptionsDescriptionText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.description = "";
+  } else {
+    state.description = text;
+  }
+  await sendOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleOptionsMaxEntriesText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  const lower = text.toLowerCase();
+  if (lower === "skip" || lower === "none" || text === "0") {
+    state.maxEntries = null;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const max = parseInt(text, 10);
+  if (isNaN(max) || max < 1 || max > 1_000_000) {
+    await ctx.reply("Enter a positive number, or type <code>none</code>.", { parse_mode: "HTML" });
+    return true;
+  }
+
+  state.maxEntries = max;
+  await sendOptionsScreen(ctx, state);
   return true;
 }
 
@@ -1564,8 +1721,7 @@ async function sendStandaloneTimezonePicker(ctx: Context, state: WizardState): P
   const body =
     `🌐 <b>Group timezone</b>\n\n` +
     `Current: <code>${escapeHtml(current)}</code> (now: ${escapeHtml(nowStr)})\n\n` +
-    `Pick a timezone — it'll apply to <b>this raffle</b> and become the group's default for future raffles.\n\n` +
-    `<i>Don't see yours? Admins can also use /timezone &lt;name&gt; in the group.</i>`;
+    `Pick a timezone — it'll apply to <b>this raffle</b> and become the group's default for future raffles.`;
 
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
@@ -1656,6 +1812,47 @@ async function handleOptionsCooldownText(
   return true;
 }
 
+async function handleOptionsRequiredGroupText(
+  ctx: Context,
+  state: WizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text.toLowerCase() === "none") {
+    state.requiredChatId = null;
+    state.requiredChatTitle = null;
+    await sendOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const target = text.trim();
+  const chatRef: string | number = /^-?\d+$/.test(target)
+    ? parseInt(target, 10)
+    : target.startsWith("@")
+      ? target
+      : `@${target}`;
+
+  try {
+    const chat = await ctx.api.getChat(chatRef);
+    const chatId = chat.id;
+    const title = "title" in chat && chat.title ? chat.title : String(chatRef);
+
+    // Validate the bot can check membership there.
+    await ctx.api.getChatMember(chatId, ctx.me.id);
+
+    state.requiredChatId = chatId;
+    state.requiredChatTitle = title;
+    await sendOptionsScreen(ctx, state);
+  } catch {
+    await ctx.reply(
+      `I couldn't verify that chat.\n\n` +
+        `Make sure the bot is in the required group/channel and can check members, then send its <code>@username</code> or numeric chat ID again.\n\n` +
+        `<i>Type <code>skip</code> to disable this gate.</i>`,
+      { parse_mode: "HTML" }
+    );
+  }
+  return true;
+}
+
 async function handleOptionsReferralMaxText(
   ctx: Context,
   state: WizardState,
@@ -1693,10 +1890,10 @@ async function createRaffleFromWizard(
     creator_id: state.userId,
     creator_name: displayName,
     title: state.title || "Raffle",
-    description: "",
+    description: state.description || "",
     prize: singlePrize,
     prizes: prizesJson,
-    max_entries: null,
+    max_entries: state.maxEntries || null,
     max_winners: state.maxWinners || 1,
     ends_at: state.endsAt || null,
     starts_at: state.startsAt || null,
@@ -1705,8 +1902,8 @@ async function createRaffleFromWizard(
     // changing the group default later doesn't retroactively shift existing
     // raffles' wall-clock displays.
     display_timezone: state.scheduledTimezone || db.getChatTimezone(state.targetChatId),
-    required_chat_id: null,
-    required_chat_title: null,
+    required_chat_id: state.requiredChatId || null,
+    required_chat_title: state.requiredChatTitle || null,
     sponsor_name: state.sponsorName || null,
     anonymous: state.anonymous ? 1 : 0,
     image_file_id: state.imageFileId || null,
@@ -1780,7 +1977,20 @@ interface EditWizardState {
   chatId: number;
   dmChatId: number;
   userId: number;
-  editingField: "title" | "prize" | "ends" | "max" | "sponsor" | null;
+  editingField:
+    | "title"
+    | "description"
+    | "prize"
+    | "ends"
+    | "starts"
+    | "max"
+    | "sponsor"
+    | "image"
+    | "minage"
+    | "cooldown"
+    | "required_group"
+    | "referral_max"
+    | null;
   createdAt: number;
 }
 
@@ -1873,6 +2083,7 @@ function buildEditScreenText(raffle: ReturnType<typeof db.getRaffleById>): strin
   const maxStr = raffle.max_entries ? `${raffle.max_entries}` : "No limit";
 
   let msg = `✏️ <b>Editing: ${escapeHtml(raffle.title)}</b>\n\n`;
+  msg += `📝 <b>Rules:</b> ${raffle.description ? "Added" : "None"}\n`;
   msg += `🎁 <b>Prize:</b> ${escapeHtml(raffle.prize)}\n`;
   msg += `🏆 <b>Winners:</b> ${raffle.max_winners}\n`;
   msg += `👥 <b>Entries:</b> ${count} (max: ${maxStr})\n`;
@@ -1891,7 +2102,17 @@ function buildEditScreenText(raffle: ReturnType<typeof db.getRaffleById>): strin
   }
 
   msg += `👁 <b>Hidden entries:</b> ${raffle.anonymous ? "On" : "Off"}\n`;
+  msg += `🖼 <b>Image:</b> ${raffle.image_file_id ? "Added" : "None"}\n`;
   msg += `📌 <b>Auto-pin:</b> ${raffle.auto_pin ? "On" : "Off"}\n`;
+  msg += `📛 <b>Require username:</b> ${raffle.require_username ? "On" : "Off"}\n`;
+  msg += `🌐 <b>Timezone:</b> ${escapeHtml(raffle.display_timezone || db.getChatTimezone(raffle.chat_id))}\n`;
+  msg += `📅 <b>Min account age:</b> ${raffle.min_account_age_days || 0}d\n`;
+  msg += `🛡 <b>Winner cooldown:</b> ${raffle.winner_cooldown || 0}\n`;
+  msg += `🎡 <b>Animation:</b> ${raffle.show_animation ? "On" : "Off"}\n`;
+  msg += `🔗 <b>Referrals:</b> ${raffle.referral_enabled ? `On (${raffle.max_referral_entries > 0 ? `max ${raffle.max_referral_entries}` : "unlimited"})` : "Off"}\n`;
+  if (raffle.required_chat_id) {
+    msg += `🔒 <b>Required group:</b> ${escapeHtml(raffle.required_chat_title || String(raffle.required_chat_id))}\n`;
+  }
 
   msg += `\n<i>Tap a button to edit that field:</i>`;
   return msg;
@@ -1901,23 +2122,57 @@ function buildEditScreenKeyboard(raffle: ReturnType<typeof db.getRaffleById>): I
   if (!raffle) return new InlineKeyboard();
 
   const kb = new InlineKeyboard();
+  kb.text("📝 Rules", "edit_description");
+  kb.text("🖼 Image", "edit_image");
+  kb.row();
   kb.text("✏️ Title", "edit_title");
   kb.text("🎁 Prize", "edit_prize");
   kb.row();
   kb.text("⏰ End Time", "edit_time");
+  kb.text("🕐 Start Time", "edit_start");
+  kb.row();
   kb.text("👥 Max Entries", "edit_max");
-  kb.row();
   kb.text("🏆 Winners", "edit_winners");
-  kb.text("💎 Sponsor", "edit_sponsor");
   kb.row();
+  kb.text("💎 Sponsor", "edit_sponsor");
   kb.text(
     raffle.anonymous ? "👁 Entries: Hidden" : "👁 Entries: Visible",
     "edit_anon"
   );
+  kb.row();
   kb.text(
     raffle.auto_pin ? "📌 Pin: On" : "📌 Pin: Off",
     "edit_pin"
   );
+  kb.text(
+    raffle.require_username ? "📛 Username: Required" : "📛 Username: Off",
+    "edit_requser"
+  );
+  kb.row();
+  kb.text("📅 Min Age", "edit_minage");
+  kb.text("🛡 Cooldown", "edit_cooldown");
+  kb.row();
+  kb.text("🌐 Timezone", "edit_timezone");
+  kb.row();
+  kb.text(
+    raffle.show_animation ? "🎡 Animation: On" : "🎡 Animation: Off",
+    "edit_animation"
+  );
+  kb.text(
+    raffle.required_chat_id ? "🔒 Group Gate: On" : "🔒 Group Gate: Off",
+    "edit_required_group"
+  );
+  kb.row();
+  kb.text(
+    raffle.referral_enabled ? "🔗 Referrals: On" : "🔗 Referrals: Off",
+    "edit_referral"
+  );
+  if (raffle.referral_enabled) {
+    kb.text(
+      raffle.revoke_referral_links ? "🗑 Revoke: On" : "🗑 Revoke: Off",
+      "edit_revoke_links"
+    );
+  }
   kb.row();
   kb.text("✅ Done", "edit_done");
 
@@ -2004,6 +2259,27 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  if (data === "edit_description") {
+    state.editingField = "description";
+    await ctx.editMessageText(
+      `📝 <b>Edit Rules / Description</b>\n\n` +
+        `Current: <b>${raffle.description ? escapeHtml(raffle.description.slice(0, 500)) : "None"}</b>\n\n` +
+        `Type the new rules/description, or <code>none</code> to remove:`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_image") {
+    state.editingField = "image";
+    await ctx.editMessageText(
+      `🖼 <b>Edit Image</b>\n\n` +
+        `Send a new photo, or type <code>none</code> to remove the current image.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
   if (data === "edit_prize") {
     state.editingField = "prize";
     await ctx.editMessageText(
@@ -2034,6 +2310,86 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
         `Type a number (or <code>none</code> for no limit):`,
       { parse_mode: "HTML" }
     );
+    return;
+  }
+
+  if (data === "edit_start") {
+    state.editingField = "starts";
+    await ctx.editMessageText(
+      `🕐 <b>Edit Start Time</b>\n\n` +
+        `Current: <b>${raffle.starts_at ? formatCountdown(new Date(raffle.starts_at + "Z")) : "Opens immediately"}</b>\n\n` +
+        `Type a duration from now, like <code>30m</code>, <code>2h</code>, or <code>1d</code>.\n` +
+        `Type <code>none</code> to open immediately.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_minage") {
+    state.editingField = "minage";
+    await ctx.editMessageText(
+      `📅 <b>Edit Minimum Account Age</b>\n\n` +
+        `Current: <b>${raffle.min_account_age_days || 0} days</b>\n\n` +
+        `Type a number of days, or <code>0</code> / <code>none</code> to disable.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_cooldown") {
+    state.editingField = "cooldown";
+    await ctx.editMessageText(
+      `🛡 <b>Edit Winner Cooldown</b>\n\n` +
+        `Current: <b>${raffle.winner_cooldown || 0}</b>\n\n` +
+        `Type how many recent raffles winners should sit out, or <code>0</code> / <code>none</code> to disable.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_required_group") {
+    state.editingField = "required_group";
+    await ctx.editMessageText(
+      `🔒 <b>Edit Required Group</b>\n\n` +
+        `Current: <b>${raffle.required_chat_title ? escapeHtml(raffle.required_chat_title) : "None"}</b>\n\n` +
+        `Send <code>@publicusername</code> or numeric chat ID.\n` +
+        `Type <code>none</code> to disable.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (data === "edit_timezone") {
+    const current = raffle.display_timezone || db.getChatTimezone(raffle.chat_id);
+    const kb = new InlineKeyboard()
+      .text(`${current === "America/New_York" ? "✓ " : ""}Eastern`, "edit_tz_America/New_York")
+      .text(`${current === "America/Chicago" ? "✓ " : ""}Central`, "edit_tz_America/Chicago")
+      .row()
+      .text(`${current === "America/Denver" ? "✓ " : ""}Mountain`, "edit_tz_America/Denver")
+      .text(`${current === "America/Los_Angeles" ? "✓ " : ""}Pacific`, "edit_tz_America/Los_Angeles")
+      .row()
+      .text(`${current === "America/Anchorage" ? "✓ " : ""}Alaska`, "edit_tz_America/Anchorage")
+      .text(`${current === "UTC" ? "✓ " : ""}UTC`, "edit_tz_UTC")
+      .row()
+      .text("⬅️ Back", "edit_back");
+    await ctx.editMessageText(
+      `🌐 <b>Edit Timezone</b>\n\nCurrent: <code>${escapeHtml(current)}</code>`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+    return;
+  }
+
+  if (data.startsWith("edit_tz_")) {
+    const tz = data.replace("edit_tz_", "");
+    const { resolveTimezone } = await import("./timezone");
+    const resolved = resolveTimezone(tz);
+    if (!resolved) {
+      await ctx.answerCallbackQuery({ text: "Unknown timezone.", show_alert: true });
+      return;
+    }
+    db.updateRaffleFields(state.raffleId, { display_timezone: resolved });
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
     return;
   }
 
@@ -2127,6 +2483,49 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  if (data === "edit_requser") {
+    db.updateRaffleFields(state.raffleId, { require_username: raffle.require_username ? 0 : 1 });
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_animation") {
+    db.updateRaffleFields(state.raffleId, { show_animation: raffle.show_animation ? 0 : 1 });
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
+  if (data === "edit_referral") {
+    if (raffle.referral_enabled) {
+      db.updateRaffleFields(state.raffleId, {
+        referral_enabled: 0,
+        max_referral_entries: 0,
+        revoke_referral_links: 0,
+      });
+      await updateRafflePostById(ctx, state.raffleId, state.chatId);
+      await refreshEditScreen(ctx, state);
+    } else {
+      state.editingField = "referral_max";
+      await ctx.editMessageText(
+        `🔗 <b>Enable Referrals</b>\n\n` +
+          `Type the max bonus entries per user, or <code>0</code> for unlimited.`,
+        { parse_mode: "HTML" }
+      );
+    }
+    return;
+  }
+
+  if (data === "edit_revoke_links") {
+    db.updateRaffleFields(state.raffleId, {
+      revoke_referral_links: raffle.revoke_referral_links ? 0 : 1,
+    });
+    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshEditScreen(ctx, state);
+    return;
+  }
+
   if (data === "edit_pin") {
     db.updateRaffleFields(state.raffleId, { auto_pin: raffle.auto_pin ? 0 : 1 });
     // Pin/unpin the message
@@ -2187,6 +2586,12 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
       db.updateRaffleFields(state.raffleId, { title: text });
       break;
 
+    case "description":
+      db.updateRaffleFields(state.raffleId, {
+        description: text.toLowerCase() === "none" ? "" : text,
+      });
+      break;
+
     case "prize": {
       const prizes = text.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
       if (prizes.length === 0) {
@@ -2204,6 +2609,10 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
     }
 
     case "ends": {
+      if (text.toLowerCase() === "none" || text === "0") {
+        db.updateRaffleFields(state.raffleId, { ends_at: null });
+        break;
+      }
       const parsed = parseEndTime(text);
       if (!parsed) {
         await ctx.reply(
@@ -2214,6 +2623,24 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
       }
       const endsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
       db.updateRaffleFields(state.raffleId, { ends_at: endsAt });
+      break;
+    }
+
+    case "starts": {
+      if (text.toLowerCase() === "none" || text === "0") {
+        db.updateRaffleFields(state.raffleId, { starts_at: null });
+        break;
+      }
+      const parsed = parseEndTime(text);
+      if (!parsed) {
+        await ctx.reply(
+          `Could not parse "<code>${escapeHtml(text)}</code>". Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>`,
+          { parse_mode: "HTML" }
+        );
+        return true;
+      }
+      const startsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      db.updateRaffleFields(state.raffleId, { starts_at: startsAt });
       break;
     }
 
@@ -2239,6 +2666,78 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
       }
       break;
     }
+
+    case "image": {
+      if (text.toLowerCase() === "none") {
+        db.updateRaffleFields(state.raffleId, { image_file_id: null });
+        break;
+      }
+      await ctx.reply("Please send a photo, or type <code>none</code> to remove the image.", { parse_mode: "HTML" });
+      return true;
+    }
+
+    case "minage": {
+      const lower = text.toLowerCase();
+      const days = lower === "none" ? 0 : parseInt(text, 10);
+      if (isNaN(days) || days < 0 || days > 3650) {
+        await ctx.reply("Enter a number between 0 and 3650, or <code>none</code>.", { parse_mode: "HTML" });
+        return true;
+      }
+      db.updateRaffleFields(state.raffleId, { min_account_age_days: days });
+      break;
+    }
+
+    case "cooldown": {
+      const lower = text.toLowerCase();
+      const count = lower === "none" ? 0 : parseInt(text, 10);
+      if (isNaN(count) || count < 0 || count > 100) {
+        await ctx.reply("Enter a number between 0 and 100, or <code>none</code>.", { parse_mode: "HTML" });
+        return true;
+      }
+      db.updateRaffleFields(state.raffleId, { winner_cooldown: count });
+      break;
+    }
+
+    case "required_group": {
+      if (text.toLowerCase() === "none") {
+        db.updateRaffleFields(state.raffleId, { required_chat_id: null, required_chat_title: null });
+        break;
+      }
+      const target = text.trim();
+      const chatRef: string | number = /^-?\d+$/.test(target)
+        ? parseInt(target, 10)
+        : target.startsWith("@")
+          ? target
+          : `@${target}`;
+      try {
+        const chat = await ctx.api.getChat(chatRef);
+        await ctx.api.getChatMember(chat.id, ctx.me.id);
+        db.updateRaffleFields(state.raffleId, {
+          required_chat_id: chat.id,
+          required_chat_title: "title" in chat && chat.title ? chat.title : String(chatRef),
+        });
+      } catch {
+        await ctx.reply(
+          `I couldn't verify that chat. Make sure the bot is there and can check members, then try again.`,
+          { parse_mode: "HTML" }
+        );
+        return true;
+      }
+      break;
+    }
+
+    case "referral_max": {
+      const max = parseInt(text, 10);
+      if (isNaN(max) || max < 0) {
+        await ctx.reply("Enter a number, using <code>0</code> for unlimited.", { parse_mode: "HTML" });
+        return true;
+      }
+      db.updateRaffleFields(state.raffleId, {
+        referral_enabled: 1,
+        max_referral_entries: max,
+      });
+      break;
+    }
   }
 
   // Update the live raffle post
@@ -2254,6 +2753,35 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
     );
   }
 
+  return true;
+}
+
+export async function handleEditPhotoMessage(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.photo) return false;
+
+  const state = getActiveEditWizard(ctx.from.id);
+  if (!state || state.editingField !== "image") return false;
+
+  const raffle = db.getRaffleById(state.raffleId);
+  if (!raffle || raffle.status !== "open") {
+    cancelEditWizard(ctx.from.id);
+    await ctx.reply("This raffle is no longer editable.");
+    return true;
+  }
+
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+  db.updateRaffleFields(state.raffleId, { image_file_id: largest.file_id });
+  await updateRafflePostById(ctx, state.raffleId, state.chatId);
+
+  state.editingField = null;
+  const updatedRaffle = db.getRaffleById(state.raffleId);
+  if (updatedRaffle) {
+    await ctx.reply(
+      buildEditScreenText(updatedRaffle),
+      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(updatedRaffle) }
+    );
+  }
   return true;
 }
 
@@ -2296,7 +2824,15 @@ interface TemplateWizardState {
     | "time"
     | "time_custom"
     | "options"
+    | "options_description"
+    | "options_maxentries"
+    | "options_startafter"
     | "options_sponsor"
+    | "options_image"
+    | "options_minage"
+    | "options_cooldown"
+    | "options_required_group"
+    | "options_referral_max"
     | "options_recurring";
   targetChatId: number;
   targetChatTitle: string;
@@ -2304,11 +2840,25 @@ interface TemplateWizardState {
   userId: number;
   name?: string;
   title?: string;
+  description?: string;
   prizes?: string[];
+  maxEntries?: number | null;
   maxWinners?: number;
   durationMinutes?: number | null;
+  startsAfterMinutes?: number | null;
   sponsorName?: string | null;
   anonymous?: boolean;
+  imageFileId?: string | null;
+  autoPin?: boolean;
+  minAccountAgeDays?: number;
+  requireUsername?: boolean;
+  requiredChatId?: number | null;
+  requiredChatTitle?: string | null;
+  winnerCooldown?: number;
+  showAnimation?: boolean;
+  referralEnabled?: boolean;
+  maxReferralEntries?: number;
+  revokeReferralLinks?: boolean;
   recurringMinutes?: number | null;
   createdAt: number;
 }
@@ -2407,13 +2957,44 @@ export async function handleTemplateWizardMessage(
       return await handleTmplCustomWinnersStep(ctx, state, text);
     case "time_custom":
       return await handleTmplCustomTimeStep(ctx, state, text);
+    case "options_description":
+      return await handleTmplDescriptionText(ctx, state, text);
+    case "options_maxentries":
+      return await handleTmplMaxEntriesText(ctx, state, text);
+    case "options_startafter":
+      return await handleTmplStartAfterText(ctx, state, text);
     case "options_sponsor":
       return await handleTmplSponsorText(ctx, state, text);
+    case "options_image":
+      return await handleTmplImageText(ctx, state, text);
+    case "options_minage":
+      return await handleTmplMinAgeText(ctx, state, text);
+    case "options_cooldown":
+      return await handleTmplCooldownText(ctx, state, text);
+    case "options_required_group":
+      return await handleTmplRequiredGroupText(ctx, state, text);
+    case "options_referral_max":
+      return await handleTmplReferralMaxText(ctx, state, text);
     case "options_recurring":
       return await handleTmplRecurringText(ctx, state, text);
     default:
       return false;
   }
+}
+
+export async function handleTemplateWizardPhoto(ctx: Context): Promise<boolean> {
+  if (!ctx.from || !ctx.message?.photo) return false;
+
+  const state = getActiveTemplateWizard(ctx.from.id);
+  if (!state || state.step !== "options_image") return false;
+
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+  state.imageFileId = largest.file_id;
+
+  await ctx.reply("✅ Template image added!");
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
 }
 
 async function handleTmplNameStep(
@@ -2698,14 +3279,50 @@ async function handleTmplCustomTimeStep(
 
 // --- Template options screen ---
 
+function formatTemplateDuration(minutes: number): string {
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (mins > 0) parts.push(`${mins}m`);
+  return parts.length > 0 ? parts.join(" ") : "< 1m";
+}
+
 function buildTmplOptionsText(state: TemplateWizardState): string {
   let msg = `⚙️ <b>Template Options</b> — tap to change, then Create:\n\n`;
 
+  msg += `📝 <b>Rules/description:</b> ${state.description ? "Added ✅" : "None"}\n`;
+  msg += `👥 <b>Max entries:</b> ${state.maxEntries ? state.maxEntries : "No limit"}\n`;
+  msg += `🕐 <b>Delayed start:</b> ${state.startsAfterMinutes ? formatTemplateDuration(state.startsAfterMinutes) : "opens immediately"}\n`;
   const sponsor = state.sponsorName
     ? `${escapeHtml(state.sponsorName)} ✅`
     : "None";
   msg += `💎 <b>Sponsor:</b> ${sponsor}\n`;
   msg += `👁 <b>Hidden entries:</b> ${state.anonymous ? "On ✅" : "Off"}\n`;
+  msg += `🖼 <b>Image:</b> ${state.imageFileId ? "Added ✅" : "None"}\n`;
+  msg += `📌 <b>Auto-pin:</b> ${state.autoPin ? "On ✅" : "Off"}\n`;
+  msg += `📛 <b>Require username:</b> ${state.requireUsername ? "Yes ✅" : "No"}\n`;
+  if (state.requiredChatId) {
+    msg += `🔒 <b>Required group:</b> ${escapeHtml(state.requiredChatTitle || String(state.requiredChatId))} ✅\n`;
+  }
+  if (state.minAccountAgeDays && state.minAccountAgeDays > 0) {
+    msg += `📅 <b>Min account age:</b> ${state.minAccountAgeDays}d ✅\n`;
+  }
+  if (state.winnerCooldown && state.winnerCooldown > 0) {
+    msg += `🛡 <b>Winner cooldown:</b> ${state.winnerCooldown} raffle${state.winnerCooldown === 1 ? "" : "s"} ✅\n`;
+  }
+  msg += `🎡 <b>Animation:</b> ${state.showAnimation !== false ? "On" : "Off"}\n`;
+  if (state.referralEnabled) {
+    const cap = state.maxReferralEntries && state.maxReferralEntries > 0
+      ? `max ${state.maxReferralEntries}`
+      : "unlimited";
+    msg += `🔗 <b>Referral entries:</b> On (${cap}) ✅\n`;
+    msg += `🗑 <b>Revoke links on end:</b> ${state.revokeReferralLinks ? "On ✅" : "Off"}\n`;
+  } else {
+    msg += `🔗 <b>Referral entries:</b> Off\n`;
+  }
 
   if (state.recurringMinutes) {
     const hours = Math.floor(state.recurringMinutes / 60);
@@ -2725,6 +3342,20 @@ function buildTmplOptionsKeyboard(state: TemplateWizardState): InlineKeyboard {
   const kb = new InlineKeyboard();
 
   kb.text(
+    state.description ? "📝 Edit Rules" : "📝 Add Rules",
+    "twiz_opt_description"
+  );
+  kb.text(
+    state.maxEntries ? `👥 Max: ${state.maxEntries}` : "👥 Max Entries",
+    "twiz_opt_maxentries"
+  );
+  kb.row();
+  kb.text(
+    state.startsAfterMinutes ? `🕐 Start +${formatTemplateDuration(state.startsAfterMinutes)}` : "🕐 Delay Start",
+    "twiz_opt_startafter"
+  );
+  kb.row();
+  kb.text(
     state.sponsorName ? "💎 Change Sponsor" : "💎 Set Sponsor",
     "twiz_opt_sponsor"
   );
@@ -2733,6 +3364,49 @@ function buildTmplOptionsKeyboard(state: TemplateWizardState): InlineKeyboard {
     "twiz_opt_anon"
   );
   kb.row();
+  kb.text(
+    state.imageFileId ? "🖼 Replace Image" : "🖼 Add Image",
+    "twiz_opt_image"
+  );
+  kb.text(
+    state.autoPin ? "📌 Pin: On" : "📌 Pin: Off",
+    "twiz_opt_pin"
+  );
+  kb.row();
+  kb.text(
+    state.requireUsername ? "📛 Username: Required" : "📛 Username: Off",
+    "twiz_opt_requser"
+  );
+  kb.text(
+    state.requiredChatId ? "🔒 Group Gate: On" : "🔒 Group Gate: Off",
+    "twiz_opt_required_group"
+  );
+  kb.row();
+  kb.text(
+    state.minAccountAgeDays ? `📅 Age: ${state.minAccountAgeDays}d` : "📅 Min Age: Off",
+    "twiz_opt_minage"
+  );
+  kb.text(
+    state.winnerCooldown ? `🛡 Cooldown: ${state.winnerCooldown}` : "🛡 Cooldown: Off",
+    "twiz_opt_cooldown"
+  );
+  kb.row();
+  kb.text(
+    state.showAnimation !== false ? "🎡 Animation: On" : "🎡 Animation: Off",
+    "twiz_opt_animation"
+  );
+  kb.text(
+    state.referralEnabled ? "🔗 Referrals: On" : "🔗 Referrals: Off",
+    "twiz_opt_referral"
+  );
+  kb.row();
+  if (state.referralEnabled) {
+    kb.text(
+      state.revokeReferralLinks ? "🗑 Revoke Links: On" : "🗑 Revoke Links: Off",
+      "twiz_opt_revoke_links"
+    );
+    kb.row();
+  }
   kb.text(
     state.recurringMinutes ? "🔄 Change Recurring" : "🔄 Set Recurring",
     "twiz_opt_recurring"
@@ -2770,6 +3444,37 @@ export async function handleTmplOptionsCallback(ctx: Context): Promise<void> {
   await ctx.answerCallbackQuery();
 
   switch (data) {
+    case "twiz_opt_description":
+      state.step = "options_description";
+      await ctx.editMessageText(
+        `📝 <b>Template Rules / Description</b>\n\n` +
+          `Type the rules or notes every raffle from this template should show.\n\n` +
+          `<i>Type <code>skip</code> to remove it.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_maxentries":
+      state.step = "options_maxentries";
+      await ctx.editMessageText(
+        `👥 <b>Template Max Entries</b>\n\n` +
+          `Type the maximum participant count for raffles made from this template.\n\n` +
+          `<i>Type <code>0</code>, <code>none</code>, or <code>skip</code> for no limit.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_startafter":
+      state.step = "options_startafter";
+      await ctx.editMessageText(
+        `🕐 <b>Template Delayed Start</b>\n\n` +
+          `How long after using this template should the raffle open?\n\n` +
+          `Type a duration like <code>30m</code>, <code>2h</code>, or <code>1d</code>.\n\n` +
+          `<i>Type <code>skip</code>, <code>0</code>, or <code>none</code> to open immediately.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
     case "twiz_opt_sponsor":
       state.step = "options_sponsor";
       await ctx.editMessageText(
@@ -2782,6 +3487,97 @@ export async function handleTmplOptionsCallback(ctx: Context): Promise<void> {
 
     case "twiz_opt_anon":
       state.anonymous = !state.anonymous;
+      await ctx.editMessageText(buildTmplOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildTmplOptionsKeyboard(state),
+      });
+      break;
+
+    case "twiz_opt_image":
+      state.step = "options_image";
+      await ctx.editMessageText(
+        `🖼 Send a <b>photo</b> for raffles created from this template.\n\n` +
+          `<i>Type <code>skip</code> to remove image.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_pin":
+      state.autoPin = !state.autoPin;
+      await ctx.editMessageText(buildTmplOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildTmplOptionsKeyboard(state),
+      });
+      break;
+
+    case "twiz_opt_requser":
+      state.requireUsername = !state.requireUsername;
+      await ctx.editMessageText(buildTmplOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildTmplOptionsKeyboard(state),
+      });
+      break;
+
+    case "twiz_opt_required_group":
+      state.step = "options_required_group";
+      await ctx.editMessageText(
+        `🔒 <b>Template Required Group Membership</b>\n\n` +
+          `Send the required chat as <code>@publicusername</code> or numeric chat ID.\n` +
+          `The bot must be able to read membership in that chat.\n\n` +
+          `<i>Type <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_minage":
+      state.step = "options_minage";
+      await ctx.editMessageText(
+        `📅 How many <b>days old</b> must an account be to enter raffles from this template?\n\n` +
+          `<i>Type <code>0</code> or <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_cooldown":
+      state.step = "options_cooldown";
+      await ctx.editMessageText(
+        `🛡 <b>Winner Cooldown</b>\n\n` +
+          `How many past raffles should a recent winner sit out?\n\n` +
+          `<i>Type <code>0</code> or <code>skip</code> to disable.</i>`,
+        { parse_mode: "HTML" }
+      );
+      break;
+
+    case "twiz_opt_animation":
+      state.showAnimation = state.showAnimation === false ? true : false;
+      await ctx.editMessageText(buildTmplOptionsText(state), {
+        parse_mode: "HTML",
+        reply_markup: buildTmplOptionsKeyboard(state),
+      });
+      break;
+
+    case "twiz_opt_referral":
+      if (state.referralEnabled) {
+        state.referralEnabled = false;
+        state.maxReferralEntries = undefined;
+        state.revokeReferralLinks = undefined;
+        await ctx.editMessageText(buildTmplOptionsText(state), {
+          parse_mode: "HTML",
+          reply_markup: buildTmplOptionsKeyboard(state),
+        });
+      } else {
+        state.referralEnabled = true;
+        state.step = "options_referral_max";
+        await ctx.editMessageText(
+          `🔗 <b>Template Referral Entries</b>\n\n` +
+            `Set a max bonus-entry cap per user, or type <code>0</code> for unlimited.`,
+          { parse_mode: "HTML" }
+        );
+      }
+      break;
+
+    case "twiz_opt_revoke_links":
+      state.revokeReferralLinks = !state.revokeReferralLinks;
       await ctx.editMessageText(buildTmplOptionsText(state), {
         parse_mode: "HTML",
         reply_markup: buildTmplOptionsKeyboard(state),
@@ -2815,6 +3611,167 @@ async function handleTmplSponsorText(
   } else {
     state.sponsorName = text;
   }
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplDescriptionText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  state.description = text.toLowerCase() === "skip" ? "" : text;
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplImageText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip") {
+    state.imageFileId = null;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+  await ctx.reply(
+    `Please send a <b>photo</b>, or type <code>skip</code> to continue without an image.`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
+async function handleTmplMaxEntriesText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const lower = text.toLowerCase();
+  if (lower === "skip" || lower === "none" || text === "0") {
+    state.maxEntries = null;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+  const max = parseInt(text, 10);
+  if (isNaN(max) || max < 1 || max > 1_000_000) {
+    await ctx.reply("Enter a positive number, or type <code>none</code>.", { parse_mode: "HTML" });
+    return true;
+  }
+  state.maxEntries = max;
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplStartAfterText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const lower = text.toLowerCase();
+  if (lower === "skip" || lower === "none" || text === "0") {
+    state.startsAfterMinutes = null;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+  const parsed = parseEndTime(text);
+  if (!parsed) {
+    await ctx.reply(
+      `Could not parse "<code>${escapeHtml(text)}</code>". Use formats like: <code>30m</code>, <code>2h</code>, <code>1d</code>.`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+  state.startsAfterMinutes = Math.max(1, Math.round((parsed.getTime() - Date.now()) / 60000));
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplMinAgeText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text === "0") {
+    state.minAccountAgeDays = 0;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+  const days = parseInt(text, 10);
+  if (isNaN(days) || days < 0 || days > 3650) {
+    await ctx.reply("Enter a number between 0 and 3650.");
+    return true;
+  }
+  state.minAccountAgeDays = days;
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplCooldownText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text === "0") {
+    state.winnerCooldown = 0;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+  const count = parseInt(text, 10);
+  if (isNaN(count) || count < 0 || count > 100) {
+    await ctx.reply("Enter a number between 0 and 100.");
+    return true;
+  }
+  state.winnerCooldown = count;
+  await sendTmplOptionsScreen(ctx, state);
+  return true;
+}
+
+async function handleTmplRequiredGroupText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  if (text.toLowerCase() === "skip" || text.toLowerCase() === "none") {
+    state.requiredChatId = null;
+    state.requiredChatTitle = null;
+    await sendTmplOptionsScreen(ctx, state);
+    return true;
+  }
+
+  const target = text.trim();
+  const chatRef: string | number = /^-?\d+$/.test(target)
+    ? parseInt(target, 10)
+    : target.startsWith("@")
+      ? target
+      : `@${target}`;
+  try {
+    const chat = await ctx.api.getChat(chatRef);
+    await ctx.api.getChatMember(chat.id, ctx.me.id);
+    state.requiredChatId = chat.id;
+    state.requiredChatTitle = "title" in chat && chat.title ? chat.title : String(chatRef);
+    await sendTmplOptionsScreen(ctx, state);
+  } catch {
+    await ctx.reply(
+      `I couldn't verify that chat. Make sure the bot is there and can check members, then try again.\n\n` +
+        `<i>Type <code>skip</code> to disable.</i>`,
+      { parse_mode: "HTML" }
+    );
+  }
+  return true;
+}
+
+async function handleTmplReferralMaxText(
+  ctx: Context,
+  state: TemplateWizardState,
+  text: string
+): Promise<boolean> {
+  const num = parseInt(text, 10);
+  if (isNaN(num) || num < 0) {
+    await ctx.reply("Enter a number (0 for unlimited, or a positive cap).");
+    return true;
+  }
+  state.maxReferralEntries = num;
   await sendTmplOptionsScreen(ctx, state);
   return true;
 }
@@ -2862,13 +3819,27 @@ async function createTemplateFromWizard(
       creator_id: state.userId,
       name: state.name || "Template",
       title: state.title || state.name || "Raffle",
+      description: state.description || "",
       prize: singlePrize,
       prizes: prizesJson,
-      max_entries: null,
+      max_entries: state.maxEntries || null,
       max_winners: state.maxWinners || 1,
       duration_minutes: state.durationMinutes || null,
+      starts_after_minutes: state.startsAfterMinutes || null,
+      display_timezone: db.getChatTimezone(state.targetChatId),
+      required_chat_id: state.requiredChatId || null,
+      required_chat_title: state.requiredChatTitle || null,
       sponsor_name: state.sponsorName || null,
       anonymous: state.anonymous ? 1 : 0,
+      image_file_id: state.imageFileId || null,
+      auto_pin: state.autoPin ? 1 : 0,
+      min_account_age_days: state.minAccountAgeDays || 0,
+      require_username: state.requireUsername ? 1 : 0,
+      winner_cooldown: state.winnerCooldown || 0,
+      show_animation: state.showAnimation !== false ? 1 : 0,
+      referral_enabled: state.referralEnabled ? 1 : 0,
+      max_referral_entries: state.maxReferralEntries || 0,
+      revoke_referral_links: state.revokeReferralLinks ? 1 : 0,
       recurring_interval_minutes: state.recurringMinutes || null,
     });
 

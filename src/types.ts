@@ -121,19 +121,54 @@ export interface RaffleTemplate {
   creator_id: number;
   name: string;
   title: string;
+  description: string;
   prize: string;
   prizes: string | null;
   max_entries: number | null;
   max_winners: number;
   /** Duration in minutes (used to compute ends_at when creating from template) */
   duration_minutes: number | null;
+  /** Delayed start offset in minutes from template use time (null = open immediately) */
+  starts_after_minutes: number | null;
+  display_timezone: string | null;
+  required_chat_id: number | null;
+  required_chat_title: string | null;
   sponsor_name: string | null;
   anonymous: number;
+  image_file_id: string | null;
+  auto_pin: number;
+  min_account_age_days: number;
+  require_username: number;
+  winner_cooldown: number;
+  show_animation: number;
+  referral_enabled: number;
+  max_referral_entries: number;
+  revoke_referral_links: number;
   /** Recurring interval in minutes (null = not recurring) */
   recurring_interval_minutes: number | null;
   recurring_active: number;
   next_run_at: string | null;
   created_at: string;
+}
+
+export interface GroupDefaults {
+  chat_id: number;
+  max_entries: number | null;
+  max_winners: number | null;
+  duration_minutes: number | null;
+  sponsor_name: string | null;
+  anonymous: number | null;
+  auto_pin: number | null;
+  min_account_age_days: number | null;
+  require_username: number | null;
+  winner_cooldown: number | null;
+  show_animation: number | null;
+  referral_enabled: number | null;
+  max_referral_entries: number | null;
+  revoke_referral_links: number | null;
+  required_chat_id: number | null;
+  required_chat_title: string | null;
+  updated_at: string;
 }
 
 export interface ReferralLink {

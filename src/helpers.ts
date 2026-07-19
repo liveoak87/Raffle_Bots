@@ -81,6 +81,9 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
   // Entry requirements
   const reqs: string[] = [];
   if (raffle.require_username) reqs.push("username required");
+  if (raffle.required_chat_id) {
+    reqs.push(`member of ${raffle.required_chat_title || "required group"}`);
+  }
   if (raffle.min_account_age_days > 0) reqs.push(`account ${raffle.min_account_age_days}d+ old`);
   if (raffle.winner_cooldown > 0) reqs.push(`recent winners excluded`);
   if (reqs.length > 0) {
@@ -293,6 +296,5 @@ export function buildMessageLink(chatId: number, messageId: number | null): stri
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 
 

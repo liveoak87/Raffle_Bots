@@ -6,6 +6,7 @@ import type {
   RaffleWinner,
   CreateRaffleInput,
   RaffleTemplate,
+  GroupDefaults,
   ReferralLink,
 } from "./types";
 import { getPrizeForPosition } from "./types";
@@ -69,16 +70,31 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE TABLE IF NOT EXISTS raffle_templates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
+      thread_id INTEGER,
       creator_id INTEGER NOT NULL,
       name TEXT NOT NULL,
       title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
       prize TEXT NOT NULL,
       prizes TEXT,
       max_entries INTEGER,
       max_winners INTEGER NOT NULL DEFAULT 1,
       duration_minutes INTEGER,
+      starts_after_minutes INTEGER,
+      display_timezone TEXT,
+      required_chat_id INTEGER,
+      required_chat_title TEXT,
       sponsor_name TEXT,
       anonymous INTEGER NOT NULL DEFAULT 0,
+      image_file_id TEXT,
+      auto_pin INTEGER NOT NULL DEFAULT 0,
+      min_account_age_days INTEGER NOT NULL DEFAULT 0,
+      require_username INTEGER NOT NULL DEFAULT 0,
+      winner_cooldown INTEGER NOT NULL DEFAULT 0,
+      show_animation INTEGER NOT NULL DEFAULT 1,
+      referral_enabled INTEGER NOT NULL DEFAULT 0,
+      max_referral_entries INTEGER NOT NULL DEFAULT 0,
+      revoke_referral_links INTEGER NOT NULL DEFAULT 0,
       recurring_interval_minutes INTEGER,
       recurring_active INTEGER NOT NULL DEFAULT 0,
       next_run_at TEXT,
@@ -116,6 +132,26 @@ export function initDatabase(dbPath: string): Database.Database {
       title TEXT NOT NULL DEFAULT '',
       bot_status TEXT NOT NULL DEFAULT 'member' CHECK(bot_status IN ('member', 'administrator')),
       added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS group_defaults (
+      chat_id INTEGER PRIMARY KEY,
+      max_entries INTEGER,
+      max_winners INTEGER,
+      duration_minutes INTEGER,
+      sponsor_name TEXT,
+      anonymous INTEGER,
+      auto_pin INTEGER,
+      min_account_age_days INTEGER,
+      require_username INTEGER,
+      winner_cooldown INTEGER,
+      show_animation INTEGER,
+      referral_enabled INTEGER,
+      max_referral_entries INTEGER,
+      revoke_referral_links INTEGER,
+      required_chat_id INTEGER,
+      required_chat_title TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -261,15 +297,52 @@ function migrateDatabase(): void {
     getDb().exec("ALTER TABLE raffles ADD COLUMN display_timezone TEXT DEFAULT NULL");
   }
 
-  // Add thread_id to raffle_templates if the table exists
+  // Add current template/default columns to existing databases.
   try {
     const templateColumns = tableInfo("raffle_templates").map((c) => c.name);
-    if (!templateColumns.includes("thread_id")) {
-      getDb().exec("ALTER TABLE raffle_templates ADD COLUMN thread_id INTEGER DEFAULT NULL");
-    }
+    const addTemplateColumn = (name: string, ddl: string) => {
+      if (!templateColumns.includes(name)) getDb().exec(ddl);
+    };
+    addTemplateColumn("thread_id", "ALTER TABLE raffle_templates ADD COLUMN thread_id INTEGER DEFAULT NULL");
+    addTemplateColumn("description", "ALTER TABLE raffle_templates ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+    addTemplateColumn("starts_after_minutes", "ALTER TABLE raffle_templates ADD COLUMN starts_after_minutes INTEGER DEFAULT NULL");
+    addTemplateColumn("display_timezone", "ALTER TABLE raffle_templates ADD COLUMN display_timezone TEXT DEFAULT NULL");
+    addTemplateColumn("required_chat_id", "ALTER TABLE raffle_templates ADD COLUMN required_chat_id INTEGER DEFAULT NULL");
+    addTemplateColumn("required_chat_title", "ALTER TABLE raffle_templates ADD COLUMN required_chat_title TEXT DEFAULT NULL");
+    addTemplateColumn("image_file_id", "ALTER TABLE raffle_templates ADD COLUMN image_file_id TEXT DEFAULT NULL");
+    addTemplateColumn("auto_pin", "ALTER TABLE raffle_templates ADD COLUMN auto_pin INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("min_account_age_days", "ALTER TABLE raffle_templates ADD COLUMN min_account_age_days INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("require_username", "ALTER TABLE raffle_templates ADD COLUMN require_username INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("winner_cooldown", "ALTER TABLE raffle_templates ADD COLUMN winner_cooldown INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("show_animation", "ALTER TABLE raffle_templates ADD COLUMN show_animation INTEGER NOT NULL DEFAULT 1");
+    addTemplateColumn("referral_enabled", "ALTER TABLE raffle_templates ADD COLUMN referral_enabled INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("max_referral_entries", "ALTER TABLE raffle_templates ADD COLUMN max_referral_entries INTEGER NOT NULL DEFAULT 0");
+    addTemplateColumn("revoke_referral_links", "ALTER TABLE raffle_templates ADD COLUMN revoke_referral_links INTEGER NOT NULL DEFAULT 0");
   } catch {
     // Table may not exist yet
   }
+
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS group_defaults (
+      chat_id INTEGER PRIMARY KEY,
+      max_entries INTEGER,
+      max_winners INTEGER,
+      duration_minutes INTEGER,
+      sponsor_name TEXT,
+      anonymous INTEGER,
+      auto_pin INTEGER,
+      min_account_age_days INTEGER,
+      require_username INTEGER,
+      winner_cooldown INTEGER,
+      show_animation INTEGER,
+      referral_enabled INTEGER,
+      max_referral_entries INTEGER,
+      revoke_referral_links INTEGER,
+      required_chat_id INTEGER,
+      required_chat_title TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 
   // Create persistent job queue table — survives bot restarts.
   // Used for fire-and-forget background tasks (winner DMs, banner ops, etc.)
@@ -794,20 +867,65 @@ export function createTemplate(input: {
   creator_id: number;
   name: string;
   title: string;
+  description?: string;
   prize: string;
   prizes: string | null;
   max_entries: number | null;
   max_winners: number;
   duration_minutes: number | null;
+  starts_after_minutes?: number | null;
+  display_timezone?: string | null;
+  required_chat_id?: number | null;
+  required_chat_title?: string | null;
   sponsor_name: string | null;
   anonymous: number;
+  image_file_id?: string | null;
+  auto_pin?: number;
+  min_account_age_days?: number;
+  require_username?: number;
+  winner_cooldown?: number;
+  show_animation?: number;
+  referral_enabled?: number;
+  max_referral_entries?: number;
+  revoke_referral_links?: number;
   recurring_interval_minutes: number | null;
 }): RaffleTemplate {
+  const values = {
+    description: "",
+    starts_after_minutes: null,
+    display_timezone: null,
+    required_chat_id: null,
+    required_chat_title: null,
+    image_file_id: null,
+    auto_pin: 0,
+    min_account_age_days: 0,
+    require_username: 0,
+    winner_cooldown: 0,
+    show_animation: 1,
+    referral_enabled: 0,
+    max_referral_entries: 0,
+    revoke_referral_links: 0,
+    ...input,
+  };
   const stmt = getDb().prepare(`
-    INSERT INTO raffle_templates (chat_id, thread_id, creator_id, name, title, prize, prizes, max_entries, max_winners, duration_minutes, sponsor_name, anonymous, recurring_interval_minutes, recurring_active, next_run_at)
-    VALUES (@chat_id, @thread_id, @creator_id, @name, @title, @prize, @prizes, @max_entries, @max_winners, @duration_minutes, @sponsor_name, @anonymous, @recurring_interval_minutes, 0, NULL)
+    INSERT INTO raffle_templates (
+      chat_id, thread_id, creator_id, name, title, description, prize, prizes,
+      max_entries, max_winners, duration_minutes, starts_after_minutes,
+      display_timezone, required_chat_id, required_chat_title, sponsor_name,
+      anonymous, image_file_id, auto_pin, min_account_age_days, require_username,
+      winner_cooldown, show_animation, referral_enabled, max_referral_entries,
+      revoke_referral_links, recurring_interval_minutes, recurring_active, next_run_at
+    )
+    VALUES (
+      @chat_id, @thread_id, @creator_id, @name, @title, @description, @prize, @prizes,
+      @max_entries, @max_winners, @duration_minutes, @starts_after_minutes,
+      @display_timezone, @required_chat_id, @required_chat_title, @sponsor_name,
+      @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username,
+      @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries,
+      @revoke_referral_links, @recurring_interval_minutes, 0, NULL
+    )
   `);
-  const result = stmt.run(input);
+  const result = stmt.run(values);
   return getDb()
     .prepare("SELECT * FROM raffle_templates WHERE id = ?")
     .get(result.lastInsertRowid) as RaffleTemplate;
@@ -1106,19 +1224,23 @@ export function updateRaffleFields(
 ): boolean {
   const allowedFields = [
     "title",
+    "description",
     "prize",
     "prizes",
     "max_entries",
     "max_winners",
     "ends_at",
+    "starts_at",
     "sponsor_name",
-    "description",
     "anonymous",
     "auto_pin",
     "min_account_age_days",
     "require_username",
     "winner_cooldown",
+    "show_animation",
     "image_file_id",
+    "required_chat_id",
+    "required_chat_title",
     "referral_enabled",
     "max_referral_entries",
     "revoke_referral_links",
@@ -1142,6 +1264,79 @@ export function updateRaffleFields(
     .prepare(`UPDATE raffles SET ${updates.join(", ")} WHERE id = ?`)
     .run(...values);
   return result.changes > 0;
+}
+
+// --- Group defaults ---
+
+export function getGroupDefaults(chatId: number): GroupDefaults | undefined {
+  return getDb()
+    .prepare("SELECT * FROM group_defaults WHERE chat_id = ?")
+    .get(chatId) as GroupDefaults | undefined;
+}
+
+export function upsertGroupDefaults(
+  chatId: number,
+  fields: Partial<Omit<GroupDefaults, "chat_id" | "updated_at">>
+): void {
+  const existing = getGroupDefaults(chatId);
+  const defaults: Omit<GroupDefaults, "updated_at"> = {
+    chat_id: chatId,
+    max_entries: null,
+    max_winners: null,
+    duration_minutes: null,
+    sponsor_name: null,
+    anonymous: null,
+    auto_pin: null,
+    min_account_age_days: null,
+    require_username: null,
+    winner_cooldown: null,
+    show_animation: null,
+    referral_enabled: null,
+    max_referral_entries: null,
+    revoke_referral_links: null,
+    required_chat_id: null,
+    required_chat_title: null,
+    ...(existing || {}),
+    ...fields,
+  };
+
+  getDb()
+    .prepare(
+      `INSERT INTO group_defaults (
+        chat_id, max_entries, max_winners, duration_minutes, sponsor_name,
+        anonymous, auto_pin, min_account_age_days, require_username,
+        winner_cooldown, show_animation, referral_enabled, max_referral_entries,
+        revoke_referral_links, required_chat_id, required_chat_title, updated_at
+      )
+      VALUES (
+        @chat_id, @max_entries, @max_winners, @duration_minutes, @sponsor_name,
+        @anonymous, @auto_pin, @min_account_age_days, @require_username,
+        @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries,
+        @revoke_referral_links, @required_chat_id, @required_chat_title, datetime('now')
+      )
+      ON CONFLICT(chat_id) DO UPDATE SET
+        max_entries = excluded.max_entries,
+        max_winners = excluded.max_winners,
+        duration_minutes = excluded.duration_minutes,
+        sponsor_name = excluded.sponsor_name,
+        anonymous = excluded.anonymous,
+        auto_pin = excluded.auto_pin,
+        min_account_age_days = excluded.min_account_age_days,
+        require_username = excluded.require_username,
+        winner_cooldown = excluded.winner_cooldown,
+        show_animation = excluded.show_animation,
+        referral_enabled = excluded.referral_enabled,
+        max_referral_entries = excluded.max_referral_entries,
+        revoke_referral_links = excluded.revoke_referral_links,
+        required_chat_id = excluded.required_chat_id,
+        required_chat_title = excluded.required_chat_title,
+        updated_at = datetime('now')`
+    )
+    .run(defaults);
+}
+
+export function clearGroupDefaults(chatId: number): void {
+  getDb().prepare("DELETE FROM group_defaults WHERE chat_id = ?").run(chatId);
 }
 
 // --- Chat settings (language) ---

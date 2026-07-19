@@ -13,14 +13,13 @@ import {
   formatWinnersMessage,
   formatCountdown,
   isGroupAdmin,
-  parseEndTime,
   replyPrivately,
   buildRaffleKeyboard,
   buildMessageLink,
 } from "./helpers";
 import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendCustomImage, sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 
 // --- Smart debounced post updates ---
 // Pattern: first entry refreshes the message immediately (so users see their
@@ -160,36 +159,32 @@ export async function handleHelp(ctx: Context): Promise<void> {
   await replyPrivately(ctx,
     `🎟 <b>Raffle Bot Help</b>\n\n` +
       `<b>Creating a Raffle:</b>\n` +
-      `/newraffle - Interactive wizard (in DMs)\n\n` +
-      `<b>Quick format:</b>\n` +
-      `<code>/newraffle Title | Prize</code>\n\n` +
-      `<b>With options:</b>\n` +
-      `<code>/newraffle Title | Prize | winners:N | max:N | ends:30m</code>\n\n` +
-      `<b>Multiple prizes (one per winner position):</b>\n` +
-      `<code>/newraffle Title | prizes: $100, $50, $25 | ends:1d</code>\n\n` +
-      `<b>Parameters:</b>\n` +
-      `• <b>Title</b> - Name of the raffle (required)\n` +
-      `• <b>Prize</b> - Single prize (or use prizes: for multiple)\n` +
-      `• <b>prizes: A, B, C</b> - Comma-separated prizes for 1st, 2nd, 3rd...\n` +
-      `• <b>winners:N</b> - Number of winners (default: 1, auto-set from prizes count)\n` +
-      `• <b>max:N</b> - Maximum entries (auto-draws when full)\n` +
-      `• <b>ends:TIME</b> - Auto-close time (30m, 2h, 1d)\n` +
-      `• <b>sponsor:Name</b> - Add a sponsor to the raffle\n\n` +
-      `<b>Wizard options:</b> The interactive wizard also supports:\n` +
+      `/newraffle - Opens the interactive setup wizard in DMs\n\n` +
+      `<b>Wizard options include:</b>\n` +
+      `• 📝 Rules / description\n` +
+      `• 👥 Max entries\n` +
       `• 👁 Anonymous mode (hide entries until draw)\n` +
       `• 🖼 Raffle banner image\n` +
       `• 🕐 Delayed start time\n` +
       `• 💎 Sponsor\n` +
-      `• 📌 Auto-pin raffle message\n\n` +
+      `• 📌 Auto-pin raffle message\n` +
+      `• 🔒 Required group membership\n` +
+      `• 📛 Username requirement\n` +
+      `• 📅 Minimum account age\n` +
+      `• 🛡 Winner cooldown\n` +
+      `• 🔗 Referral bonus entries\n\n` +
       `<b>Templates:</b>\n` +
       `/templates - Create, use, delete & manage templates\n\n` +
       `<b>Management:</b>\n` +
-      `/draw [id] - Draw winners (admin only)\n` +
-      `/editraffle [id] - Edit an active raffle (admin only)\n` +
-      `/cancelraffle [id] - Cancel a raffle (admin only)\n` +
-      `/exportentries [id] - Export all participants (admin only — works in group or DM)\n` +
-      `/rerun [id] - Re-run a past raffle (admin only)\n` +
-      `/language [code] - Set bot language (admin only)\n` +
+      `/draw - Pick a raffle and draw winners (admin only)\n` +
+      `/editraffle - Pick and edit an active raffle (admin only)\n` +
+      `/cancelraffle - Pick and cancel a raffle (admin only)\n` +
+      `/exportentries - Pick/export participants (admin only — works in group or DM)\n` +
+      `/rerun - Pick a past raffle to re-run (admin only)\n` +
+      `/language - Set bot language (admin only)\n` +
+      `/defaults - Set group raffle defaults (admin only)\n` +
+      `/setupcheck - Check bot setup and permissions (admin only)\n` +
+      `/referrals - View group referral stats (admin only)\n` +
       `/raffles - List open raffles in this chat\n` +
       `/rafflehistory - View recent raffle history\n` +
       `/myentries - See your active entries\n\n` +
@@ -212,150 +207,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
     return;
   }
 
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/newraffle(@\w+)?/i, "").trim();
-
-  if (!args) {
-    // Launch the interactive wizard
-    await startWizard(ctx);
-    return;
-  }
-
-  const parts = args.split("|").map((p) => p.trim());
-
-  const title = parts[0];
-  if (!title) {
-    await replyPrivately(ctx, "Title is required.");
-    return;
-  }
-
-  let singlePrize = "";
-  let prizesList: string[] | null = null;
-  let maxWinners = 1;
-  let maxEntries: number | null = null;
-  let endsAt: string | null = null;
-  let description = "";
-  let sponsorName: string | null = null;
-
-  for (let i = 1; i < parts.length; i++) {
-    const part = parts[i];
-    const partLower = part.toLowerCase();
-
-    const winnersMatch = partLower.match(/^winners?\s*:\s*(\d+)$/);
-    const maxMatch = partLower.match(/^max\s*:\s*(\d+)$/);
-    const endsMatch = part.match(/^ends?\s*:\s*(.+)$/i);
-    const prizesMatch = part.match(/^prizes?\s*:\s*(.+)$/i);
-    const sponsorMatch = part.match(/^sponsor\s*:\s*(.+)$/i);
-
-    if (winnersMatch) {
-      maxWinners = Math.max(1, Math.min(50, parseInt(winnersMatch[1], 10)));
-    } else if (maxMatch) {
-      maxEntries = Math.max(1, parseInt(maxMatch[1], 10));
-    } else if (endsMatch) {
-      const parsed = parseEndTime(endsMatch[1].trim());
-      if (parsed) {
-        endsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
-      } else {
-        await replyPrivately(ctx,
-          `Could not parse end time "${endsMatch[1]}". Use formats like: 30m, 2h, 1d`
-        );
-        return;
-      }
-    } else if (prizesMatch) {
-      prizesList = prizesMatch[1]
-        .split(",")
-        .map((p) => p.trim())
-        .filter((p) => p.length > 0);
-      if (prizesList.length === 0) {
-        await replyPrivately(ctx, "Please provide at least one prize.");
-        return;
-      }
-    } else if (sponsorMatch) {
-      sponsorName = sponsorMatch[1].trim();
-    } else if (!singlePrize) {
-      // First unrecognized segment is the single prize
-      singlePrize = part;
-    } else {
-      // Extra text goes into description
-      description += (description ? "\n" : "") + part;
-    }
-  }
-
-  // If prizes: was used, auto-set max_winners to match prize count (unless explicitly set)
-  if (prizesList && prizesList.length > 1) {
-    const explicitWinners = parts.some((p) =>
-      p.toLowerCase().match(/^winners?\s*:\s*\d+$/)
-    );
-    if (!explicitWinners) {
-      maxWinners = prizesList.length;
-    }
-  }
-
-  // Need either a single prize or a prizes list
-  const finalPrize = singlePrize || (prizesList ? prizesList[0] : "");
-  if (!finalPrize) {
-    await replyPrivately(ctx,
-      "Please provide a prize.\n" +
-        "Example: <code>/newraffle Title | Prize</code>\n" +
-        "Or: <code>/newraffle Title | prizes: $100, $50, $25</code>",
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  const displayName = getUserDisplayName(
-    ctx.from!.first_name,
-    ctx.from!.last_name
-  );
-
-  const threadId = ctx.message?.message_thread_id ?? null;
-
-  const raffle = db.createRaffle({
-    chat_id: ctx.chat.id,
-    thread_id: threadId,
-    creator_id: userId,
-    creator_name: displayName,
-    title,
-    description,
-    prize: finalPrize,
-    prizes: prizesList ? JSON.stringify(prizesList) : null,
-    max_entries: maxEntries,
-    max_winners: maxWinners,
-    ends_at: endsAt,
-    starts_at: null,
-    display_timezone: db.getChatTimezone(ctx.chat.id),
-    required_chat_id: null,
-    required_chat_title: null,
-    sponsor_name: sponsorName,
-    anonymous: 0,
-    image_file_id: null,
-    auto_pin: 0,
-    min_account_age_days: 0,
-    require_username: 0,
-    winner_cooldown: 0,
-    show_animation: 1,
-    referral_enabled: 0,
-    max_referral_entries: 0,
-    revoke_referral_links: 0,
-  });
-
-  const lang = db.getChatLanguage(ctx.chat.id);
-  const botUsername = ctx.me.username;
-
-  const keyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
-
-  const msgId = await sendRafflePost(
-    ctx.api,
-    ctx.chat.id,
-    "open",
-    formatRaffleMessage(raffle, 0, lang),
-    keyboard,
-    null,
-    raffle.thread_id
-  );
-
-  if (msgId) {
-    db.updateRaffleMessageId(raffle.id, msgId);
-  }
+  await startWizard(ctx);
 }
 
 // /raffles - List open raffles
@@ -394,7 +246,59 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
   await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
-// /draw - Draw winners
+async function executeDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof db.getRaffleById>>): Promise<string> {
+  const entryCount = db.getEntryCount(raffle.id);
+  if (entryCount === 0) {
+    db.markRaffleDrawn(raffle.id);
+    await revokeReferralInviteLinks(ctx.api, raffle.id);
+    await updateRafflePost(ctx, raffle.id);
+    return `🎟 <b>${escapeHtml(raffle.title)}</b>\n\nNo entries were received. Raffle closed with no winners.`;
+  }
+
+  const lang = db.getChatLanguage(raffle.chat_id);
+  const entries = db.getEntriesForRaffle(raffle.id);
+  const entryNames = entries.map((e) => e.user_display_name);
+  const winners = db.selectWinners(raffle.id);
+
+  // Countdown animation (if animation enabled and at least 1 entry)
+  if (entryNames.length >= 1 && raffle.show_animation) {
+    await sendWheelSpin(ctx.api, raffle.chat_id, raffle.thread_id);
+  }
+
+  // Announce winners with embedded "WINNERS DRAWN" banner
+  await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
+
+  // Mark as drawn and announced after successful announcement
+  db.markRaffleDrawn(raffle.id);
+  db.markRaffleAnnounced(raffle.id);
+  await revokeReferralInviteLinks(ctx.api, raffle.id);
+
+  await updateRafflePost(ctx, raffle.id);
+
+  // DM winners and the creator
+  await notifyWinnersAndCreator(ctx.api, raffle, winners);
+  return `🏆 Winners drawn for <b>${escapeHtml(raffle.title)}</b>.`;
+}
+
+async function isAdminOfChat(ctx: Context, chatId: number, userId: number): Promise<boolean> {
+  try {
+    const member = await ctx.api.getChatMember(chatId, userId);
+    return member.status === "administrator" || member.status === "creator";
+  } catch {
+    return false;
+  }
+}
+
+function buildDrawKeyboard(chatId: number, raffles: Array<NonNullable<ReturnType<typeof db.getRaffleById>>>): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const r of raffles) {
+    keyboard.text(`🏆 ${r.title.slice(0, 32)}`, `draw_pick_${chatId}_${r.id}`).row();
+  }
+  keyboard.text("❌ Cancel", "draw_cancel");
+  return keyboard;
+}
+
+// /draw - Draw winners through a guided pick/confirm flow
 export async function handleDraw(ctx: Context): Promise<void> {
   if (!ctx.chat || ctx.chat.type === "private") {
     await ctx.reply("Use this command in a group chat.");
@@ -408,84 +312,108 @@ export async function handleDraw(ctx: Context): Promise<void> {
     return;
   }
 
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/draw(@\w+)?/i, "").trim();
+  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  if (openRaffles.length === 0) {
+    await replyPrivately(ctx, "No open raffles to draw from.");
+    return;
+  }
 
-  let raffle: ReturnType<typeof db.getRaffleById>;
+  if (openRaffles.length === 1) {
+    const raffle = openRaffles[0];
+    const keyboard = new InlineKeyboard()
+      .text("✅ Draw Winners", `draw_confirm_${ctx.chat.id}_${raffle.id}`)
+      .row()
+      .text("❌ Cancel", "draw_cancel");
+    await replyPrivately(
+      ctx,
+      `🏆 <b>Draw winners?</b>\n\n` +
+        `Raffle: <b>${escapeHtml(raffle.title)}</b>\n` +
+        `Entries: <b>${db.getEntryCount(raffle.id)}</b>\n` +
+        `Winners: <b>${raffle.max_winners}</b>`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
 
-  if (args) {
-    const raffleId = parseInt(args, 10);
-    if (isNaN(raffleId)) {
-      await replyPrivately(ctx, "Please provide a valid raffle ID. Usage: /draw 1");
+  await replyPrivately(ctx, `🏆 <b>Pick a raffle to draw:</b>`, {
+    parse_mode: "HTML",
+    reply_markup: buildDrawKeyboard(ctx.chat.id, openRaffles),
+  });
+}
+
+export async function handleDrawCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  if (data === "draw_cancel") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText("Draw cancelled.");
+    return;
+  }
+
+  const pick = data.match(/^draw_pick_(-?\d+)_(\d+)$/);
+  if (pick) {
+    const chatId = parseInt(pick[1], 10);
+    const raffleId = parseInt(pick[2], 10);
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can draw winners.", show_alert: true });
       return;
     }
-    raffle = db.getRaffleById(raffleId);
-  } else {
-    const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
-    if (openRaffles.length === 0) {
-      await replyPrivately(ctx, "No open raffles to draw from.");
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.chat_id !== chatId || raffle.status !== "open") {
+      await ctx.answerCallbackQuery({ text: "This raffle is no longer open.", show_alert: true });
       return;
     }
-    if (openRaffles.length === 1) {
-      raffle = openRaffles[0];
-    } else {
-      let msg = `Multiple open raffles found. Please specify which one:\n\n`;
-      for (const r of openRaffles) {
-        msg += `/draw ${r.id} - ${escapeHtml(r.title)}\n`;
-      }
-      await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    await ctx.answerCallbackQuery();
+    const keyboard = new InlineKeyboard()
+      .text("✅ Draw Winners", `draw_confirm_${chatId}_${raffle.id}`)
+      .row()
+      .text("⬅️ Back", `draw_back_${chatId}`);
+    await ctx.editMessageText(
+      `🏆 <b>Draw winners?</b>\n\n` +
+        `Raffle: <b>${escapeHtml(raffle.title)}</b>\n` +
+        `Entries: <b>${db.getEntryCount(raffle.id)}</b>\n` +
+        `Winners: <b>${raffle.max_winners}</b>`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+
+  const back = data.match(/^draw_back_(-?\d+)$/);
+  if (back) {
+    const chatId = parseInt(back[1], 10);
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can draw winners.", show_alert: true });
       return;
     }
-  }
-
-  if (!raffle) {
-    await replyPrivately(ctx, "Raffle not found.");
+    const openRaffles = db.getOpenRafflesForChat(chatId);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(`🏆 <b>Pick a raffle to draw:</b>`, {
+      parse_mode: "HTML",
+      reply_markup: buildDrawKeyboard(chatId, openRaffles),
+    });
     return;
   }
 
-  if (raffle.chat_id !== ctx.chat.id) {
-    await replyPrivately(ctx, "That raffle doesn't belong to this chat.");
+  const confirm = data.match(/^draw_confirm_(-?\d+)_(\d+)$/);
+  if (!confirm) return;
+
+  const chatId = parseInt(confirm[1], 10);
+  const raffleId = parseInt(confirm[2], 10);
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can draw winners.", show_alert: true });
     return;
   }
 
-  if (raffle.status === "drawn") {
-    await replyPrivately(ctx, "This raffle has already been drawn.");
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.chat_id !== chatId || raffle.status !== "open") {
+    await ctx.answerCallbackQuery({ text: "This raffle is no longer open.", show_alert: true });
     return;
   }
 
-  const entryCount = db.getEntryCount(raffle.id);
-  if (entryCount === 0) {
-    db.markRaffleDrawn(raffle.id);
-    await revokeReferralInviteLinks(ctx.api, raffle.id);
-    await replyPrivately(ctx,
-      `🎟 <b>${escapeHtml(raffle.title)}</b>\n\nNo entries were received. Raffle closed with no winners.`,
-      { parse_mode: "HTML" });
-    await updateRafflePost(ctx, raffle.id);
-    return;
-  }
-
-  const lang = db.getChatLanguage(ctx.chat!.id);
-  const entries = db.getEntriesForRaffle(raffle.id);
-  const entryNames = entries.map((e) => e.user_display_name);
-  const winners = db.selectWinners(raffle.id);
-
-  // Countdown animation (if animation enabled and at least 1 entry)
-  if (entryNames.length >= 1 && raffle.show_animation) {
-    await sendWheelSpin(ctx.api, ctx.chat!.id, raffle.thread_id);
-  }
-
-  // Announce winners with embedded "WINNERS DRAWN" banner
-  await sendWinnerPost(ctx.api, ctx.chat!.id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
-
-  // Mark as drawn and announced after successful announcement
-  db.markRaffleDrawn(raffle.id);
-  db.markRaffleAnnounced(raffle.id);
-  await revokeReferralInviteLinks(ctx.api, raffle.id);
-
-  await updateRafflePost(ctx, raffle.id);
-
-  // DM winners and the creator
-  await notifyWinnersAndCreator(ctx.api, raffle, winners);
+  await ctx.answerCallbackQuery({ text: "Drawing winners..." });
+  const result = await executeDraw(ctx, raffle);
+  await ctx.editMessageText(result, { parse_mode: "HTML" });
 }
 
 // /cancelraffle - Cancel a raffle (sends interactive buttons to DM)
@@ -761,12 +689,77 @@ export async function handleRaffleHistory(ctx: Context): Promise<void> {
 //   - In a group: lists/exports raffles from that group (admin only)
 //   - In DM:      lists/exports raffles the user CREATED across all groups
 //                 (admin-of-chat fallback for non-creator admins)
+async function sendEntriesExport(
+  ctx: Context,
+  raffle: NonNullable<ReturnType<typeof db.getRaffleById>>,
+  recipientId: number
+): Promise<void> {
+  const entries = db.getEntriesForRaffle(raffle.id);
+  if (entries.length === 0) {
+    await ctx.api.sendMessage(
+      recipientId,
+      `No entries found for raffle "${escapeHtml(raffle.title)}".`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  let msg = `📋 <b>Participants Export: ${escapeHtml(raffle.title)}</b>\n`;
+  msg += `<b>Raffle ID:</b> ${raffle.id} | <b>Status:</b> ${raffle.status}\n`;
+  msg += `<b>Total Entries:</b> ${entries.length}\n\n`;
+  msg += `<b>Participant List:</b>\n`;
+  entries.forEach((e, i) => {
+    const username = e.user_name ? `@${e.user_name}` : `[${e.user_id}]`;
+    msg += `${i + 1}. ${escapeHtml(e.user_display_name)} (${username})\n`;
+  });
+  msg += `\n<b>User IDs (for re-run):</b>\n<code>`;
+  msg += entries.map((e) => e.user_id).join(", ");
+  msg += `</code>`;
+  msg += `\n\n💡 To create a raffle with these same participants, use the /rerun picker in the group.`;
+
+  if (msg.length > 4000) {
+    const csvLines = ["#,Display Name,Username,User ID,Entered At"];
+    entries.forEach((e, i) => {
+      csvLines.push(
+        `${i + 1},"${e.user_display_name}","${e.user_name || ""}",${e.user_id},"${e.entered_at}"`
+      );
+    });
+    const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
+    await ctx.api.sendDocument(
+      recipientId,
+      new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
+      {
+        caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nTo create a raffle with these same participants, use the /rerun picker in the group.`,
+      }
+    );
+    return;
+  }
+
+  await ctx.api.sendMessage(recipientId, msg, { parse_mode: "HTML" });
+}
+
+async function canExportRaffle(
+  ctx: Context,
+  raffle: NonNullable<ReturnType<typeof db.getRaffleById>>,
+  userId: number,
+  sourceChatId?: number
+): Promise<boolean> {
+  if (sourceChatId !== undefined && sourceChatId !== raffle.chat_id) return false;
+  if (raffle.creator_id === userId) return true;
+  return isAdminOfChat(ctx, raffle.chat_id, userId);
+}
+
 export async function handleExportEntries(ctx: Context): Promise<void> {
   if (!ctx.from || !ctx.chat) return;
   const userId = ctx.from.id;
   const text = ctx.message?.text || "";
-  const args = text.replace(/^\/exportentries(@\w+)?/i, "").trim();
+  const typedArgs = text.replace(/^\/exportentries(@\w+)?/i, "").trim();
+  const args = "";
   const inDm = ctx.chat.type === "private";
+  if (typedArgs) {
+    const reply = (message: string) => (inDm ? ctx.reply(message) : replyPrivately(ctx, message));
+    await reply("Participant export is button-based now. Opening the export picker.");
+  }
 
   // ---- Listing branch (no raffle ID provided) ----
   if (!args) {
@@ -777,7 +770,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
         await ctx.reply(
           "You haven't created any raffles yet.\n\n" +
             "If you want to export a raffle from a group where you're an admin but didn't create it, " +
-            "run <code>/exportentries</code> directly in that group instead.",
+            "open the export picker from that group.",
           { parse_mode: "HTML" }
         );
         return;
@@ -806,20 +799,21 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
       }
 
       let msg = `📋 <b>Your recent raffles</b> (across all groups)\n\n`;
-      msg += `Reply with the command for the one you want to export:\n\n`;
+      msg += `Pick the raffle you want to export:\n\n`;
+      const keyboard = new InlineKeyboard();
       for (const [chatId, list] of byChat) {
         const name = groupNames.get(chatId) || `Chat ${chatId}`;
         msg += `<b>📍 ${escapeHtml(name)}</b>\n`;
         for (const r of list) {
           const count = db.getEntryCount(r.id);
-          msg += `<code>/exportentries ${r.id}</code> — ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
+          msg += `• ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
+          keyboard.text(`${r.title.slice(0, 28)} (${count})`, `export_pick_${chatId}_${r.id}`).row();
         }
         msg += `\n`;
       }
       msg += `<i>Showing up to 30 most recent raffles you created.</i>`;
-      // Send in DM (single chunk in most cases; if huge, this will fall through to a single reply
-      // and Telegram will truncate visibly — acceptable for the lister UX)
-      await ctx.reply(msg, { parse_mode: "HTML" });
+      keyboard.text("❌ Close", "export_close");
+      await ctx.reply(msg, { parse_mode: "HTML", reply_markup: keyboard });
       return;
     }
 
@@ -834,12 +828,15 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
       await replyPrivately(ctx, "No raffles found in this chat.");
       return;
     }
-    let msg = `Which raffle do you want to export?\n\n`;
+    let msg = `📋 <b>Pick a raffle to export:</b>\n\n`;
+    const keyboard = new InlineKeyboard();
     for (const r of allRaffles) {
       const count = db.getEntryCount(r.id);
-      msg += `/exportentries ${r.id} - ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
+      msg += `• ${escapeHtml(r.title)} (${count} entries, ${r.status})\n`;
+      keyboard.text(`${r.title.slice(0, 28)} (${count})`, `export_pick_${ctx.chat.id}_${r.id}`).row();
     }
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+    keyboard.text("❌ Close", "export_close");
+    await replyPrivately(ctx, msg, { parse_mode: "HTML", reply_markup: keyboard });
     return;
   }
 
@@ -880,58 +877,33 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     return;
   }
 
-  const entries = db.getEntriesForRaffle(raffleId);
-  if (entries.length === 0) {
-    const reply = (text: string, opts?: { parse_mode?: string }) =>
-      inDm ? ctx.reply(text, opts as Record<string, unknown>) : replyPrivately(ctx, text, opts);
-    await reply(`No entries found for raffle "${escapeHtml(raffle.title)}".`, { parse_mode: "HTML" });
-    return;
-  }
+  await sendEntriesExport(ctx, raffle, userId);
+}
 
-  // Build the message
-  let msg = `📋 <b>Participants Export: ${escapeHtml(raffle.title)}</b>\n`;
-  msg += `<b>Raffle ID:</b> ${raffle.id} | <b>Status:</b> ${raffle.status}\n`;
-  msg += `<b>Total Entries:</b> ${entries.length}\n\n`;
-  msg += `<b>Participant List:</b>\n`;
-  entries.forEach((e, i) => {
-    const username = e.user_name ? `@${e.user_name}` : `[${e.user_id}]`;
-    msg += `${i + 1}. ${escapeHtml(e.user_display_name)} (${username})\n`;
-  });
-  msg += `\n<b>User IDs (for re-run):</b>\n<code>`;
-  msg += entries.map((e) => e.user_id).join(", ");
-  msg += `</code>`;
-  msg += `\n\n💡 Use <code>/rerun ${raffle.id}</code> to create a new raffle with these same participants.`;
+export async function handleExportCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
 
-  // If too long, fall back to a CSV document attachment
-  if (msg.length > 4000) {
-    const csvLines = ["#,Display Name,Username,User ID,Entered At"];
-    entries.forEach((e, i) => {
-      csvLines.push(
-        `${i + 1},"${e.user_display_name}","${e.user_name || ""}",${e.user_id},"${e.entered_at}"`
-      );
-    });
-    const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
+  if (data === "export_close") {
+    await ctx.answerCallbackQuery();
     try {
-      await ctx.api.sendDocument(userId,
-        new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
-        {
-          caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nUse /rerun ${raffle.id} to create a new raffle with these same participants.`,
-        }
-      );
-    } catch {
-      const fallback = `Export has ${entries.length} entries — please DM me first so I can send you the file.`;
-      if (inDm) await ctx.reply(fallback);
-      else await replyPrivately(ctx, fallback);
-    }
+      await ctx.deleteMessage();
+    } catch {}
     return;
   }
 
-  // Short enough — send as a text message
-  if (inDm) {
-    await ctx.reply(msg, { parse_mode: "HTML" });
-  } else {
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  const match = data.match(/^export_pick_(-?\d+)_(\d+)$/);
+  if (!match) return;
+  const chatId = parseInt(match[1], 10);
+  const raffleId = parseInt(match[2], 10);
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || !(await canExportRaffle(ctx, raffle, ctx.from.id, chatId))) {
+    await ctx.answerCallbackQuery({ text: "You cannot export that raffle.", show_alert: true });
+    return;
   }
+
+  await ctx.answerCallbackQuery({ text: "Sending export..." });
+  await sendEntriesExport(ctx, raffle, ctx.from.id);
 }
 
 // /rerun - Re-run a raffle with same participants from a previous one
@@ -1184,6 +1156,9 @@ function formatTemplateSummary(tmpl: ReturnType<typeof db.getTemplateById>): str
   if (!tmpl) return "Template not found.";
   let msg = "";
   msg += `📝 <b>Title:</b> ${escapeHtml(tmpl.title)}\n`;
+  if (tmpl.description) {
+    msg += `📄 <b>Rules:</b> ${escapeHtml(tmpl.description.slice(0, 120))}${tmpl.description.length > 120 ? "..." : ""}\n`;
+  }
   if (tmpl.prizes) {
     try {
       const prizes = JSON.parse(tmpl.prizes) as string[];
@@ -1210,6 +1185,18 @@ function formatTemplateSummary(tmpl: ReturnType<typeof db.getTemplateById>): str
   }
   if (tmpl.anonymous) {
     msg += `👁 <b>Hidden entries:</b> On\n`;
+  }
+  if (tmpl.image_file_id) msg += `🖼 <b>Image:</b> Added\n`;
+  if (tmpl.auto_pin) msg += `📌 <b>Auto-pin:</b> On\n`;
+  if (tmpl.require_username) msg += `📛 <b>Username required:</b> Yes\n`;
+  if (tmpl.required_chat_id) {
+    msg += `🔒 <b>Required group:</b> ${escapeHtml(tmpl.required_chat_title || String(tmpl.required_chat_id))}\n`;
+  }
+  if (tmpl.min_account_age_days) msg += `📅 <b>Min age:</b> ${tmpl.min_account_age_days}d\n`;
+  if (tmpl.winner_cooldown) msg += `🛡 <b>Winner cooldown:</b> ${tmpl.winner_cooldown}\n`;
+  if (tmpl.show_animation === 0) msg += `🎡 <b>Animation:</b> Off\n`;
+  if (tmpl.referral_enabled) {
+    msg += `🔗 <b>Referrals:</b> On (${tmpl.max_referral_entries > 0 ? `max ${tmpl.max_referral_entries}` : "unlimited"})\n`;
   }
   if (tmpl.recurring_interval_minutes) {
     const interval = formatDurationHuman(tmpl.recurring_interval_minutes * 60000);
@@ -1356,6 +1343,11 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       const endDate = new Date(Date.now() + tmpl.duration_minutes * 60 * 1000);
       endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
     }
+    let startsAt: string | null = null;
+    if (tmpl.starts_after_minutes) {
+      const startDate = new Date(Date.now() + tmpl.starts_after_minutes * 60 * 1000);
+      startsAt = startDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+    }
 
     const raffle = db.createRaffle({
       chat_id: chatId,
@@ -1363,27 +1355,27 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       creator_id: ctx.from.id,
       creator_name: displayName,
       title: tmpl.title,
-      description: "",
+      description: tmpl.description || "",
       prize: tmpl.prize,
       prizes: tmpl.prizes,
       max_entries: tmpl.max_entries,
       max_winners: tmpl.max_winners,
       ends_at: endsAt,
-      starts_at: null,
-      display_timezone: db.getChatTimezone(chatId),
-      required_chat_id: null,
-      required_chat_title: null,
+      starts_at: startsAt,
+      display_timezone: tmpl.display_timezone || db.getChatTimezone(chatId),
+      required_chat_id: tmpl.required_chat_id,
+      required_chat_title: tmpl.required_chat_title,
       sponsor_name: tmpl.sponsor_name,
       anonymous: tmpl.anonymous,
-      image_file_id: null,
-      auto_pin: 0,
-      min_account_age_days: 0,
-      require_username: 0,
-      winner_cooldown: 0,
-      show_animation: 1,
-      referral_enabled: 0,
-      max_referral_entries: 0,
-      revoke_referral_links: 0,
+      image_file_id: tmpl.image_file_id,
+      auto_pin: tmpl.auto_pin,
+      min_account_age_days: tmpl.min_account_age_days,
+      require_username: tmpl.require_username,
+      winner_cooldown: tmpl.winner_cooldown,
+      show_animation: tmpl.show_animation,
+      referral_enabled: tmpl.referral_enabled,
+      max_referral_entries: tmpl.max_referral_entries,
+      revoke_referral_links: tmpl.revoke_referral_links,
     });
 
     const lang = db.getChatLanguage(chatId);
@@ -1397,12 +1389,17 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       "open",
       formatRaffleMessage(raffle, 0, lang),
       raffleKeyboard,
-      null,
+      raffle.image_file_id,
       raffle.thread_id
     );
 
     if (msgId) {
       db.updateRaffleMessageId(raffle.id, msgId);
+      if (raffle.auto_pin) {
+        try {
+          await ctx.api.pinChatMessage(chatId, msgId, { disable_notification: true });
+        } catch {}
+      }
     }
 
     return;
@@ -1555,127 +1552,13 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
 
   const text = ctx.message?.text || "";
   const args = text.replace(/^\/savetemplate(@\w+)?/i, "").trim();
-
-  if (!args) {
-    await buildTemplateHub(ctx, ctx.chat.id, false);
-    return;
-  }
-
-  const parts = args.split("|").map((p) => p.trim());
-  const templateName = parts[0];
-  if (!templateName) {
-    await replyPrivately(ctx, "Template name is required.");
-    return;
-  }
-
-  const title = parts[1] || templateName;
-  let singlePrize = "";
-  let prizesList: string[] | null = null;
-  let maxWinners = 1;
-  let maxEntries: number | null = null;
-  let durationMinutes: number | null = null;
-  let sponsorName: string | null = null;
-  let anonymous = 0;
-  let recurringMinutes: number | null = null;
-
-  for (let i = 2; i < parts.length; i++) {
-    const part = parts[i];
-    const partLower = part.toLowerCase();
-
-    const winnersMatch = partLower.match(/^winners?\s*:\s*(\d+)$/);
-    const maxMatch = partLower.match(/^max\s*:\s*(\d+)$/);
-    const endsMatch = part.match(/^ends?\s*:\s*(.+)$/i);
-    const prizesMatch = part.match(/^prizes?\s*:\s*(.+)$/i);
-    const sponsorMatch = part.match(/^sponsor\s*:\s*(.+)$/i);
-    const recurringMatch = part.match(/^recurring\s*:\s*(.+)$/i);
-    const anonMatch = partLower.match(/^anonymous\s*:\s*(on|off|true|false|1|0|yes|no)$/);
-
-    if (winnersMatch) {
-      maxWinners = Math.max(1, Math.min(50, parseInt(winnersMatch[1], 10)));
-    } else if (maxMatch) {
-      maxEntries = Math.max(1, parseInt(maxMatch[1], 10));
-    } else if (endsMatch) {
-      const val = endsMatch[1].trim().toLowerCase();
-      const durationMatch = val.match(/^(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
-      if (durationMatch) {
-        const amount = parseInt(durationMatch[1], 10);
-        const unit = durationMatch[2].toLowerCase();
-        if (unit.startsWith("m")) durationMinutes = amount;
-        else if (unit.startsWith("h")) durationMinutes = amount * 60;
-        else if (unit.startsWith("d")) durationMinutes = amount * 60 * 24;
-      }
-    } else if (prizesMatch) {
-      prizesList = prizesMatch[1]
-        .split(",")
-        .map((p) => p.trim())
-        .filter((p) => p.length > 0);
-    } else if (sponsorMatch) {
-      sponsorName = sponsorMatch[1].trim();
-    } else if (recurringMatch) {
-      const val = recurringMatch[1].trim().toLowerCase();
-      const recMatch = val.match(/^(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
-      if (recMatch) {
-        const amount = parseInt(recMatch[1], 10);
-        const unit = recMatch[2].toLowerCase();
-        if (unit.startsWith("m")) recurringMinutes = amount;
-        else if (unit.startsWith("h")) recurringMinutes = amount * 60;
-        else if (unit.startsWith("d")) recurringMinutes = amount * 60 * 24;
-      }
-    } else if (anonMatch) {
-      const val = anonMatch[1].toLowerCase();
-      anonymous = ["on", "true", "1", "yes"].includes(val) ? 1 : 0;
-    } else if (!singlePrize) {
-      singlePrize = part;
-    }
-  }
-
-  if (prizesList && prizesList.length > 1) {
-    const explicitWinners = parts.some((p) =>
-      p.toLowerCase().match(/^winners?\s*:\s*\d+$/)
+  if (args) {
+    await replyPrivately(
+      ctx,
+      "Template setup is now wizard-based. Use the template hub and tap ➕ Create New.",
     );
-    if (!explicitWinners) {
-      maxWinners = prizesList.length;
-    }
   }
-
-  const finalPrize = singlePrize || (prizesList ? prizesList[0] : title);
-
-  try {
-    const template = db.createTemplate({
-      chat_id: ctx.chat.id,
-      thread_id: ctx.message?.message_thread_id ?? null,
-      creator_id: userId,
-      name: templateName,
-      title,
-      prize: finalPrize,
-      prizes: prizesList ? JSON.stringify(prizesList) : null,
-      max_entries: maxEntries,
-      max_winners: maxWinners,
-      duration_minutes: durationMinutes,
-      sponsor_name: sponsorName,
-      anonymous,
-      recurring_interval_minutes: recurringMinutes,
-    });
-
-    let msg = `✅ Template <b>${escapeHtml(templateName)}</b> saved!\n\n`;
-    msg += `📋 Title: ${escapeHtml(title)}\n`;
-    msg += `🎁 Prize: ${escapeHtml(finalPrize)}\n`;
-    msg += `🏆 Winners: ${maxWinners}\n`;
-    if (durationMinutes) msg += `⏰ Duration: ${durationMinutes}m\n`;
-    if (recurringMinutes) msg += `🔄 Recurring: every ${recurringMinutes}m\n`;
-
-    msg += `\nUse <code>/usetemplate ${escapeHtml(templateName)}</code> to create a raffle from this template.`;
-
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
-  } catch (err: any) {
-    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      await replyPrivately(ctx,
-        `A template named "${escapeHtml(templateName)}" already exists in this chat.\nDelete it first with <code>/deletetemplate ${escapeHtml(templateName)}</code>`,
-        { parse_mode: "HTML" });
-    } else {
-      throw err;
-    }
-  }
+  await buildTemplateHub(ctx, ctx.chat.id, false);
 }
 
 // /templates - Template management hub with inline buttons
@@ -1717,16 +1600,8 @@ export async function handleDeleteTemplate(ctx: Context): Promise<void> {
     return;
   }
 
-  const deleted = db.deleteTemplate(ctx.chat.id, name);
-  if (deleted) {
-    await replyPrivately(ctx,
-      `✅ Template <b>${escapeHtml(name)}</b> deleted.`,
-      { parse_mode: "HTML" });
-  } else {
-    await replyPrivately(ctx,
-      `Template "${escapeHtml(name)}" not found.`,
-      { parse_mode: "HTML" });
-  }
+  await replyPrivately(ctx, "Template deletion is button-based now. Pick the template from the hub and tap Delete.");
+  await buildTemplateHub(ctx, ctx.chat.id, false);
 }
 
 // /usetemplate - Create a raffle from a saved template
@@ -1751,78 +1626,8 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
     return;
   }
 
-  const template = db.getTemplateByName(ctx.chat.id, name);
-  if (!template) {
-    await replyPrivately(ctx,
-      `Template "${escapeHtml(name)}" not found. Use /templates to see saved templates.`,
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  const displayName = getUserDisplayName(
-    ctx.from!.first_name,
-    ctx.from!.last_name
-  );
-
-  let endsAt: string | null = null;
-  if (template.duration_minutes) {
-    const endDate = new Date(Date.now() + template.duration_minutes * 60 * 1000);
-    endsAt = endDate
-      .toISOString()
-      .replace("T", " ")
-      .replace("Z", "")
-      .split(".")[0];
-  }
-
-  const threadId = ctx.message?.message_thread_id ?? template.thread_id;
-
-  const raffle = db.createRaffle({
-    chat_id: ctx.chat.id,
-    thread_id: threadId,
-    creator_id: userId,
-    creator_name: displayName,
-    title: template.title,
-    description: "",
-    prize: template.prize,
-    prizes: template.prizes,
-    max_entries: template.max_entries,
-    max_winners: template.max_winners,
-    ends_at: endsAt,
-    starts_at: null,
-    display_timezone: db.getChatTimezone(ctx.chat!.id),
-    required_chat_id: null,
-    required_chat_title: null,
-    sponsor_name: template.sponsor_name,
-    anonymous: template.anonymous,
-    image_file_id: null,
-    auto_pin: 0,
-    min_account_age_days: 0,
-    require_username: 0,
-    winner_cooldown: 0,
-    show_animation: 1,
-    referral_enabled: 0,
-    max_referral_entries: 0,
-    revoke_referral_links: 0,
-  });
-
-  const lang = db.getChatLanguage(ctx.chat.id);
-  const botUsername = ctx.me.username;
-
-  const keyboard = buildRaffleKeyboard(raffle, 0, lang, botUsername);
-
-  const msgId = await sendRafflePost(
-    ctx.api,
-    ctx.chat.id,
-    "open",
-    formatRaffleMessage(raffle, 0, lang),
-    keyboard,
-    null,
-    raffle.thread_id
-  );
-
-  if (msgId) {
-    db.updateRaffleMessageId(raffle.id, msgId);
-  }
+  await replyPrivately(ctx, "Template use is button-based now. Pick the template from the hub and tap Use Template.");
+  await buildTemplateHub(ctx, ctx.chat.id, false);
 }
 
 // /recurring - Toggle recurring on/off for a template
@@ -1847,49 +1652,8 @@ export async function handleRecurring(ctx: Context): Promise<void> {
     return;
   }
 
-  const parts = args.split(/\s+/);
-  const action = parts.pop()?.toLowerCase();
-  const name = parts.join(" ");
-
-  if (!name || (action !== "on" && action !== "off")) {
-    await replyPrivately(ctx,
-      "Usage: <code>/recurring TemplateName on</code> or <code>/recurring TemplateName off</code>",
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  const template = db.getTemplateByName(ctx.chat.id, name);
-  if (!template) {
-    await replyPrivately(ctx,
-      `Template "${escapeHtml(name)}" not found.`,
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  if (!template.recurring_interval_minutes) {
-    await replyPrivately(ctx,
-      `Template "${escapeHtml(name)}" doesn't have a recurring interval set.\nRe-create it with <code>recurring:TIME</code> parameter.`,
-      { parse_mode: "HTML" });
-    return;
-  }
-
-  if (action === "on") {
-    const nextRun = new Date(Date.now() + template.recurring_interval_minutes * 60 * 1000);
-    const nextRunStr = nextRun
-      .toISOString()
-      .replace("T", " ")
-      .replace("Z", "")
-      .split(".")[0];
-    db.setRecurringActive(template.id, true, nextRunStr);
-    await replyPrivately(ctx,
-      `🔄 Recurring <b>activated</b> for "${escapeHtml(name)}".\nNext raffle in ${template.recurring_interval_minutes} minutes.`,
-      { parse_mode: "HTML" });
-  } else {
-    db.setRecurringActive(template.id, false, null);
-    await replyPrivately(ctx,
-      `⏸ Recurring <b>paused</b> for "${escapeHtml(name)}".`,
-      { parse_mode: "HTML" });
-  }
+  await replyPrivately(ctx, "Recurring controls are button-based now. Pick the template from the hub and use the recurring button.");
+  await buildTemplateHub(ctx, ctx.chat.id, false);
 }
 
 // /editraffle - Edit an active raffle's settings
@@ -1910,19 +1674,6 @@ export async function handleEditRaffle(ctx: Context): Promise<void> {
   if (openRaffles.length === 0) {
     await replyPrivately(ctx, "No open raffles to edit.");
     return;
-  }
-
-  // Check if a specific raffle ID was provided
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/editraffle(@\w+)?/i, "").trim();
-  const raffleId = parseInt(args, 10);
-
-  if (!isNaN(raffleId)) {
-    const raffle = openRaffles.find((r) => r.id === raffleId);
-    if (raffle) {
-      await startEditWizard(ctx, raffle.id, ctx.chat.id);
-      return;
-    }
   }
 
   // If only one open raffle, edit it directly
@@ -1971,36 +1722,82 @@ export async function handleLanguage(ctx: Context): Promise<void> {
     return;
   }
 
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/language(@\w+)?/i, "").trim().toLowerCase();
-
   const current = db.getChatLanguage(ctx.chat.id);
+  const langs = getAvailableLanguages();
+  const keyboard = new InlineKeyboard();
+  for (const l of langs) {
+    const marker = l.code === current ? " ✅" : "";
+    keyboard.text(`${l.name}${marker}`, `langset_${ctx.chat.id}_${l.code}`).row();
+  }
+  keyboard.text("❌ Close", "langset_close");
 
-  if (!args) {
-    const langs = getAvailableLanguages();
-    let msg = `🌐 <b>${t(current, "misc.lang_current", { lang: getLanguageName(current) })}</b>\n\n`;
-    msg += `<b>Available languages:</b>\n`;
-    for (const l of langs) {
-      const marker = l.code === current ? " ✅" : "";
-      msg += `• <code>/language ${l.code}</code> — ${l.name}${marker}\n`;
-    }
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await replyPrivately(ctx, `🌐 <b>${t(current, "misc.lang_current", { lang: getLanguageName(current) })}</b>\n\nPick a language:`, {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
+}
+
+export async function handleLanguageCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  if (data === "langset_close") {
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+    return;
+  }
+
+  const match = data.match(/^langset_(-?\d+)_([a-z]{2})$/);
+  if (!match) return;
+
+  const chatId = parseInt(match[1], 10);
+  const code = match[2];
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can change language.", show_alert: true });
     return;
   }
 
   const supported = db.getSupportedLanguages();
-  if (!supported.includes(args)) {
-    await replyPrivately(ctx,
-      `Language "${escapeHtml(args)}" is not supported.\nUse /language to see available options.`,
-      { parse_mode: "HTML" });
+  if (!supported.includes(code)) {
+    await ctx.answerCallbackQuery({ text: "Language is not supported.", show_alert: true });
     return;
   }
 
-  db.setChatLanguage(ctx.chat.id, args);
-  const langName = getLanguageName(args);
-  await replyPrivately(ctx,
-    `🌐 ${t(args, "misc.lang_set", { lang: langName })}`,
-    { parse_mode: "HTML" });
+  db.setChatLanguage(chatId, code);
+  await ctx.answerCallbackQuery({ text: getLanguageName(code) });
+  await ctx.editMessageText(`🌐 ${t(code, "misc.lang_set", { lang: getLanguageName(code) })}`, {
+    parse_mode: "HTML",
+  });
+}
+
+const COMMON_GROUP_TIMEZONES: Array<{ label: string; tz: string }> = [
+  { label: "Eastern (ET)", tz: "America/New_York" },
+  { label: "Central (CT)", tz: "America/Chicago" },
+  { label: "Mountain (MT)", tz: "America/Denver" },
+  { label: "Pacific (PT)", tz: "America/Los_Angeles" },
+  { label: "Alaska (AKT)", tz: "America/Anchorage" },
+  { label: "Hawaii (HST)", tz: "Pacific/Honolulu" },
+  { label: "UTC", tz: "UTC" },
+  { label: "London", tz: "Europe/London" },
+  { label: "Paris", tz: "Europe/Paris" },
+  { label: "Tokyo", tz: "Asia/Tokyo" },
+  { label: "Sydney", tz: "Australia/Sydney" },
+  { label: "India", tz: "Asia/Kolkata" },
+];
+
+function buildGroupTimezoneKeyboard(chatId: number, current: string): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (let i = 0; i < COMMON_GROUP_TIMEZONES.length; i++) {
+    const option = COMMON_GROUP_TIMEZONES[i];
+    const marker = option.tz === current ? " ✅" : "";
+    keyboard.text(`${option.label}${marker}`, `tzset_${chatId}_${option.tz}`);
+    if (i % 2 === 1) keyboard.row();
+  }
+  if (COMMON_GROUP_TIMEZONES.length % 2 === 1) keyboard.row();
+  keyboard.text("❌ Close", "tzset_close");
+  return keyboard;
 }
 
 // /timezone - View or set the chat's timezone (admin only in groups)
@@ -2017,48 +1814,56 @@ export async function handleTimezone(ctx: Context): Promise<void> {
     return;
   }
 
-  const { resolveTimezone, formatInTimezone } = await import("./timezone");
-
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/timezone(@\w+)?/i, "").trim();
+  const { formatInTimezone } = await import("./timezone");
   const current = db.getChatTimezone(ctx.chat.id);
-
-  if (!args) {
-    const nowInTz = formatInTimezone(new Date(), current);
-    const msg =
-      `🕐 <b>Group timezone:</b> <code>${escapeHtml(current)}</code>\n` +
-      `Current time: <b>${escapeHtml(nowInTz)}</b>\n\n` +
-      `<b>Set with:</b> <code>/timezone &lt;name&gt;</code>\n\n` +
-      `<b>Common options:</b>\n` +
-      `• <code>/timezone UTC</code>\n` +
-      `• <code>/timezone EST</code> (or <code>America/New_York</code>)\n` +
-      `• <code>/timezone CST</code> (or <code>America/Chicago</code>)\n` +
-      `• <code>/timezone MST</code> (or <code>America/Denver</code>)\n` +
-      `• <code>/timezone PST</code> (or <code>America/Los_Angeles</code>)\n` +
-      `• <code>/timezone Europe/London</code>\n` +
-      `• <code>/timezone Asia/Tokyo</code>\n\n` +
-      `<i>Any IANA timezone name works. Daylight saving is handled automatically.</i>`;
-    await replyPrivately(ctx, msg, { parse_mode: "HTML" });
-    return;
-  }
-
-  const resolved = resolveTimezone(args);
-  if (!resolved) {
-    await replyPrivately(ctx,
-      `Timezone "<code>${escapeHtml(args)}</code>" is not recognized.\n\n` +
-        `Try a common name like <code>EST</code>, <code>PST</code>, or an IANA name like <code>America/New_York</code>.\n` +
-        `Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones`,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
-    return;
-  }
-
-  db.setChatTimezone(ctx.chat.id, resolved);
-  const nowInTz = formatInTimezone(new Date(), resolved);
+  const nowInTz = formatInTimezone(new Date(), current);
   await replyPrivately(ctx,
-    `✅ Timezone set to <code>${escapeHtml(resolved)}</code>.\n` +
+    `🕐 <b>Group timezone:</b> <code>${escapeHtml(current)}</code>\n` +
       `Current time: <b>${escapeHtml(nowInTz)}</b>\n\n` +
-      `All future raffles in this group will use this timezone for scheduling and display.`,
-    { parse_mode: "HTML" });
+      `Pick the timezone this group's raffle wizards should use:`,
+    {
+      parse_mode: "HTML",
+      reply_markup: buildGroupTimezoneKeyboard(ctx.chat.id, current),
+    }
+  );
+}
+
+export async function handleTimezoneCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  if (data === "tzset_close") {
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+    return;
+  }
+
+  const match = data.match(/^tzset_(-?\d+)_(.+)$/);
+  if (!match) return;
+
+  const chatId = parseInt(match[1], 10);
+  const timezone = match[2];
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can change timezone.", show_alert: true });
+    return;
+  }
+
+  const allowed = COMMON_GROUP_TIMEZONES.some((option) => option.tz === timezone);
+  if (!allowed) {
+    await ctx.answerCallbackQuery({ text: "Timezone option is not supported.", show_alert: true });
+    return;
+  }
+
+  db.setChatTimezone(chatId, timezone);
+  const { formatInTimezone } = await import("./timezone");
+  await ctx.answerCallbackQuery({ text: timezone });
+  await ctx.editMessageText(
+    `✅ Timezone set to <code>${escapeHtml(timezone)}</code>.\n` +
+      `Current time: <b>${escapeHtml(formatInTimezone(new Date(), timezone))}</b>`,
+    { parse_mode: "HTML" }
+  );
 }
 
 // --- Callback query handlers ---
@@ -2087,6 +1892,29 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
         show_alert: true,
       });
       return;
+    }
+
+    // Required group/channel membership check
+    if (raffle.required_chat_id) {
+      try {
+        const member = await ctx.api.getChatMember(raffle.required_chat_id, userId);
+        const allowedStatuses = ["member", "administrator", "creator"];
+        const isRestrictedMember =
+          member.status === "restricted" && "is_member" in member && member.is_member;
+        if (!allowedStatuses.includes(member.status) && !isRestrictedMember) {
+          await ctx.answerCallbackQuery({
+            text: `⚠️ You must be a member of ${raffle.required_chat_title || "the required group"} to enter.`,
+            show_alert: true,
+          });
+          return;
+        }
+      } catch {
+        await ctx.answerCallbackQuery({
+          text: "⚠️ I couldn't verify the required group membership. Ask an admin to check the raffle setup.",
+          show_alert: true,
+        });
+        return;
+      }
     }
 
     // Account age check (estimated from user ID)
@@ -3012,6 +2840,244 @@ export async function handleGroupStats(ctx: Context): Promise<void> {
   }
 
   await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+}
+
+function formatGroupDefaults(chatId: number): string {
+  const d = db.getGroupDefaults(chatId);
+  const line = (label: string, value: string) => `  ${label}: <b>${escapeHtml(value)}</b>\n`;
+  let msg = `⚙️ <b>Group Raffle Defaults</b>\n\n`;
+  msg += line("Winners", d?.max_winners ? String(d.max_winners) : "ask each time");
+  msg += line("Duration", d?.duration_minutes ? formatDurationHuman(d.duration_minutes * 60000) : "ask each time");
+  msg += line("Max entries", d?.max_entries ? String(d.max_entries) : "no default");
+  msg += line("Hidden entries", d?.anonymous === null || d?.anonymous === undefined ? "ask/default off" : d.anonymous ? "on" : "off");
+  msg += line("Auto-pin", d?.auto_pin === null || d?.auto_pin === undefined ? "ask/default off" : d.auto_pin ? "on" : "off");
+  msg += line("Username required", d?.require_username ? "yes" : "no");
+  msg += line("Min account age", d?.min_account_age_days ? `${d.min_account_age_days}d` : "off");
+  msg += line("Winner cooldown", d?.winner_cooldown ? String(d.winner_cooldown) : "off");
+  msg += line("Animation", d?.show_animation === 0 ? "off" : "on");
+  msg += line("Referrals", d?.referral_enabled ? `on (${d.max_referral_entries ? `max ${d.max_referral_entries}` : "unlimited"})` : "off");
+  msg += line("Revoke referral links", d?.revoke_referral_links ? "yes" : "no");
+  msg += `\n<i>Tap a button to change a default. These apply to new raffle wizards in this group.</i>`;
+  return msg;
+}
+
+function buildDefaultsKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🏆 Winners", "def_pick_winners").text("⏰ Duration", "def_pick_duration").row()
+    .text("👥 Max Entries", "def_pick_max").row()
+    .text("👁 Toggle Hidden", "def_toggle_anon").text("📌 Toggle Pin", "def_toggle_pin").row()
+    .text("📛 Toggle Username", "def_toggle_user").text("🎡 Toggle Animation", "def_toggle_anim").row()
+    .text("📅 Min Age", "def_pick_age").text("🛡 Cooldown", "def_pick_cooldown").row()
+    .text("🔗 Referrals", "def_pick_referrals").text("🗑 Toggle Revoke", "def_toggle_revoke").row()
+    .text("♻️ Clear Defaults", "def_clear").text("❌ Close", "def_close");
+}
+
+export async function handleDefaults(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+  const userId = ctx.from!.id;
+  if (!(await isGroupAdmin(ctx, userId))) {
+    await replyPrivately(ctx, "Only group admins can manage defaults.");
+    return;
+  }
+  await ctx.reply(formatGroupDefaults(ctx.chat.id), {
+    parse_mode: "HTML",
+    reply_markup: buildDefaultsKeyboard(),
+  });
+}
+
+export async function handleDefaultsCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  const chatId = ctx.callbackQuery?.message?.chat.id;
+  if (!data || !ctx.from || !chatId) return;
+  if (!(await isGroupAdmin(ctx, ctx.from.id))) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can manage defaults.", show_alert: true });
+    return;
+  }
+
+  const current = db.getGroupDefaults(chatId);
+  const update = (fields: Record<string, string | number | null>) => {
+    db.upsertGroupDefaults(chatId, fields as Parameters<typeof db.upsertGroupDefaults>[1]);
+  };
+
+  await ctx.answerCallbackQuery();
+
+  const picker = async (text: string, kb: InlineKeyboard) =>
+    ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: kb });
+
+  if (data === "def_close") {
+    try { await ctx.deleteMessage(); } catch {}
+    return;
+  }
+  if (data === "def_clear") {
+    db.clearGroupDefaults(chatId);
+  } else if (data === "def_pick_winners") {
+    await picker("🏆 <b>Default winners</b>", new InlineKeyboard()
+      .text("Ask", "def_winners_null").text("1", "def_winners_1").text("2", "def_winners_2").row()
+      .text("3", "def_winners_3").text("5", "def_winners_5").text("10", "def_winners_10").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data.startsWith("def_winners_")) {
+    const val = data.replace("def_winners_", "");
+    update({ max_winners: val === "null" ? null : parseInt(val, 10) });
+  } else if (data === "def_pick_duration") {
+    await picker("⏰ <b>Default duration</b>", new InlineKeyboard()
+      .text("Ask", "def_duration_null").text("30m", "def_duration_30").text("1h", "def_duration_60").row()
+      .text("6h", "def_duration_360").text("1d", "def_duration_1440").text("7d", "def_duration_10080").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data.startsWith("def_duration_")) {
+    const val = data.replace("def_duration_", "");
+    update({ duration_minutes: val === "null" ? null : parseInt(val, 10) });
+  } else if (data === "def_pick_max") {
+    await picker("👥 <b>Default max entries</b>", new InlineKeyboard()
+      .text("None", "def_max_null").text("50", "def_max_50").text("100", "def_max_100").row()
+      .text("250", "def_max_250").text("500", "def_max_500").text("1000", "def_max_1000").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data.startsWith("def_max_")) {
+    const val = data.replace("def_max_", "");
+    update({ max_entries: val === "null" ? null : parseInt(val, 10) });
+  } else if (data === "def_toggle_anon") {
+    update({ anonymous: current?.anonymous ? 0 : 1 });
+  } else if (data === "def_toggle_pin") {
+    update({ auto_pin: current?.auto_pin ? 0 : 1 });
+  } else if (data === "def_toggle_user") {
+    update({ require_username: current?.require_username ? 0 : 1 });
+  } else if (data === "def_toggle_anim") {
+    update({ show_animation: current?.show_animation === 0 ? 1 : 0 });
+  } else if (data === "def_pick_age") {
+    await picker("📅 <b>Default minimum account age</b>", new InlineKeyboard()
+      .text("Off", "def_age_0").text("7d", "def_age_7").text("30d", "def_age_30").row()
+      .text("90d", "def_age_90").text("180d", "def_age_180").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data.startsWith("def_age_")) {
+    update({ min_account_age_days: parseInt(data.replace("def_age_", ""), 10) });
+  } else if (data === "def_pick_cooldown") {
+    await picker("🛡 <b>Default winner cooldown</b>", new InlineKeyboard()
+      .text("Off", "def_cooldown_0").text("1", "def_cooldown_1").text("3", "def_cooldown_3").row()
+      .text("5", "def_cooldown_5").text("10", "def_cooldown_10").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data.startsWith("def_cooldown_")) {
+    update({ winner_cooldown: parseInt(data.replace("def_cooldown_", ""), 10) });
+  } else if (data === "def_pick_referrals") {
+    await picker("🔗 <b>Default referrals</b>", new InlineKeyboard()
+      .text("Off", "def_ref_0").text("Unlimited", "def_ref_on_0").row()
+      .text("Max 5", "def_ref_on_5").text("Max 10", "def_ref_on_10").row()
+      .text("⬅️ Back", "def_back"));
+    return;
+  } else if (data === "def_ref_0") {
+    update({ referral_enabled: 0, max_referral_entries: 0 });
+  } else if (data.startsWith("def_ref_on_")) {
+    update({ referral_enabled: 1, max_referral_entries: parseInt(data.replace("def_ref_on_", ""), 10) });
+  } else if (data === "def_toggle_revoke") {
+    update({ revoke_referral_links: current?.revoke_referral_links ? 0 : 1 });
+  }
+
+  await ctx.editMessageText(formatGroupDefaults(chatId), {
+    parse_mode: "HTML",
+    reply_markup: buildDefaultsKeyboard(),
+  });
+}
+
+export async function handleSetupCheck(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+  if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
+    await replyPrivately(ctx, "Only group admins can run setup checks.");
+    return;
+  }
+  let msg = `🧪 <b>Raffle Bot Setup Check</b>\n\n`;
+  try {
+    const member = await ctx.api.getChatMember(ctx.chat.id, ctx.me.id);
+    const admin = member.status === "administrator";
+    msg += `Admin status: ${admin ? "✅ administrator" : "⚠️ not admin"}\n`;
+    if (member.status === "administrator") {
+      msg += `Delete messages: ${member.can_delete_messages ? "✅" : "⚠️ missing"}\n`;
+      msg += `Invite links: ${member.can_invite_users ? "✅" : "⚠️ missing"}\n`;
+      msg += `Pin messages: ${member.can_pin_messages ? "✅" : "⚠️ missing"}\n`;
+      msg += `Manage chat: ${member.can_manage_chat ? "✅" : "⚠️ missing"}\n`;
+    }
+  } catch {
+    msg += `Admin status: ⚠️ could not verify\n`;
+  }
+  msg += `\nTimezone: <code>${escapeHtml(db.getChatTimezone(ctx.chat.id))}</code>\n`;
+  msg += `Language: <code>${escapeHtml(db.getChatLanguage(ctx.chat.id))}</code>\n`;
+  msg += `Open raffles: <b>${db.getOpenRafflesForChat(ctx.chat.id).length}</b>\n`;
+  msg += `Templates: <b>${db.getTemplatesForChat(ctx.chat.id).length}</b>\n`;
+  msg += `\n<i>If any permission is missing, promote the bot again with the requested rights.</i>`;
+  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+}
+
+export async function handleReferrals(ctx: Context): Promise<void> {
+  if (!ctx.chat || ctx.chat.type === "private") {
+    await ctx.reply("Use this command in a group chat.");
+    return;
+  }
+  if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
+    await replyPrivately(ctx, "Only group admins can view referral stats.");
+    return;
+  }
+  const raffles = db.getOpenRafflesForChat(ctx.chat.id).filter((r) => r.referral_enabled);
+  if (raffles.length === 0) {
+    await replyPrivately(ctx, "No active referral raffles in this group.");
+    return;
+  }
+  const kb = new InlineKeyboard();
+  for (const r of raffles.slice(0, 20)) {
+    kb.text(r.title.slice(0, 32), `refdash_${ctx.chat.id}_${r.id}`).row();
+  }
+  await replyPrivately(ctx, `🔗 <b>Referral Raffles</b>\n\nPick a raffle to view this group's referral stats:`, {
+    parse_mode: "HTML",
+    reply_markup: kb,
+  });
+}
+
+export async function handleReferralsCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+  const match = data.match(/^refdash_(-?\d+)_(\d+)$/);
+  if (!match) return;
+  const chatId = parseInt(match[1], 10);
+  const raffleId = parseInt(match[2], 10);
+
+  let isAdmin = false;
+  try {
+    const member = await ctx.api.getChatMember(chatId, ctx.from.id);
+    isAdmin = member.status === "administrator" || member.status === "creator";
+  } catch {}
+  if (!isAdmin) {
+    await ctx.answerCallbackQuery({ text: "Only group admins can view referral stats.", show_alert: true });
+    return;
+  }
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.chat_id !== chatId || !raffle.referral_enabled) {
+    await ctx.answerCallbackQuery({ text: "Referral raffle not found in this group.", show_alert: true });
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  const links = db.getReferralLinksForRaffle(raffleId);
+  let msg = `🔗 <b>Referral Stats: ${escapeHtml(raffle.title)}</b>\n\n`;
+  msg += `Participants: <b>${db.getEntryCount(raffleId)}</b>\n`;
+  msg += `Effective entries: <b>${db.getTotalEntryCount(raffleId)}</b>\n`;
+  msg += `Links created: <b>${links.length}</b>\n`;
+  msg += `Bonus entries: <b>${links.reduce((s, l) => s + l.bonus_entries, 0)}</b>\n\n`;
+  const leaders = links.filter((l) => l.bonus_entries > 0).slice(0, 15);
+  if (leaders.length === 0) {
+    msg += `<i>No successful referrals yet.</i>`;
+  } else {
+    msg += `<b>Leaderboard</b>\n`;
+    leaders.forEach((l, i) => {
+      msg += `${i + 1}. ${escapeHtml(l.user_display_name)} — <b>${l.bonus_entries}</b>\n`;
+    });
+  }
+  await ctx.editMessageText(msg, { parse_mode: "HTML" });
 }
 
 // /bugreport — Start a bug report (works anywhere)

@@ -12,7 +12,6 @@ import {
   formatRaffleMessage,
   formatWinnersMessage,
   formatCountdown,
-  isGroupAdmin,
   replyPrivately,
   buildRaffleKeyboard,
   buildMessageLink,
@@ -26,6 +25,7 @@ import {
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+import { getGroupManagementAccess, isGroupOwner } from "./access";
 
 // --- Smart debounced post updates ---
 // Pattern: first entry refreshes the message immediately (so users see their
@@ -185,7 +185,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• 🔗 Referral bonus entries\n\n` +
       `<b>Admin Center tools:</b>\n` +
       `Create, templates, draw, edit, cancel, re-run, export, history, stats, defaults, setup check, referrals, language, and timezone.\n\n` +
-      `<b>Note:</b> Only group admins can create raffles and draw winners.\n` +
+      `<b>Note:</b> Group owners can choose whether all admins or only approved admins may manage raffles.\n` +
       `<b>Supported languages:</b> English, Espanol, Portugues, Русский, Francais, Deutsch`,
     {
       parse_mode: "HTML",
@@ -202,7 +202,7 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can create raffles.");
     return;
@@ -290,15 +290,7 @@ async function executeDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof d
 }
 
 async function isAdminOfChat(ctx: Context, chatId: number, userId: number): Promise<boolean> {
-  try {
-    const member = await ctx.api.getChatMember(chatId, userId);
-    const isAdmin = member.status === "administrator" || member.status === "creator";
-    if (isAdmin) db.rememberUserAdminGroup(userId, chatId);
-    else db.forgetUserAdminGroup(userId, chatId);
-    return isAdmin;
-  } catch {
-    return false;
-  }
+  return (await getGroupManagementAccess(ctx.api, chatId, userId)).allowed;
 }
 
 type AdminAction =
@@ -314,6 +306,7 @@ type AdminAction =
   | "history"
   | "stats"
   | "defaults"
+  | "access"
   | "setup"
   | "referrals"
   | "language"
@@ -321,8 +314,8 @@ type AdminAction =
 
 const ADMIN_SCAN_BATCH_SIZE = 8;
 
-function buildAdminDashboardKeyboard(chatId: number): InlineKeyboard {
-  return new InlineKeyboard()
+function buildAdminDashboardKeyboard(chatId: number, isOwner: boolean): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
     .text("➕ Create Raffle", `admin_do_create_${chatId}`).row()
     .text("🎟 Open Raffles", `admin_do_raffles_${chatId}`).row()
     .text("📋 Templates", `admin_do_templates_${chatId}`).text("🏆 Draw", `admin_do_draw_${chatId}`).row()
@@ -331,7 +324,11 @@ function buildAdminDashboardKeyboard(chatId: number): InlineKeyboard {
     .text("🕘 History", `admin_do_history_${chatId}`).text("📊 Stats", `admin_do_stats_${chatId}`).row()
     .text("⚙️ Defaults", `admin_do_defaults_${chatId}`).text("🧪 Setup Check", `admin_do_setup_${chatId}`).row()
     .text("🔗 Referrals", `admin_do_referrals_${chatId}`).row()
-    .text("🌐 Language", `admin_do_language_${chatId}`).text("🕐 Timezone", `admin_do_timezone_${chatId}`).row()
+    .text("🌐 Language", `admin_do_language_${chatId}`).text("🕐 Timezone", `admin_do_timezone_${chatId}`).row();
+  if (isOwner) {
+    keyboard.text("🔐 Admin Access", `admin_do_access_${chatId}`).row();
+  }
+  return keyboard
     .text("↔️ Change Group", "admin_groups").text("❌ Close", "admin_close");
 }
 
@@ -346,7 +343,11 @@ async function discoverAdminGroups(ctx: Context, userId: number): Promise<Return
         try {
           const member = await ctx.api.getChatMember(group.chat_id, userId);
           if (member.status === "administrator" || member.status === "creator") {
-            db.rememberUserAdminGroup(userId, group.chat_id);
+            db.rememberUserAdminGroup(
+              userId,
+              group.chat_id,
+              member.status === "creator" ? "creator" : "administrator"
+            );
           }
         } catch {
           // Telegram only guarantees this lookup when the bot can inspect members.
@@ -404,8 +405,10 @@ async function showAdminGroupPicker(
 }
 
 async function showAdminDashboard(ctx: Context, chatId: number): Promise<void> {
-  if (!ctx.from || !(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
-    await ctx.reply("I could not verify that you are still an admin of that group.");
+  if (!ctx.from) return;
+  const access = await getGroupManagementAccess(ctx.api, chatId, ctx.from.id);
+  if (!access.allowed) {
+    await ctx.reply("You do not have permission to manage that group.");
     return;
   }
   const group = db.getBotGroup(chatId);
@@ -417,13 +420,15 @@ async function showAdminDashboard(ctx: Context, chatId: number): Promise<void> {
 
   await ctx.reply(
     `<b>${escapeHtml(title)} Admin Center</b>\n\nChoose what you want to manage. Everything stays in this private chat; only raffle posts and required results are sent to the group.`,
-    { parse_mode: "HTML", reply_markup: buildAdminDashboardKeyboard(chatId) }
+    { parse_mode: "HTML", reply_markup: buildAdminDashboardKeyboard(chatId, access.isOwner) }
   );
 }
 
 async function runAdminAction(ctx: Context, action: AdminAction, chatId: number): Promise<void> {
-  if (!ctx.from || !(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
-    await ctx.reply("I could not verify that you are still an admin of that group.");
+  if (!ctx.from) return;
+  const access = await getGroupManagementAccess(ctx.api, chatId, ctx.from.id);
+  if (!access.allowed) {
+    await ctx.reply("You do not have permission to manage that group.");
     return;
   }
   const group = db.getBotGroup(chatId);
@@ -442,6 +447,13 @@ async function runAdminAction(ctx: Context, action: AdminAction, chatId: number)
     case "history": await showRaffleHistoryForChat(ctx, chatId); return;
     case "stats": await showGroupStatsForChat(ctx, chatId); return;
     case "defaults": await showDefaultsForChat(ctx, chatId); return;
+    case "access":
+      if (!access.isOwner) {
+        await ctx.reply("Only the Telegram group owner can change Admin Access.");
+        return;
+      }
+      await showAccessSettingsForChat(ctx, chatId);
+      return;
     case "setup": await showSetupCheckForChat(ctx, chatId); return;
     case "referrals": await showReferralsForChat(ctx, chatId); return;
     case "language": await showLanguageForChat(ctx, chatId); return;
@@ -531,7 +543,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can draw raffle winners.");
     return;
@@ -624,7 +636,7 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can cancel raffles.");
     return;
@@ -735,7 +747,7 @@ export async function handleRepostCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, raffle.chat_id, userId);
   if (!isAdmin) {
     await ctx.answerCallbackQuery({ text: "Only group admins can repost raffles.", show_alert: true });
     return;
@@ -969,7 +981,6 @@ async function canExportRaffle(
   sourceChatId?: number
 ): Promise<boolean> {
   if (sourceChatId !== undefined && sourceChatId !== raffle.chat_id) return false;
-  if (raffle.creator_id === userId) return true;
   return isAdminOfChat(ctx, raffle.chat_id, userId);
 }
 
@@ -1062,7 +1073,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     }
 
     // Group: existing behavior — list raffles in this chat (admin only)
-    const isAdmin = await isGroupAdmin(ctx, userId);
+    const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
     if (!isAdmin) {
       await replyPrivately(ctx, "Only group admins can export entries.");
       return;
@@ -1099,25 +1110,14 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
     return;
   }
 
-  // Authorization: must be the creator OR an admin of the raffle's chat
-  let authorized = raffle.creator_id === userId;
-  if (!authorized) {
-    if (!inDm && raffle.chat_id !== ctx.chat.id) {
-      // In a group context, raffle has to belong to this chat
-      await replyPrivately(ctx, "Raffle not found in this chat.");
-      return;
-    }
-    // Verify they're an admin of the raffle's chat
-    try {
-      const member = await ctx.api.getChatMember(raffle.chat_id, userId);
-      authorized = member.status === "administrator" || member.status === "creator";
-    } catch {
-      authorized = false;
-    }
+  if (!inDm && raffle.chat_id !== ctx.chat.id) {
+    await replyPrivately(ctx, "Raffle not found in this chat.");
+    return;
   }
+  const authorized = await isAdminOfChat(ctx, raffle.chat_id, userId);
   if (!authorized) {
     const reply = (text: string) => (inDm ? ctx.reply(text) : replyPrivately(ctx, text));
-    await reply("You can only export raffles you created or that you're an admin of.");
+    await reply("You do not have permission to export raffles for that group.");
     return;
   }
 
@@ -1159,7 +1159,7 @@ export async function handleRerun(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can re-run raffles.");
     return;
@@ -1794,7 +1794,7 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can save templates.");
     return;
@@ -1820,7 +1820,7 @@ export async function handleTemplates(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await ctx.reply("Only group admins can manage templates.");
     return;
@@ -1838,7 +1838,7 @@ export async function handleDeleteTemplate(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can delete templates.");
     return;
@@ -1865,7 +1865,7 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can create raffles.");
     return;
@@ -1892,7 +1892,7 @@ export async function handleRecurring(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can manage recurring raffles.");
     return;
@@ -1919,7 +1919,7 @@ export async function handleEditRaffle(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can edit raffles.");
     return;
@@ -1960,7 +1960,7 @@ export async function handleLanguage(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can change the language.");
     return;
@@ -2057,7 +2057,7 @@ export async function handleTimezone(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     await replyPrivately(ctx, "Only group admins can change the timezone.");
     return;
@@ -3055,7 +3055,7 @@ export async function handleGroupStats(ctx: Context): Promise<void> {
   }
 
   const userId = ctx.from!.id;
-  const isAdmin = await isGroupAdmin(ctx, userId);
+  const isAdmin = await isAdminOfChat(ctx, ctx.chat.id, userId);
   if (!isAdmin) {
     return; // silently ignore for non-admins
   }
@@ -3098,6 +3098,173 @@ async function showGroupStatsForChat(ctx: Context, chatId: number): Promise<void
   }
 
   await ctx.reply(msg, { parse_mode: "HTML" });
+}
+
+function accessModeLabel(mode: db.GroupAccessMode): string {
+  if (mode === "owner_only") return "Owner Only";
+  if (mode === "selected_admins") return "Selected Admins";
+  return "All Admins";
+}
+
+function buildAccessSettingsKeyboard(
+  chatId: number,
+  mode: db.GroupAccessMode
+): InlineKeyboard {
+  const selected = (value: db.GroupAccessMode) => value === mode ? " ✓" : "";
+  const keyboard = new InlineKeyboard()
+    .text(`All Admins${selected("all_admins")}`, `access_mode_${chatId}_all_admins`).row()
+    .text(`Owner Only${selected("owner_only")}`, `access_mode_${chatId}_owner_only`).row()
+    .text(`Selected Admins${selected("selected_admins")}`, `access_mode_${chatId}_selected_admins`).row();
+  if (mode === "selected_admins") {
+    keyboard.text("Choose Allowed Admins", `access_select_${chatId}`).row();
+  }
+  return keyboard.text("Close", "access_close");
+}
+
+async function showAccessSettingsForChat(
+  ctx: Context,
+  chatId: number,
+  edit = false
+): Promise<void> {
+  if (!ctx.from || !(await isGroupOwner(ctx.api, chatId, ctx.from.id))) {
+    const message = "Only the Telegram group owner can change Admin Access.";
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: message, show_alert: true });
+    } else {
+      await ctx.reply(message);
+    }
+    return;
+  }
+
+  const mode = db.getGroupAccessMode(chatId);
+  const selectedCount = db.getSelectedGroupAdminIds(chatId).length;
+  const group = db.getBotGroup(chatId);
+  const text =
+    `🔐 <b>Admin Access: ${escapeHtml(group?.title || "Group")}</b>\n\n` +
+    `Current setting: <b>${accessModeLabel(mode)}</b>\n` +
+    (mode === "selected_admins"
+      ? `Allowed administrators: <b>${selectedCount}</b>\n\n`
+      : "\n") +
+    `<b>All Admins</b> lets every Telegram administrator manage the bot.\n` +
+    `<b>Owner Only</b> restricts management to the group owner.\n` +
+    `<b>Selected Admins</b> lets the owner approve specific administrators.\n\n` +
+    `<i>The group owner always retains access.</i>`;
+  const options = {
+    parse_mode: "HTML" as const,
+    reply_markup: buildAccessSettingsKeyboard(chatId, mode),
+  };
+  if (edit) await ctx.editMessageText(text, options);
+  else await ctx.reply(text, options);
+}
+
+async function showSelectedAdminsForChat(ctx: Context, chatId: number): Promise<void> {
+  if (!ctx.from || !(await isGroupOwner(ctx.api, chatId, ctx.from.id))) {
+    await ctx.answerCallbackQuery({
+      text: "Only the Telegram group owner can choose allowed admins.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  let administrators: Awaited<ReturnType<typeof ctx.api.getChatAdministrators>>;
+  try {
+    administrators = await ctx.api.getChatAdministrators(chatId);
+  } catch {
+    await ctx.editMessageText(
+      "I couldn't load this group's administrator list. Check the bot's permissions and try again."
+    );
+    return;
+  }
+  const selectable = administrators.filter(
+    (member) => member.status === "administrator" && !member.user.is_bot
+  );
+  const allowed = new Set(db.getSelectedGroupAdminIds(chatId));
+  const keyboard = new InlineKeyboard();
+  for (const member of selectable) {
+    const name = member.user.username
+      ? `@${member.user.username}`
+      : getUserDisplayName(member.user.first_name, member.user.last_name);
+    keyboard
+      .text(`${allowed.has(member.user.id) ? "✓ " : ""}${name}`.slice(0, 40), `access_toggle_${chatId}_${member.user.id}`)
+      .row();
+  }
+  keyboard.text("Back", `access_back_${chatId}`);
+
+  const text = selectable.length > 0
+    ? `<b>Choose Allowed Admins</b>\n\nTap an administrator to allow or remove their bot-management access.`
+    : `<b>Choose Allowed Admins</b>\n\nNo other human administrators are currently available.`;
+  await ctx.editMessageText(text, {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
+}
+
+export async function handleAccessCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+
+  if (data === "access_close") {
+    await ctx.answerCallbackQuery();
+    try { await ctx.deleteMessage(); } catch {}
+    return;
+  }
+
+  const modeMatch = data.match(/^access_mode_(-?\d+)_(all_admins|owner_only|selected_admins)$/);
+  if (modeMatch) {
+    const chatId = parseInt(modeMatch[1], 10);
+    if (!(await isGroupOwner(ctx.api, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only the group owner can change this setting.", show_alert: true });
+      return;
+    }
+    const mode = modeMatch[2] as db.GroupAccessMode;
+    db.setGroupAccessMode(chatId, mode);
+    await ctx.answerCallbackQuery({ text: `Access set to ${accessModeLabel(mode)}.` });
+    if (mode === "selected_admins") await showSelectedAdminsForChat(ctx, chatId);
+    else await showAccessSettingsForChat(ctx, chatId, true);
+    return;
+  }
+
+  const selectMatch = data.match(/^access_select_(-?\d+)$/);
+  if (selectMatch) {
+    await ctx.answerCallbackQuery();
+    await showSelectedAdminsForChat(ctx, parseInt(selectMatch[1], 10));
+    return;
+  }
+
+  const toggleMatch = data.match(/^access_toggle_(-?\d+)_(\d+)$/);
+  if (toggleMatch) {
+    const chatId = parseInt(toggleMatch[1], 10);
+    const targetUserId = parseInt(toggleMatch[2], 10);
+    if (!(await isGroupOwner(ctx.api, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only the group owner can choose allowed admins.", show_alert: true });
+      return;
+    }
+    let administrators: Awaited<ReturnType<typeof ctx.api.getChatAdministrators>>;
+    try {
+      administrators = await ctx.api.getChatAdministrators(chatId);
+    } catch {
+      await ctx.answerCallbackQuery({ text: "I couldn't refresh the administrator list.", show_alert: true });
+      return;
+    }
+    const target = administrators.find(
+      (member) => member.status === "administrator" && member.user.id === targetUserId && !member.user.is_bot
+    );
+    if (!target) {
+      await ctx.answerCallbackQuery({ text: "That user is no longer a group administrator.", show_alert: true });
+      return;
+    }
+    const currentlyAllowed = db.isSelectedGroupAdmin(chatId, targetUserId);
+    db.setSelectedGroupAdmin(chatId, targetUserId, !currentlyAllowed, ctx.from.id);
+    await ctx.answerCallbackQuery({ text: currentlyAllowed ? "Admin access removed." : "Admin access allowed." });
+    await showSelectedAdminsForChat(ctx, chatId);
+    return;
+  }
+
+  const backMatch = data.match(/^access_back_(-?\d+)$/);
+  if (backMatch) {
+    await ctx.answerCallbackQuery();
+    await showAccessSettingsForChat(ctx, parseInt(backMatch[1], 10), true);
+  }
 }
 
 function formatGroupDefaults(chatId: number): string {
@@ -3145,7 +3312,7 @@ export async function handleDefaults(ctx: Context): Promise<void> {
     return;
   }
   const userId = ctx.from!.id;
-  if (!(await isGroupAdmin(ctx, userId))) {
+  if (!(await isAdminOfChat(ctx, ctx.chat.id, userId))) {
     await replyPrivately(ctx, "Only group admins can manage defaults.");
     return;
   }
@@ -3258,7 +3425,7 @@ export async function handleSetupCheck(ctx: Context): Promise<void> {
     await showAdminGroupPicker(ctx, false, "setup");
     return;
   }
-  if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
+  if (!(await isAdminOfChat(ctx, ctx.chat.id, ctx.from!.id))) {
     await replyPrivately(ctx, "Only group admins can run setup checks.");
     return;
   }
@@ -3294,7 +3461,7 @@ export async function handleReferrals(ctx: Context): Promise<void> {
     await showAdminGroupPicker(ctx, false, "referrals");
     return;
   }
-  if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
+  if (!(await isAdminOfChat(ctx, ctx.chat.id, ctx.from!.id))) {
     await replyPrivately(ctx, "Only group admins can view referral stats.");
     return;
   }
@@ -3325,12 +3492,7 @@ export async function handleReferralsCallback(ctx: Context): Promise<void> {
   const chatId = parseInt(match[1], 10);
   const raffleId = parseInt(match[2], 10);
 
-  let isAdmin = false;
-  try {
-    const member = await ctx.api.getChatMember(chatId, ctx.from.id);
-    isAdmin = member.status === "administrator" || member.status === "creator";
-  } catch {}
-  if (!isAdmin) {
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
     await ctx.answerCallbackQuery({ text: "Only group admins can view referral stats.", show_alert: true });
     return;
   }

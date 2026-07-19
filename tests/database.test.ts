@@ -129,6 +129,29 @@ describe("database optimization helpers", () => {
     expect(db.getUserAdminGroups(20)).toHaveLength(1);
   });
 
+  it("filters remembered groups using owner-controlled access settings", () => {
+    db.upsertBotGroup(-1001, "Restricted", "administrator");
+    db.rememberUserAdminGroup(10, -1001, "creator");
+    db.rememberUserAdminGroup(20, -1001, "administrator");
+
+    expect(db.getGroupAccessMode(-1001)).toBe("all_admins");
+    expect(db.getUserAdminGroups(20)).toHaveLength(1);
+
+    db.setGroupAccessMode(-1001, "owner_only");
+    expect(db.getUserAdminGroups(10)).toHaveLength(1);
+    expect(db.getUserAdminGroups(20)).toEqual([]);
+
+    db.setGroupAccessMode(-1001, "selected_admins");
+    expect(db.getUserAdminGroups(20)).toEqual([]);
+    db.setSelectedGroupAdmin(-1001, 20, true, 10);
+    expect(db.isSelectedGroupAdmin(-1001, 20)).toBe(true);
+    expect(db.getSelectedGroupAdminIds(-1001)).toEqual([20]);
+    expect(db.getUserAdminGroups(20)).toHaveLength(1);
+
+    db.setSelectedGroupAdmin(-1001, 20, false, 10);
+    expect(db.getUserAdminGroups(20)).toEqual([]);
+  });
+
   it("lists a participant's open raffle entries across groups", () => {
     const first = db.createRaffle(raffleInput({ chat_id: -1001, title: "First" }));
     const second = db.createRaffle(raffleInput({ chat_id: -1002, title: "Second" }));

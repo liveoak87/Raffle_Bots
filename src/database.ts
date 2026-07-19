@@ -158,8 +158,23 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE TABLE IF NOT EXISTS user_admin_groups (
       user_id INTEGER NOT NULL,
       chat_id INTEGER NOT NULL,
+      admin_role TEXT NOT NULL DEFAULT 'administrator' CHECK(admin_role IN ('administrator', 'creator')),
       verified_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (user_id, chat_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_access_settings (
+      chat_id INTEGER PRIMARY KEY,
+      access_mode TEXT NOT NULL DEFAULT 'all_admins' CHECK(access_mode IN ('all_admins', 'owner_only', 'selected_admins')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS group_access_admins (
+      chat_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      added_by INTEGER NOT NULL,
+      added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chat_id, user_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
@@ -191,9 +206,15 @@ function migrateDatabase(): void {
   const raffleColumns = tableInfo("raffles").map((c) => c.name);
   const winnerColumns = tableInfo("raffle_winners").map((c) => c.name);
   const botGroupsColumns = tableInfo("bot_groups").map((c) => c.name);
+  const userAdminGroupColumns = tableInfo("user_admin_groups").map((c) => c.name);
 
   if (!botGroupsColumns.includes("timezone")) {
     getDb().exec("ALTER TABLE bot_groups ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'");
+  }
+  if (!userAdminGroupColumns.includes("admin_role")) {
+    getDb().exec(
+      "ALTER TABLE user_admin_groups ADD COLUMN admin_role TEXT NOT NULL DEFAULT 'administrator'"
+    );
   }
 
   if (!raffleColumns.includes("prizes")) {
@@ -1479,14 +1500,26 @@ export function getAdminBotGroups(): BotGroup[] {
     .all() as BotGroup[];
 }
 
-export function rememberUserAdminGroup(userId: number, chatId: number): void {
+export type GroupAccessMode = "all_admins" | "owner_only" | "selected_admins";
+
+export interface UserAdminGroup extends BotGroup {
+  admin_role: "administrator" | "creator";
+}
+
+export function rememberUserAdminGroup(
+  userId: number,
+  chatId: number,
+  role: "administrator" | "creator" = "administrator"
+): void {
   getDb()
     .prepare(
-      `INSERT INTO user_admin_groups (user_id, chat_id, verified_at)
-       VALUES (?, ?, datetime('now'))
-       ON CONFLICT(user_id, chat_id) DO UPDATE SET verified_at = datetime('now')`
+      `INSERT INTO user_admin_groups (user_id, chat_id, admin_role, verified_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(user_id, chat_id) DO UPDATE SET
+         admin_role = excluded.admin_role,
+         verified_at = datetime('now')`
     )
-    .run(userId, chatId);
+    .run(userId, chatId, role);
 }
 
 export function forgetUserAdminGroup(userId: number, chatId: number): void {
@@ -1499,16 +1532,83 @@ export function clearUserAdminGroups(userId: number): void {
   getDb().prepare("DELETE FROM user_admin_groups WHERE user_id = ?").run(userId);
 }
 
-export function getUserAdminGroups(userId: number): BotGroup[] {
+export function getUserAdminGroups(userId: number): UserAdminGroup[] {
   return getDb()
     .prepare(
-      `SELECT bg.*
+      `SELECT bg.*, uag.admin_role
        FROM user_admin_groups uag
        JOIN bot_groups bg ON bg.chat_id = uag.chat_id
+       LEFT JOIN group_access_settings gas ON gas.chat_id = bg.chat_id
        WHERE uag.user_id = ?
+         AND (
+           uag.admin_role = 'creator'
+           OR COALESCE(gas.access_mode, 'all_admins') = 'all_admins'
+           OR (
+             gas.access_mode = 'selected_admins'
+             AND EXISTS (
+               SELECT 1 FROM group_access_admins gaa
+               WHERE gaa.chat_id = bg.chat_id AND gaa.user_id = uag.user_id
+             )
+           )
+         )
        ORDER BY bg.title COLLATE NOCASE`
     )
-    .all(userId) as BotGroup[];
+    .all(userId) as UserAdminGroup[];
+}
+
+export function getGroupAccessMode(chatId: number): GroupAccessMode {
+  const row = getDb()
+    .prepare("SELECT access_mode FROM group_access_settings WHERE chat_id = ?")
+    .get(chatId) as { access_mode: GroupAccessMode } | undefined;
+  return row?.access_mode || "all_admins";
+}
+
+export function setGroupAccessMode(chatId: number, mode: GroupAccessMode): void {
+  getDb()
+    .prepare(
+      `INSERT INTO group_access_settings (chat_id, access_mode, updated_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(chat_id) DO UPDATE SET
+         access_mode = excluded.access_mode,
+         updated_at = datetime('now')`
+    )
+    .run(chatId, mode);
+}
+
+export function getSelectedGroupAdminIds(chatId: number): number[] {
+  const rows = getDb()
+    .prepare("SELECT user_id FROM group_access_admins WHERE chat_id = ? ORDER BY user_id")
+    .all(chatId) as Array<{ user_id: number }>;
+  return rows.map((row) => row.user_id);
+}
+
+export function isSelectedGroupAdmin(chatId: number, userId: number): boolean {
+  return Boolean(
+    getDb()
+      .prepare("SELECT 1 FROM group_access_admins WHERE chat_id = ? AND user_id = ?")
+      .get(chatId, userId)
+  );
+}
+
+export function setSelectedGroupAdmin(
+  chatId: number,
+  userId: number,
+  allowed: boolean,
+  addedBy: number
+): void {
+  if (!allowed) {
+    getDb()
+      .prepare("DELETE FROM group_access_admins WHERE chat_id = ? AND user_id = ?")
+      .run(chatId, userId);
+    return;
+  }
+  getDb()
+    .prepare(
+      `INSERT INTO group_access_admins (chat_id, user_id, added_by)
+       VALUES (?, ?, ?)
+       ON CONFLICT(chat_id, user_id) DO UPDATE SET added_by = excluded.added_by`
+    )
+    .run(chatId, userId, addedBy);
 }
 
 /**

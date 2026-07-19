@@ -5,7 +5,6 @@ import {
   getUserDisplayName,
   formatRaffleMessage,
   escapeHtml,
-  isGroupAdmin,
   parseEndTime,
   formatCountdown,
   buildRaffleKeyboard,
@@ -13,6 +12,7 @@ import {
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
 import { formatInTimezone } from "./timezone";
+import { canManageGroup } from "./access";
 
 interface WizardState {
   step:
@@ -142,9 +142,8 @@ export async function startWizard(ctx: Context): Promise<void> {
   const groupTitle = ctx.chat!.title || "this group";
   const userId = ctx.from!.id;
 
-  const isAdmin = await isGroupAdmin(ctx, userId);
-  if (!isAdmin) {
-    await ctx.reply("Only group admins can create raffles.");
+  if (!(await canManageGroup(ctx.api, groupChatId, userId))) {
+    await ctx.reply("You do not have permission to manage raffles in this group.");
     return;
   }
 
@@ -202,14 +201,8 @@ export async function startRaffleWizardForGroup(
 ): Promise<boolean> {
   if (!ctx.from || ctx.chat?.type !== "private") return false;
 
-  try {
-    const member = await ctx.api.getChatMember(groupChatId, ctx.from.id);
-    if (member.status !== "administrator" && member.status !== "creator") {
-      await ctx.reply("You must be an admin in that group to create raffles.");
-      return false;
-    }
-  } catch {
-    await ctx.reply("I couldn't verify your admin status in that group.");
+  if (!(await canManageGroup(ctx.api, groupChatId, ctx.from.id))) {
+    await ctx.reply("You do not have permission to manage raffles in that group.");
     return false;
   }
 
@@ -317,14 +310,8 @@ export async function handleStartDeepLink(
     const groupChatId = parseInt(tmplMatch[1], 10);
     const userId = ctx.from!.id;
 
-    try {
-      const member = await ctx.api.getChatMember(groupChatId, userId);
-      if (member.status !== "administrator" && member.status !== "creator") {
-        await ctx.reply("You must be an admin in that group to create templates.");
-        return true;
-      }
-    } catch {
-      await ctx.reply("I couldn't verify your admin status in that group.");
+    if (!(await canManageGroup(ctx.api, groupChatId, userId))) {
+      await ctx.reply("You do not have permission to manage templates in that group.");
       return true;
     }
 
@@ -375,15 +362,8 @@ export async function handleStartDeepLink(
       return true;
     }
 
-    // Verify the user is still an admin of the source group
-    try {
-      const member = await ctx.api.getChatMember(groupChatId, userId);
-      if (member.status !== "administrator" && member.status !== "creator") {
-        await ctx.reply("You must be an admin of that group to edit its raffles.");
-        return true;
-      }
-    } catch {
-      await ctx.reply("I couldn't verify your admin status in that group.");
+    if (!(await canManageGroup(ctx.api, groupChatId, userId))) {
+      await ctx.reply("You do not have permission to edit raffles in that group.");
       return true;
     }
 
@@ -1883,6 +1863,11 @@ async function createRaffleFromWizard(
   ctx: Context,
   state: WizardState
 ): Promise<void> {
+  if (!(await canManageGroup(ctx.api, state.targetChatId, state.userId))) {
+    cancelWizard(state.userId);
+    await ctx.reply("Your access to manage raffles in this group has been removed.");
+    return;
+  }
   const displayName = getUserDisplayName(
     ctx.from!.first_name,
     ctx.from!.last_name
@@ -2221,14 +2206,8 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
       await ctx.answerCallbackQuery({ text: "This raffle is no longer editable.", show_alert: true });
       return;
     }
-    try {
-      const member = await ctx.api.getChatMember(raffle.chat_id, ctx.from.id);
-      if (member.status !== "administrator" && member.status !== "creator") {
-        await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
-        return;
-      }
-    } catch {
-      await ctx.answerCallbackQuery({ text: "I could not verify your admin access.", show_alert: true });
+    if (!(await canManageGroup(ctx.api, raffle.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "You do not have permission to edit raffles in that group.", show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2262,6 +2241,11 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
   if (!raffle || raffle.status !== "open") {
     await ctx.answerCallbackQuery({ text: "This raffle is no longer editable.", show_alert: true });
     cancelEditWizard(ctx.from.id);
+    return;
+  }
+  if (!(await canManageGroup(ctx.api, state.chatId, ctx.from.id))) {
+    cancelEditWizard(ctx.from.id);
+    await ctx.answerCallbackQuery({ text: "Your access to manage this group has been removed.", show_alert: true });
     return;
   }
 
@@ -2599,6 +2583,11 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
     await ctx.reply("This raffle is no longer editable.");
     return true;
   }
+  if (!(await canManageGroup(ctx.api, state.chatId, ctx.from.id))) {
+    cancelEditWizard(ctx.from.id);
+    await ctx.reply("Your access to manage this group has been removed.");
+    return true;
+  }
 
   switch (state.editingField) {
     case "title":
@@ -2785,6 +2774,11 @@ export async function handleEditPhotoMessage(ctx: Context): Promise<boolean> {
   if (!raffle || raffle.status !== "open") {
     cancelEditWizard(ctx.from.id);
     await ctx.reply("This raffle is no longer editable.");
+    return true;
+  }
+  if (!(await canManageGroup(ctx.api, state.chatId, ctx.from.id))) {
+    cancelEditWizard(ctx.from.id);
+    await ctx.reply("Your access to manage this group has been removed.");
     return true;
   }
 
@@ -3827,6 +3821,11 @@ async function createTemplateFromWizard(
   ctx: Context,
   state: TemplateWizardState
 ): Promise<void> {
+  if (!(await canManageGroup(ctx.api, state.targetChatId, state.userId))) {
+    cancelTemplateWizard(state.userId);
+    await ctx.reply("Your access to manage templates in this group has been removed.");
+    return;
+  }
   const prizes = state.prizes || ["Prize"];
   const singlePrize = prizes[0];
   const prizesJson = prizes.length > 1 ? JSON.stringify(prizes) : null;
@@ -3866,7 +3865,7 @@ async function createTemplateFromWizard(
 
     await ctx.reply(
       `✅ Template <b>${escapeHtml(state.name || "Template")}</b> saved!\n\n` +
-        `Use /templates in <b>${escapeHtml(state.targetChatTitle)}</b> to manage it.`,
+        `Open <b>${escapeHtml(state.targetChatTitle)}</b> in the private Admin Center to manage it.`,
       { parse_mode: "HTML" }
     );
   } catch (err: unknown) {

@@ -148,21 +148,6 @@ export function formatWinnersMessage(
   return msg;
 }
 
-export async function isGroupAdmin(
-  ctx: Context,
-  userId: number
-): Promise<boolean> {
-  try {
-    const chatMember = await ctx.api.getChatMember(ctx.chat!.id, userId);
-    return (
-      chatMember.status === "administrator" ||
-      chatMember.status === "creator"
-    );
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Send a message privately to the user via DM.
  * Falls back to a temporary group message that auto-deletes after 8 seconds.
@@ -296,5 +281,4 @@ export function buildMessageLink(chatId: number, messageId: number | null): stri
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 

@@ -24,6 +24,7 @@ import {
   handleHelp,
   handleManage,
   handleAdminCallback,
+  handleAccessCallback,
   handleNewRaffle,
   handleListRaffles,
   handleDraw,
@@ -453,6 +454,7 @@ bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
 bot.callbackQuery(/^draw_/, handleDrawCallback);
 bot.callbackQuery(/^export_/, handleExportCallback);
 bot.callbackQuery(/^admin_/, handleAdminCallback);
+bot.callbackQuery(/^access_/, handleAccessCallback);
 
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);

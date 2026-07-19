@@ -8,6 +8,7 @@ import {
   parseEndTime,
   formatCountdown,
   buildRaffleKeyboard,
+  replyPrivately,
 } from "./helpers";
 import { t } from "./i18n";
 import { sendCustomImage, sendRafflePost } from "./banners";
@@ -143,7 +144,7 @@ export async function startWizard(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
 
   if (!(await canManageGroup(ctx.api, groupChatId, userId))) {
-    await ctx.reply("You do not have permission to manage raffles in this group.");
+    await replyPrivately(ctx, "You do not have permission to manage raffles in this group.");
     return;
   }
 
@@ -165,15 +166,6 @@ export async function startWizard(ctx: Context): Promise<void> {
       userId,
       createdAt: Date.now(),
     }));
-
-    const notice = await ctx.reply(
-      `📝 Check your DMs @${ctx.from!.username || ctx.from!.first_name} — I sent you the raffle setup there.`
-    );
-    setTimeout(async () => {
-      try {
-        await ctx.api.deleteMessage(groupChatId, notice.message_id);
-      } catch {}
-    }, 5000);
   } catch {
     const botInfo = await ctx.api.getMe();
     const keyboard = new InlineKeyboard().url(

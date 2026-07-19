@@ -107,6 +107,7 @@ import {
   handleBugReportMessage,
   handleBugReportPhoto,
   handleBugReportSkip,
+  startWizard,
 } from "./wizard";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 
@@ -350,8 +351,8 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// Legacy group commands are redirected to a private button. The public command
-// menu is empty, but this keeps old typed commands from creating group clutter.
+// Legacy group commands route into private workflows. Creation can start
+// immediately; other actions retain a private button until their picker opens.
 const PRIVATE_ADMIN_ACTIONS: Record<string, string> = {
   newraffle: "create",
   draw: "draw",
@@ -381,6 +382,10 @@ bot.use(async (ctx, next) => {
   if (!action) return next();
 
   try { await ctx.deleteMessage(); } catch {}
+  if (action === "create") {
+    await startWizard(ctx);
+    return;
+  }
   try {
     await ctx.api.sendMessage(
       ctx.from.id,

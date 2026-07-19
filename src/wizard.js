@@ -50,7 +50,7 @@ function buildCreateModal() {
     .setPlaceholder('1')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
-    .setMaxLength(2);
+    .setMaxLength(3);
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(prizeInput),
@@ -94,18 +94,22 @@ function parseModalValues(interaction) {
   const maxPicksRaw = interaction.fields.getTextInputValue('max_picks')?.trim() || '0';
   const numWinnersRaw = interaction.fields.getTextInputValue('num_winners')?.trim() || '1';
 
-  const totalSlots = parseInt(slotsRaw, 10);
-  if (isNaN(totalSlots) || totalSlots < 2 || totalSlots > 200) {
+  if (!prizeRaw) {
+    return { error: 'Prize is required.' };
+  }
+
+  const totalSlots = /^\d+$/.test(slotsRaw) ? Number(slotsRaw) : NaN;
+  if (!Number.isSafeInteger(totalSlots) || totalSlots < 2 || totalSlots > 200) {
     return { error: 'Number of spots must be between 2 and 200.' };
   }
 
-  const maxPicksPerUser = parseInt(maxPicksRaw, 10);
-  if (isNaN(maxPicksPerUser) || maxPicksPerUser < 0) {
-    return { error: 'Max picks must be 0 (unlimited) or a positive number.' };
+  const maxPicksPerUser = /^\d+$/.test(maxPicksRaw) ? Number(maxPicksRaw) : NaN;
+  if (!Number.isSafeInteger(maxPicksPerUser) || maxPicksPerUser < 0 || maxPicksPerUser > totalSlots) {
+    return { error: `Max picks must be between 0 (unlimited) and ${totalSlots}.` };
   }
 
-  let numWinners = parseInt(numWinnersRaw, 10);
-  if (isNaN(numWinners) || numWinners < 1) {
+  const numWinners = /^\d+$/.test(numWinnersRaw) ? Number(numWinnersRaw) : NaN;
+  if (!Number.isSafeInteger(numWinners) || numWinners < 1) {
     return { error: 'Number of winners must be at least 1.' };
   }
   if (numWinners > totalSlots) {

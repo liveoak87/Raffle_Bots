@@ -310,6 +310,12 @@ function buildExtensionComponents(raffle, picks) {
   return allMessages;
 }
 
+function getExtensionIndexesForSlots(slotNumbers) {
+  return [...new Set(slotNumbers
+    .filter(slot => Number.isInteger(slot) && slot >= 25)
+    .map(slot => Math.floor((slot - 25) / 25)))];
+}
+
 // ── Payment management panel (ephemeral, shown only to creator) ──────────────
 
 // Builds the main header message for the donation manager (embed + Mark All controls)
@@ -410,48 +416,98 @@ function getOrdinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-function buildWinnerEmbed(raffle, picks, winners) {
-  const embed = buildBoardEmbed(raffle, picks);
+function getEmbedTextLength(embed) {
+  const data = embed.toJSON();
+  return (data.title?.length || 0) +
+    (data.description?.length || 0) +
+    (data.footer?.text?.length || 0) +
+    (data.author?.name?.length || 0) +
+    (data.fields || []).reduce((total, field) => total + field.name.length + field.value.length, 0);
+}
 
-  embed.setTitle('\uD83C\uDF89  RANDOMIZER COMPLETE  \uD83C\uDF89');
-  embed.setColor(0xFFD700);
-
-  if (!Array.isArray(winners)) {
-    winners = [winners];
+function chunkLines(lines, maxLength) {
+  const chunks = [];
+  let current = '';
+  for (const line of lines) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > maxLength && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = next;
+    }
   }
+  if (current) chunks.push(current);
+  return chunks;
+}
 
-  const prizes = raffle.prize.split('\n').filter(Boolean);
+function buildWinnerEmbeds(raffle, picks, winners) {
+  if (!Array.isArray(winners)) winners = [winners];
 
-  if (winners.length === 1) {
-    const w = winners[0];
-    embed.addFields({
-      name: '\uD83C\uDFC6 WINNER',
-      value: `**Spot #${w.slot_number}** \u2014 <@${w.user_id}> (${w.username})`,
-      inline: false
-    });
-  } else {
-    const winnerLines = winners.map((w, i) => {
-      const ordinal = getOrdinal(i + 1);
-      return `**${ordinal} Winner:** Spot #${w.slot_number} \u2014 <@${w.user_id}> (${w.username})`;
-    }).join('\n');
-    embed.addFields({
-      name: `\uD83C\uDFC6 WINNERS (${winners.length})`,
-      value: winnerLines,
-      inline: false
-    });
+  const embed = buildBoardEmbed({ ...raffle, status: 'completed' }, picks)
+    .setTitle('\uD83C\uDF89  RANDOMIZER COMPLETE  \uD83C\uDF89')
+    .setColor(0xFFD700);
+  const fieldName = winners.length === 1 ? '\uD83C\uDFC6 WINNER' : `\uD83C\uDFC6 WINNERS (${winners.length})`;
+  const winnerLines = winners.map((w, i) =>
+    `**${getOrdinal(i + 1)}:** #${w.slot_number} \u2014 <@${w.user_id}> (${w.username})`
+  );
+
+  const available = Math.max(80, Math.min(1024, 6000 - getEmbedTextLength(embed) - fieldName.length - 20));
+  let summary = '';
+  let shown = 0;
+  for (const line of winnerLines) {
+    const remaining = winners.length - shown - 1;
+    const suffix = remaining > 0 ? `\n*...and ${remaining} more announced below.*` : '';
+    const next = summary ? `${summary}\n${line}` : line;
+    if (`${next}${suffix}`.length > available) break;
+    summary = next;
+    shown++;
   }
-
-  // List prizes separately so winners can choose
-  if (prizes.length > 1) {
-    const prizeLines = prizes.map((p, i) => `${i + 1}. ${p}`).join('\n');
-    embed.addFields({
-      name: '\uD83C\uDF81 PRIZES',
-      value: prizeLines,
-      inline: false
-    });
+  if (shown < winners.length) {
+    const suffix = `*...and ${winners.length - shown} more announced below.*`;
+    summary = summary ? `${summary}\n${suffix}` : suffix;
   }
+  embed.addFields({ name: fieldName, value: summary, inline: false });
 
-  return embed;
+  return [embed];
+}
+
+function buildWinnerAnnouncementEmbeds(winners, winnerStartNumber = 1) {
+  if (!Array.isArray(winners)) winners = [winners];
+  const lines = winners.map((winner, index) => {
+    const ordinal = getOrdinal(winnerStartNumber + index);
+    return `**${ordinal} Winner:** \uD83C\uDFB0 **# ${winner.slot_number}** \u2014 **${winner.username}**`;
+  });
+
+  return chunkLines(lines, 3800).map((description, index) => {
+    const embed = new EmbedBuilder().setColor(0xFFD700).setDescription(description);
+    if (index === 0) {
+      embed.setTitle(winners.length === 1
+        ? '\uD83C\uDF89\uD83C\uDF89\uD83C\uDF89  THE WINNING NUMBER  \uD83C\uDF89\uD83C\uDF89\uD83C\uDF89'
+        : '\uD83C\uDF89\uD83C\uDF89\uD83C\uDF89  THE WINNING NUMBERS  \uD83C\uDF89\uD83C\uDF89\uD83C\uDF89');
+    }
+    return embed;
+  });
+}
+
+function buildMentionChunks(userIds, maxLength = 1900) {
+  const chunks = [];
+  let ids = [];
+  let content = '';
+  for (const userId of new Set(userIds)) {
+    const mention = `<@${userId}>`;
+    const next = content ? `${content} ${mention}` : mention;
+    if (next.length > maxLength && ids.length > 0) {
+      chunks.push({ ids, content });
+      ids = [userId];
+      content = mention;
+    } else {
+      ids.push(userId);
+      content = next;
+    }
+  }
+  if (ids.length > 0) chunks.push({ ids, content });
+  return chunks;
 }
 
 // ── Settings Embed ───────────────────────────────────────────────────────────
@@ -685,7 +741,10 @@ module.exports = {
   buildBoardEmbed,
   buildComponents,
   buildExtensionComponents,
-  buildWinnerEmbed,
+  getExtensionIndexesForSlots,
+  buildWinnerEmbeds,
+  buildWinnerAnnouncementEmbeds,
+  buildMentionChunks,
   buildSettingsEmbed,
   buildPaymentPanel,
   buildPaymentHeader,

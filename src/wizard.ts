@@ -195,6 +195,51 @@ export async function startWizard(ctx: Context): Promise<void> {
   }
 }
 
+export async function startRaffleWizardForGroup(
+  ctx: Context,
+  groupChatId: number,
+  groupTitle?: string
+): Promise<boolean> {
+  if (!ctx.from || ctx.chat?.type !== "private") return false;
+
+  try {
+    const member = await ctx.api.getChatMember(groupChatId, ctx.from.id);
+    if (member.status !== "administrator" && member.status !== "creator") {
+      await ctx.reply("You must be an admin in that group to create raffles.");
+      return false;
+    }
+  } catch {
+    await ctx.reply("I couldn't verify your admin status in that group.");
+    return false;
+  }
+
+  let resolvedTitle = groupTitle || "the group";
+  if (!groupTitle) {
+    try {
+      const chat = await ctx.api.getChat(groupChatId);
+      if ("title" in chat && chat.title) resolvedTitle = chat.title;
+    } catch {}
+  }
+
+  wizards.set(ctx.from.id, applyGroupDefaults({
+    step: "title",
+    targetChatId: groupChatId,
+    targetThreadId: null,
+    targetChatTitle: resolvedTitle,
+    dmChatId: ctx.chat.id,
+    userId: ctx.from.id,
+    createdAt: Date.now(),
+  }));
+
+  await ctx.reply(
+    `📝 <b>Create a Raffle</b> for <b>${escapeHtml(resolvedTitle)}</b>\n\n` +
+      `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
+      `<i>Just type it and send. Or /cancel to stop.</i>`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
 export async function handleStartDeepLink(
   ctx: Context,
   payload: string
@@ -364,44 +409,7 @@ export async function handleStartDeepLink(
   if (!match) return false;
 
   const groupChatId = parseInt(match[1], 10);
-  const userId = ctx.from!.id;
-
-  try {
-    const member = await ctx.api.getChatMember(groupChatId, userId);
-    if (member.status !== "administrator" && member.status !== "creator") {
-      await ctx.reply("You must be an admin in that group to create raffles.");
-      return true;
-    }
-  } catch {
-    await ctx.reply("I couldn't verify your admin status in that group.");
-    return true;
-  }
-
-  let groupTitle = "the group";
-  try {
-    const chat = await ctx.api.getChat(groupChatId);
-    if ("title" in chat) {
-      groupTitle = chat.title || groupTitle;
-    }
-  } catch {}
-
-  wizards.set(userId, applyGroupDefaults({
-    step: "title",
-    targetChatId: groupChatId,
-    targetThreadId: null,
-    targetChatTitle: groupTitle,
-    dmChatId: ctx.chat!.id,
-    userId,
-    createdAt: Date.now(),
-  }));
-
-  await ctx.reply(
-    `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-      `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
-      `<i>Just type it and send. Or /cancel to stop.</i>`,
-    { parse_mode: "HTML" }
-  );
-
+  await startRaffleWizardForGroup(ctx, groupChatId);
   return true;
 }
 
@@ -2048,15 +2056,16 @@ export async function startEditWizard(
 
     state.dmChatId = msg.chat.id;
 
-    // Notify in group
-    const notice = await ctx.reply(
-      `✏️ Check your DMs @${ctx.from!.username || ctx.from!.first_name} — editing raffle there.`
-    );
-    setTimeout(async () => {
-      try {
-        await ctx.api.deleteMessage(chatId, notice.message_id);
-      } catch {}
-    }, 5000);
+    if (ctx.chat?.type !== "private") {
+      const notice = await ctx.reply(
+        `✏️ Check your DMs @${ctx.from!.username || ctx.from!.first_name} — editing raffle there.`
+      );
+      setTimeout(async () => {
+        try {
+          await ctx.api.deleteMessage(chatId, notice.message_id);
+        } catch {}
+      }, 5000);
+    }
   } catch {
     const botInfo = await ctx.api.getMe();
     const keyboard = new InlineKeyboard().url(
@@ -2210,6 +2219,16 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     const raffle = db.getRaffleById(raffleId);
     if (!raffle || raffle.status !== "open") {
       await ctx.answerCallbackQuery({ text: "This raffle is no longer editable.", show_alert: true });
+      return;
+    }
+    try {
+      const member = await ctx.api.getChatMember(raffle.chat_id, ctx.from.id);
+      if (member.status !== "administrator" && member.status !== "creator") {
+        await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
+        return;
+      }
+    } catch {
+      await ctx.answerCallbackQuery({ text: "I could not verify your admin access.", show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();

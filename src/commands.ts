@@ -17,7 +17,13 @@ import {
   buildRaffleKeyboard,
   buildMessageLink,
 } from "./helpers";
-import { startWizard, handleStartDeepLink, startEditWizard } from "./wizard";
+import {
+  startWizard,
+  startRaffleWizardForGroup,
+  startTemplateWizard,
+  handleStartDeepLink,
+  startEditWizard,
+} from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 
@@ -136,30 +142,34 @@ export async function handleStart(ctx: Context): Promise<void> {
   if (payload) {
     const handled = await handleStartDeepLink(ctx, payload);
     if (handled) return;
+    if (payload === "manage") {
+      await showAdminGroupPicker(ctx);
+      return;
+    }
   }
 
-  await ctx.reply(
+  const message =
     `🎟 <b>Raffle Bot</b>\n\n` +
       `I help you run raffles in Telegram group chats!\n\n` +
-      `<b>Commands:</b>\n` +
-      `/newraffle - Create a new raffle\n` +
-      `/raffles - List open raffles\n` +
-      `/draw - Draw winners\n` +
-      `/templates - Manage raffle templates\n` +
-      `/editraffle - Edit an active raffle\n` +
-      `/myentries - See your active entries\n` +
-      `/help - Show detailed help\n\n` +
-      `Add me to a group to get started!`,
-    { parse_mode: "HTML" }
-  );
+      `<b>Group admins:</b> Open the private Admin Center, select a group, and manage everything with buttons.\n\n` +
+      `<b>Participants:</b> Use the raffle buttons in your groups to enter or leave.`;
+  const options = {
+    parse_mode: "HTML" as const,
+    reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
+  };
+  if (ctx.chat?.type === "private") {
+    await ctx.reply(message, options);
+  } else if (ctx.from) {
+    try { await ctx.api.sendMessage(ctx.from.id, message, options); } catch {}
+  }
 }
 
 // /help
 export async function handleHelp(ctx: Context): Promise<void> {
   await replyPrivately(ctx,
     `🎟 <b>Raffle Bot Help</b>\n\n` +
-      `<b>Creating a Raffle:</b>\n` +
-      `/newraffle - Opens the interactive setup wizard in DMs\n\n` +
+      `<b>Group administration stays private.</b>\n` +
+      `Open the Admin Center, select a group where you are an admin, then use its buttons to create and manage raffles.\n\n` +
       `<b>Wizard options include:</b>\n` +
       `• 📝 Rules / description\n` +
       `• 👥 Max entries\n` +
@@ -173,30 +183,21 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `• 📅 Minimum account age\n` +
       `• 🛡 Winner cooldown\n` +
       `• 🔗 Referral bonus entries\n\n` +
-      `<b>Templates:</b>\n` +
-      `/templates - Create, use, delete & manage templates\n\n` +
-      `<b>Management:</b>\n` +
-      `/draw - Pick a raffle and draw winners (admin only)\n` +
-      `/editraffle - Pick and edit an active raffle (admin only)\n` +
-      `/cancelraffle - Pick and cancel a raffle (admin only)\n` +
-      `/exportentries - Pick/export participants (admin only — works in group or DM)\n` +
-      `/rerun - Pick a past raffle to re-run (admin only)\n` +
-      `/language - Set bot language (admin only)\n` +
-      `/defaults - Set group raffle defaults (admin only)\n` +
-      `/setupcheck - Check bot setup and permissions (admin only)\n` +
-      `/referrals - View group referral stats (admin only)\n` +
-      `/raffles - List open raffles in this chat\n` +
-      `/rafflehistory - View recent raffle history\n` +
-      `/myentries - See your active entries\n\n` +
+      `<b>Admin Center tools:</b>\n` +
+      `Create, templates, draw, edit, cancel, re-run, export, history, stats, defaults, setup check, referrals, language, and timezone.\n\n` +
       `<b>Note:</b> Only group admins can create raffles and draw winners.\n` +
       `<b>Supported languages:</b> English, Espanol, Portugues, Русский, Francais, Deutsch`,
-    { parse_mode: "HTML" });
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
+    });
 }
 
 // /newraffle - Create a raffle
 export async function handleNewRaffle(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Raffles can only be created in group chats.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "create");
     return;
   }
 
@@ -212,16 +213,24 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
 
 // /raffles - List open raffles
 export async function handleListRaffles(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "raffles");
     return;
   }
 
-  const raffles = db.getOpenRafflesForChat(ctx.chat.id);
+  await showOpenRafflesForChat(ctx, ctx.chat.id);
+}
+
+async function showOpenRafflesForChat(ctx: Context, chatId: number): Promise<void> {
+  const raffles = db.getOpenRafflesForChat(chatId);
+  const send = (text: string, options?: Parameters<typeof ctx.reply>[1]) =>
+    ctx.chat?.type === "private"
+      ? ctx.reply(text, options)
+      : replyPrivately(ctx, text, options);
 
   if (raffles.length === 0) {
-    await replyPrivately(ctx,
-      "No open raffles in this chat. Use /newraffle to create one!");
+    await send("No open raffles in this group.");
     return;
   }
 
@@ -243,7 +252,7 @@ export async function handleListRaffles(ctx: Context): Promise<void> {
     msg += `\n`;
   }
 
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await send(msg, { parse_mode: "HTML" });
 }
 
 async function executeDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof db.getRaffleById>>): Promise<string> {
@@ -283,9 +292,197 @@ async function executeDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof d
 async function isAdminOfChat(ctx: Context, chatId: number, userId: number): Promise<boolean> {
   try {
     const member = await ctx.api.getChatMember(chatId, userId);
-    return member.status === "administrator" || member.status === "creator";
+    const isAdmin = member.status === "administrator" || member.status === "creator";
+    if (isAdmin) db.rememberUserAdminGroup(userId, chatId);
+    else db.forgetUserAdminGroup(userId, chatId);
+    return isAdmin;
   } catch {
     return false;
+  }
+}
+
+type AdminAction =
+  | "menu"
+  | "create"
+  | "raffles"
+  | "templates"
+  | "draw"
+  | "edit"
+  | "cancel"
+  | "rerun"
+  | "export"
+  | "history"
+  | "stats"
+  | "defaults"
+  | "setup"
+  | "referrals"
+  | "language"
+  | "timezone";
+
+const ADMIN_SCAN_BATCH_SIZE = 8;
+
+function buildAdminDashboardKeyboard(chatId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("➕ Create Raffle", `admin_do_create_${chatId}`).row()
+    .text("🎟 Open Raffles", `admin_do_raffles_${chatId}`).row()
+    .text("📋 Templates", `admin_do_templates_${chatId}`).text("🏆 Draw", `admin_do_draw_${chatId}`).row()
+    .text("✏️ Edit", `admin_do_edit_${chatId}`).text("🚫 Cancel", `admin_do_cancel_${chatId}`).row()
+    .text("🔄 Re-run", `admin_do_rerun_${chatId}`).text("📤 Export", `admin_do_export_${chatId}`).row()
+    .text("🕘 History", `admin_do_history_${chatId}`).text("📊 Stats", `admin_do_stats_${chatId}`).row()
+    .text("⚙️ Defaults", `admin_do_defaults_${chatId}`).text("🧪 Setup Check", `admin_do_setup_${chatId}`).row()
+    .text("🔗 Referrals", `admin_do_referrals_${chatId}`).row()
+    .text("🌐 Language", `admin_do_language_${chatId}`).text("🕐 Timezone", `admin_do_timezone_${chatId}`).row()
+    .text("↔️ Change Group", "admin_groups").text("❌ Close", "admin_close");
+}
+
+async function discoverAdminGroups(ctx: Context, userId: number): Promise<ReturnType<typeof db.getUserAdminGroups>> {
+  db.clearUserAdminGroups(userId);
+  const groups = db.getActiveBotGroups();
+
+  for (let i = 0; i < groups.length; i += ADMIN_SCAN_BATCH_SIZE) {
+    const batch = groups.slice(i, i + ADMIN_SCAN_BATCH_SIZE);
+    await Promise.all(
+      batch.map(async (group) => {
+        try {
+          const member = await ctx.api.getChatMember(group.chat_id, userId);
+          if (member.status === "administrator" || member.status === "creator") {
+            db.rememberUserAdminGroup(userId, group.chat_id);
+          }
+        } catch {
+          // Telegram only guarantees this lookup when the bot can inspect members.
+        }
+      })
+    );
+    if (i + ADMIN_SCAN_BATCH_SIZE < groups.length) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  return db.getUserAdminGroups(userId);
+}
+
+async function showAdminGroupPicker(
+  ctx: Context,
+  forceRefresh = false,
+  action: AdminAction = "menu"
+): Promise<void> {
+  if (!ctx.from || ctx.chat?.type !== "private") {
+    const botInfo = await ctx.api.getMe();
+    await ctx.reply("Open my private chat to manage your groups.", {
+      reply_markup: new InlineKeyboard().url("Open Admin Center", `https://t.me/${botInfo.username}?start=manage`),
+    });
+    return;
+  }
+
+  let statusMessage: Awaited<ReturnType<typeof ctx.reply>> | undefined;
+  let groups = forceRefresh ? [] : db.getUserAdminGroups(ctx.from.id);
+  if (groups.length === 0) {
+    statusMessage = await ctx.reply("Checking the groups where you are an admin...");
+    groups = await discoverAdminGroups(ctx, ctx.from.id);
+  }
+
+  const keyboard = new InlineKeyboard();
+  for (const group of groups.slice(0, 40)) {
+    keyboard.text(
+      group.title || `Group ${group.chat_id}`,
+      `admin_group_${action}_${group.chat_id}`
+    ).row();
+  }
+  keyboard.text("🔄 Refresh My Groups", `admin_refresh_${action}`).row();
+  keyboard.text("❌ Close", "admin_close");
+
+  const text = groups.length > 0
+    ? `<b>Select a group to manage</b>\n\nI found ${groups.length} group${groups.length === 1 ? "" : "s"} where you are an admin.`
+    : `<b>No admin groups found</b>\n\nMake sure this bot is in the group and can inspect members, then tap Refresh My Groups.`;
+  const options = { parse_mode: "HTML" as const, reply_markup: keyboard };
+
+  if (statusMessage) {
+    await ctx.api.editMessageText(ctx.chat.id, statusMessage.message_id, text, options);
+  } else {
+    await ctx.reply(text, options);
+  }
+}
+
+async function showAdminDashboard(ctx: Context, chatId: number): Promise<void> {
+  if (!ctx.from || !(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await ctx.reply("I could not verify that you are still an admin of that group.");
+    return;
+  }
+  const group = db.getBotGroup(chatId);
+  let title = group?.title || "Selected Group";
+  try {
+    const chat = await ctx.api.getChat(chatId);
+    if ("title" in chat && chat.title) title = chat.title;
+  } catch {}
+
+  await ctx.reply(
+    `<b>${escapeHtml(title)} Admin Center</b>\n\nChoose what you want to manage. Everything stays in this private chat; only raffle posts and required results are sent to the group.`,
+    { parse_mode: "HTML", reply_markup: buildAdminDashboardKeyboard(chatId) }
+  );
+}
+
+async function runAdminAction(ctx: Context, action: AdminAction, chatId: number): Promise<void> {
+  if (!ctx.from || !(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await ctx.reply("I could not verify that you are still an admin of that group.");
+    return;
+  }
+  const group = db.getBotGroup(chatId);
+  const title = group?.title || "the group";
+
+  switch (action) {
+    case "menu": return showAdminDashboard(ctx, chatId);
+    case "create": await startRaffleWizardForGroup(ctx, chatId, title); return;
+    case "raffles": await showOpenRafflesForChat(ctx, chatId); return;
+    case "templates": await buildTemplateHub(ctx, chatId); return;
+    case "draw": await showDrawForChat(ctx, chatId); return;
+    case "edit": await showEditForChat(ctx, chatId); return;
+    case "cancel": await showCancelForChat(ctx, chatId); return;
+    case "rerun": await showRerunForChat(ctx, chatId); return;
+    case "export": await showExportForChat(ctx, chatId); return;
+    case "history": await showRaffleHistoryForChat(ctx, chatId); return;
+    case "stats": await showGroupStatsForChat(ctx, chatId); return;
+    case "defaults": await showDefaultsForChat(ctx, chatId); return;
+    case "setup": await showSetupCheckForChat(ctx, chatId); return;
+    case "referrals": await showReferralsForChat(ctx, chatId); return;
+    case "language": await showLanguageForChat(ctx, chatId); return;
+    case "timezone": await showTimezoneForChat(ctx, chatId); return;
+  }
+}
+
+export async function handleManage(ctx: Context): Promise<void> {
+  await showAdminGroupPicker(ctx);
+}
+
+export async function handleAdminCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+  await ctx.answerCallbackQuery();
+
+  if (data === "admin_close") {
+    try { await ctx.deleteMessage(); } catch {}
+    return;
+  }
+  if (data === "admin_groups") {
+    await showAdminGroupPicker(ctx);
+    return;
+  }
+  const refreshMatch = data.match(/^admin_refresh_([a-z]+)$/);
+  if (refreshMatch) {
+    await showAdminGroupPicker(ctx, true, refreshMatch[1] as AdminAction);
+    return;
+  }
+  const groupMatch = data.match(/^admin_group_([a-z]+)_(-?\d+)$/);
+  if (groupMatch) {
+    await runAdminAction(
+      ctx,
+      groupMatch[1] as AdminAction,
+      parseInt(groupMatch[2], 10)
+    );
+    return;
+  }
+  const actionMatch = data.match(/^admin_do_([a-z]+)_(-?\d+)$/);
+  if (actionMatch) {
+    await runAdminAction(ctx, actionMatch[1] as AdminAction, parseInt(actionMatch[2], 10));
   }
 }
 
@@ -298,10 +495,38 @@ function buildDrawKeyboard(chatId: number, raffles: Array<NonNullable<ReturnType
   return keyboard;
 }
 
+async function showDrawForChat(ctx: Context, chatId: number): Promise<void> {
+  const openRaffles = db.getOpenRafflesForChat(chatId);
+  if (openRaffles.length === 0) {
+    await ctx.reply("No open raffles to draw from.");
+    return;
+  }
+  if (openRaffles.length === 1) {
+    const raffle = openRaffles[0];
+    const keyboard = new InlineKeyboard()
+      .text("✅ Draw Winners", `draw_confirm_${chatId}_${raffle.id}`)
+      .row()
+      .text("❌ Cancel", "draw_cancel");
+    await ctx.reply(
+      `🏆 <b>Draw winners?</b>\n\n` +
+        `Raffle: <b>${escapeHtml(raffle.title)}</b>\n` +
+        `Entries: <b>${db.getEntryCount(raffle.id)}</b>\n` +
+        `Winners: <b>${raffle.max_winners}</b>`,
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+    return;
+  }
+  await ctx.reply("🏆 <b>Pick a raffle to draw:</b>", {
+    parse_mode: "HTML",
+    reply_markup: buildDrawKeyboard(chatId, openRaffles),
+  });
+}
+
 // /draw - Draw winners through a guided pick/confirm flow
 export async function handleDraw(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "draw");
     return;
   }
 
@@ -312,33 +537,7 @@ export async function handleDraw(ctx: Context): Promise<void> {
     return;
   }
 
-  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
-  if (openRaffles.length === 0) {
-    await replyPrivately(ctx, "No open raffles to draw from.");
-    return;
-  }
-
-  if (openRaffles.length === 1) {
-    const raffle = openRaffles[0];
-    const keyboard = new InlineKeyboard()
-      .text("✅ Draw Winners", `draw_confirm_${ctx.chat.id}_${raffle.id}`)
-      .row()
-      .text("❌ Cancel", "draw_cancel");
-    await replyPrivately(
-      ctx,
-      `🏆 <b>Draw winners?</b>\n\n` +
-        `Raffle: <b>${escapeHtml(raffle.title)}</b>\n` +
-        `Entries: <b>${db.getEntryCount(raffle.id)}</b>\n` +
-        `Winners: <b>${raffle.max_winners}</b>`,
-      { parse_mode: "HTML", reply_markup: keyboard }
-    );
-    return;
-  }
-
-  await replyPrivately(ctx, `🏆 <b>Pick a raffle to draw:</b>`, {
-    parse_mode: "HTML",
-    reply_markup: buildDrawKeyboard(ctx.chat.id, openRaffles),
-  });
+  await showDrawForChat(ctx, ctx.chat.id);
 }
 
 export async function handleDrawCallback(ctx: Context): Promise<void> {
@@ -418,8 +617,9 @@ export async function handleDrawCallback(ctx: Context): Promise<void> {
 
 // /cancelraffle - Cancel a raffle (sends interactive buttons to DM)
 export async function handleCancelRaffle(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "cancel");
     return;
   }
 
@@ -430,9 +630,13 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
     return;
   }
 
-  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  await showCancelForChat(ctx, ctx.chat.id);
+}
+
+async function showCancelForChat(ctx: Context, chatId: number): Promise<void> {
+  const openRaffles = db.getOpenRafflesForChat(chatId);
   if (openRaffles.length === 0) {
-    await replyPrivately(ctx, "No open raffles to cancel.");
+    await ctx.reply("No open raffles to cancel.");
     return;
   }
 
@@ -442,9 +646,7 @@ export async function handleCancelRaffle(ctx: Context): Promise<void> {
   }
   keyboard.text("❌ Nevermind", `cancel_no`);
 
-  await replyPrivately(ctx,
-    `Which raffle do you want to cancel?`,
-    { reply_markup: keyboard });
+  await ctx.reply("Which raffle do you want to cancel?", { reply_markup: keyboard });
 }
 
 // Callback handler for cancel buttons (runs in DM)
@@ -468,6 +670,10 @@ export async function handleCancelCallback(ctx: Context): Promise<void> {
       await ctx.editMessageText("This raffle is no longer open.");
       return;
     }
+    if (!ctx.from || !(await isAdminOfChat(ctx, raffle.chat_id, ctx.from.id))) {
+      await ctx.editMessageText("You are no longer an admin of that group.");
+      return;
+    }
     const keyboard = new InlineKeyboard()
       .text("✅ Yes, cancel it", `cancel_yes_${raffleId}`)
       .text("❌ No, keep it", `cancel_no`);
@@ -484,6 +690,10 @@ export async function handleCancelCallback(ctx: Context): Promise<void> {
     const raffle = db.getRaffleById(raffleId);
     if (!raffle) {
       await ctx.editMessageText("Raffle not found.");
+      return;
+    }
+    if (!ctx.from || !(await isAdminOfChat(ctx, raffle.chat_id, ctx.from.id))) {
+      await ctx.editMessageText("You are no longer an admin of that group.");
       return;
     }
     if (raffle.status === "drawn") {
@@ -601,18 +811,22 @@ export async function handleRepostCallback(ctx: Context): Promise<void> {
 
 // /myentries - Show user's active entries
 export async function handleMyEntries(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
-    return;
-  }
+  if (!ctx.chat || !ctx.from) return;
 
-  const userId = ctx.from!.id;
-  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  const userId = ctx.from.id;
+  const inDm = ctx.chat.type === "private";
+  const openRaffles = inDm
+    ? db.getOpenRafflesEnteredByUser(userId)
+    : db.getOpenRafflesForChat(ctx.chat.id);
 
   const entered = openRaffles.filter((r) => db.hasUserEntered(r.id, userId));
 
   if (entered.length === 0) {
-    await replyPrivately(ctx, "You haven't entered any active raffles in this chat.");
+    const message = inDm
+      ? "You don't have any active raffle entries."
+      : "You haven't entered any active raffles in this group.";
+    if (inDm) await ctx.reply(message);
+    else await replyPrivately(ctx, message);
     return;
   }
 
@@ -625,26 +839,36 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
     } else {
       msg += `  🎁 ${escapeHtml(prizes[0])}\n`;
     }
+    if (inDm) {
+      const group = db.getBotGroup(r.chat_id);
+      msg += `  📍 ${escapeHtml(group?.title || "Unknown group")}\n`;
+    }
     if (r.referral_enabled) {
       const bonus = db.getBonusEntries(r.id, userId);
       msg += `  🔗 ${1 + bonus} total entries (${bonus} referral bonus)\n`;
     }
   }
 
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  if (inDm) await ctx.reply(msg, { parse_mode: "HTML" });
+  else await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
 // /rafflehistory - Show recent raffles
 export async function handleRaffleHistory(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "history");
     return;
   }
 
-  const raffles = db.getRecentRafflesForChat(ctx.chat.id, 10);
+  await showRaffleHistoryForChat(ctx, ctx.chat.id);
+}
+
+async function showRaffleHistoryForChat(ctx: Context, chatId: number): Promise<void> {
+  const raffles = db.getRecentRafflesForChat(chatId, 10);
 
   if (raffles.length === 0) {
-    await replyPrivately(ctx, "No raffle history in this chat.");
+    await ctx.reply("No raffle history in this group.");
     return;
   }
 
@@ -681,7 +905,7 @@ export async function handleRaffleHistory(ctx: Context): Promise<void> {
     msg += `\n`;
   }
 
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await ctx.reply(msg, { parse_mode: "HTML" });
 }
 
 // /exportentries - Export all participants for a raffle.
@@ -715,7 +939,7 @@ async function sendEntriesExport(
   msg += `\n<b>User IDs (for re-run):</b>\n<code>`;
   msg += entries.map((e) => e.user_id).join(", ");
   msg += `</code>`;
-  msg += `\n\n💡 To create a raffle with these same participants, use the /rerun picker in the group.`;
+  msg += `\n\n💡 To reuse these participants, open Re-run from the private Admin Center.`;
 
   if (msg.length > 4000) {
     const csvLines = ["#,Display Name,Username,User ID,Entered At"];
@@ -729,7 +953,7 @@ async function sendEntriesExport(
       recipientId,
       new InputFile(buffer, `raffle_${raffle.id}_participants.csv`),
       {
-        caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nTo create a raffle with these same participants, use the /rerun picker in the group.`,
+        caption: `📋 Participants for "${raffle.title}" (${entries.length} entries)\n\nTo reuse these participants, open Re-run from the private Admin Center.`,
       }
     );
     return;
@@ -747,6 +971,26 @@ async function canExportRaffle(
   if (sourceChatId !== undefined && sourceChatId !== raffle.chat_id) return false;
   if (raffle.creator_id === userId) return true;
   return isAdminOfChat(ctx, raffle.chat_id, userId);
+}
+
+async function showExportForChat(ctx: Context, chatId: number): Promise<void> {
+  const raffles = db.getRecentRafflesForChat(chatId, 20);
+  if (raffles.length === 0) {
+    await ctx.reply("No raffles found in this group.");
+    return;
+  }
+  let msg = `📋 <b>Pick a raffle to export:</b>\n\n`;
+  const keyboard = new InlineKeyboard();
+  for (const raffle of raffles) {
+    const count = db.getEntryCount(raffle.id);
+    msg += `• ${escapeHtml(raffle.title)} (${count} entries, ${raffle.status})\n`;
+    keyboard.text(
+      `${raffle.title.slice(0, 28)} (${count})`,
+      `export_pick_${chatId}_${raffle.id}`
+    ).row();
+  }
+  keyboard.text("❌ Close", "export_close");
+  await ctx.reply(msg, { parse_mode: "HTML", reply_markup: keyboard });
 }
 
 export async function handleExportEntries(ctx: Context): Promise<void> {
@@ -770,7 +1014,7 @@ export async function handleExportEntries(ctx: Context): Promise<void> {
         await ctx.reply(
           "You haven't created any raffles yet.\n\n" +
             "If you want to export a raffle from a group where you're an admin but didn't create it, " +
-            "open the export picker from that group.",
+            "open that group's Export tool from the private Admin Center.",
           { parse_mode: "HTML" }
         );
         return;
@@ -908,8 +1152,9 @@ export async function handleExportCallback(ctx: Context): Promise<void> {
 
 // /rerun - Re-run a raffle with same participants from a previous one
 export async function handleRerun(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "rerun");
     return;
   }
 
@@ -920,8 +1165,12 @@ export async function handleRerun(ctx: Context): Promise<void> {
     return;
   }
 
+  await showRerunForChat(ctx, ctx.chat.id);
+}
+
+async function showRerunForChat(ctx: Context, chatId: number, edit = false): Promise<void> {
   const drawnRaffles = db
-    .getRecentRafflesForChat(ctx.chat.id, 20)
+    .getRecentRafflesForChat(chatId, 20)
     .filter((r) => r.status === "drawn" || r.status === "closed");
 
   if (drawnRaffles.length === 0) {
@@ -940,11 +1189,10 @@ export async function handleRerun(ctx: Context): Promise<void> {
   }
   keyboard.text("❌ Cancel", "rerun_cancel");
 
-  await ctx.reply(
-    `🔄 <b>Re-run a Raffle</b>\n\n` +
-      `Pick a completed raffle to re-run with the same participants:`,
-    { parse_mode: "HTML", reply_markup: keyboard }
-  );
+  const text = `🔄 <b>Re-run a Raffle</b>\n\nPick a completed raffle to re-run with the same participants:`;
+  const options = { parse_mode: "HTML" as const, reply_markup: keyboard };
+  if (edit) await ctx.editMessageText(text, options);
+  else await ctx.reply(text, options);
 }
 
 export async function handleRerunCallback(ctx: Context): Promise<void> {
@@ -966,6 +1214,10 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     const sourceRaffle = db.getRaffleById(sourceId);
     if (!sourceRaffle) {
       await ctx.answerCallbackQuery({ text: "Raffle not found.", show_alert: true });
+      return;
+    }
+    if (!(await isAdminOfChat(ctx, sourceRaffle.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
       return;
     }
 
@@ -990,7 +1242,7 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     const keyboard = new InlineKeyboard()
       .text("✅ Re-run This Raffle", `rerun_confirm_${sourceId}`)
       .row()
-      .text("⬅️ Back", "rerun_back");
+      .text("⬅️ Back", `rerun_back_${sourceRaffle.chat_id}`);
 
     await ctx.editMessageText(
       `🔄 <b>Re-run: ${escapeHtml(sourceRaffle.title)}</b>\n\n` +
@@ -1006,31 +1258,15 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
   }
 
   // Back to raffle list
-  if (data === "rerun_back") {
-    const chatId = ctx.callbackQuery?.message?.chat?.id;
-    if (!chatId) return;
-
-    const drawnRaffles = db
-      .getRecentRafflesForChat(chatId, 20)
-      .filter((r) => r.status === "drawn" || r.status === "closed");
-
-    const keyboard = new InlineKeyboard();
-    for (const r of drawnRaffles.slice(0, 10)) {
-      const count = db.getEntryCount(r.id);
-      keyboard.text(
-        `${escapeHtml(r.title)} (${count} entries)`,
-        `rerun_pick_${r.id}`
-      );
-      keyboard.row();
+  const backMatch = data.match(/^rerun_back_(-?\d+)$/);
+  if (backMatch) {
+    const chatId = parseInt(backMatch[1], 10);
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
+      return;
     }
-    keyboard.text("❌ Cancel", "rerun_cancel");
-
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(
-      `🔄 <b>Re-run a Raffle</b>\n\n` +
-        `Pick a completed raffle to re-run with the same participants:`,
-      { parse_mode: "HTML", reply_markup: keyboard }
-    );
+    await showRerunForChat(ctx, chatId, true);
     return;
   }
 
@@ -1039,12 +1275,14 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     const sourceId = parseInt(data.replace("rerun_confirm_", ""), 10);
     if (isNaN(sourceId)) return;
 
-    const chatId = ctx.callbackQuery?.message?.chat?.id;
-    if (!chatId) return;
-
     const sourceRaffle = db.getRaffleById(sourceId);
-    if (!sourceRaffle || sourceRaffle.chat_id !== chatId) {
+    if (!sourceRaffle) {
       await ctx.answerCallbackQuery({ text: "Raffle not found.", show_alert: true });
+      return;
+    }
+    const chatId = sourceRaffle.chat_id;
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
       return;
     }
 
@@ -1214,10 +1452,6 @@ async function buildTemplateHub(
 ): Promise<void> {
   const templates = db.getTemplatesForChat(chatId);
 
-  // Get bot username for deep-link URL
-  const botInfo = await ctx.api.getMe();
-  const botUsername = botInfo.username || "bot";
-
   const keyboard = new InlineKeyboard();
   for (const tmpl of templates.slice(0, 10)) {
     let label = tmpl.name;
@@ -1225,8 +1459,7 @@ async function buildTemplateHub(
     keyboard.text(label, `tmpl_pick_${tmpl.id}`);
     keyboard.row();
   }
-  // Deep-link URL button — opens DM and starts template wizard immediately
-  keyboard.url("➕ Create New", `https://t.me/${botUsername}?start=tmpl_${chatId}`);
+  keyboard.text("➕ Create New", `tmpl_create_${chatId}`);
   keyboard.row();
   keyboard.text("❌ Close", "tmpl_cancel");
 
@@ -1253,9 +1486,6 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
   if (!data || !ctx.from) return;
 
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return;
-
   // --- Close hub ---
   if (data === "tmpl_cancel") {
     await ctx.answerCallbackQuery();
@@ -1266,13 +1496,25 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
   }
 
   // --- Back to template list ---
-  if (data === "tmpl_back") {
+  const backMatch = data.match(/^tmpl_back_(-?\d+)$/);
+  if (backMatch) {
     await ctx.answerCallbackQuery();
-    await buildTemplateHub(ctx, chatId, true);
+    await buildTemplateHub(ctx, parseInt(backMatch[1], 10), true);
     return;
   }
 
-  // tmpl_create is no longer a callback — it's now a URL deep-link button
+  const createMatch = data.match(/^tmpl_create_(-?\d+)$/);
+  if (createMatch) {
+    const chatId = parseInt(createMatch[1], 10);
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can create templates.", show_alert: true });
+      return;
+    }
+    const group = db.getBotGroup(chatId);
+    await ctx.answerCallbackQuery();
+    await startTemplateWizard(ctx.api, ctx.from.id, chatId, group?.title || "the group");
+    return;
+  }
 
   // --- Pick a template (action menu) ---
   if (data.startsWith("tmpl_pick_")) {
@@ -1282,6 +1524,10 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const tmpl = db.getTemplateById(templateId);
     if (!tmpl) {
       await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+    if (!(await isAdminOfChat(ctx, tmpl.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can manage templates.", show_alert: true });
       return;
     }
 
@@ -1301,7 +1547,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
     keyboard
       .text("🗑 Delete", `tmpl_delete_${tmpl.id}`)
-      .text("⬅️ Back", "tmpl_back");
+      .text("⬅️ Back", `tmpl_back_${tmpl.chat_id}`);
 
     await ctx.editMessageText(
       `📋 <b>Template: "${escapeHtml(tmpl.name)}"</b>\n\n` +
@@ -1316,15 +1562,14 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const templateId = parseInt(data.replace("tmpl_use_confirm_", ""), 10);
     if (isNaN(templateId)) return;
 
-    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
-    if (!isAdmin) {
-      await ctx.answerCallbackQuery({ text: "Only admins can create raffles.", show_alert: true });
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl) {
+      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
       return;
     }
-
-    const tmpl = db.getTemplateById(templateId);
-    if (!tmpl || tmpl.chat_id !== chatId) {
-      await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+    const chatId = tmpl.chat_id;
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only admins can create raffles.", show_alert: true });
       return;
     }
 
@@ -1414,6 +1659,10 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
       return;
     }
+    if (!(await isAdminOfChat(ctx, tmpl.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can use templates.", show_alert: true });
+      return;
+    }
 
     await ctx.answerCallbackQuery();
 
@@ -1435,15 +1684,13 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const templateId = parseInt(data.replace("tmpl_recur_", ""), 10);
     if (isNaN(templateId)) return;
 
-    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
-    if (!isAdmin) {
-      await ctx.answerCallbackQuery({ text: "Only admins can manage recurring.", show_alert: true });
-      return;
-    }
-
     const tmpl = db.getTemplateById(templateId);
     if (!tmpl || !tmpl.recurring_interval_minutes) {
       await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+    if (!(await isAdminOfChat(ctx, tmpl.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only admins can manage recurring.", show_alert: true });
       return;
     }
 
@@ -1475,7 +1722,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
     keyboard
       .text("🗑 Delete", `tmpl_delete_${updated.id}`)
-      .text("⬅️ Back", "tmpl_back");
+      .text("⬅️ Back", `tmpl_back_${updated.chat_id}`);
 
     await ctx.editMessageText(
       `📋 <b>Template: "${escapeHtml(updated.name)}"</b>\n\n` +
@@ -1490,13 +1737,11 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const templateId = parseInt(data.replace("tmpl_delete_yes_", ""), 10);
     if (isNaN(templateId)) return;
 
-    const isAdmin = await isGroupAdmin(ctx, ctx.from.id);
-    if (!isAdmin) {
+    const tmpl = db.getTemplateById(templateId);
+    if (!tmpl || !(await isAdminOfChat(ctx, tmpl.chat_id, ctx.from.id))) {
       await ctx.answerCallbackQuery({ text: "Only admins can delete templates.", show_alert: true });
       return;
     }
-
-    const tmpl = db.getTemplateById(templateId);
     const name = tmpl ? tmpl.name : "template";
 
     const deleted = db.deleteTemplateById(templateId);
@@ -1507,7 +1752,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     }
 
     // Return to hub
-    await buildTemplateHub(ctx, chatId, true);
+    await buildTemplateHub(ctx, tmpl.chat_id, true);
     return;
   }
 
@@ -1518,6 +1763,10 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
     const tmpl = db.getTemplateById(templateId);
     if (!tmpl) {
       await ctx.answerCallbackQuery({ text: "Template not found.", show_alert: true });
+      return;
+    }
+    if (!(await isAdminOfChat(ctx, tmpl.chat_id, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only admins can delete templates.", show_alert: true });
       return;
     }
 
@@ -1538,8 +1787,9 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
 // /savetemplate - Save a raffle configuration as a reusable template
 export async function handleSaveTemplate(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "templates");
     return;
   }
 
@@ -1563,8 +1813,9 @@ export async function handleSaveTemplate(ctx: Context): Promise<void> {
 
 // /templates - Template management hub with inline buttons
 export async function handleTemplates(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "templates");
     return;
   }
 
@@ -1580,8 +1831,9 @@ export async function handleTemplates(ctx: Context): Promise<void> {
 
 // /deletetemplate - Delete a saved template
 export async function handleDeleteTemplate(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "templates");
     return;
   }
 
@@ -1606,8 +1858,9 @@ export async function handleDeleteTemplate(ctx: Context): Promise<void> {
 
 // /usetemplate - Create a raffle from a saved template
 export async function handleUseTemplate(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "templates");
     return;
   }
 
@@ -1632,8 +1885,9 @@ export async function handleUseTemplate(ctx: Context): Promise<void> {
 
 // /recurring - Toggle recurring on/off for a template
 export async function handleRecurring(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "templates");
     return;
   }
 
@@ -1658,8 +1912,9 @@ export async function handleRecurring(ctx: Context): Promise<void> {
 
 // /editraffle - Edit an active raffle's settings
 export async function handleEditRaffle(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "edit");
     return;
   }
 
@@ -1670,48 +1925,37 @@ export async function handleEditRaffle(ctx: Context): Promise<void> {
     return;
   }
 
-  const openRaffles = db.getOpenRafflesForChat(ctx.chat.id);
+  await showEditForChat(ctx, ctx.chat.id);
+}
+
+async function showEditForChat(ctx: Context, chatId: number): Promise<void> {
+  const openRaffles = db.getOpenRafflesForChat(chatId);
   if (openRaffles.length === 0) {
-    await replyPrivately(ctx, "No open raffles to edit.");
+    await ctx.reply("No open raffles to edit.");
     return;
   }
 
   // If only one open raffle, edit it directly
   if (openRaffles.length === 1) {
-    await startEditWizard(ctx, openRaffles[0].id, ctx.chat.id);
+    await startEditWizard(ctx, openRaffles[0].id, chatId);
     return;
   }
 
-  // Multiple raffles — show selection in DM
-  try {
-    const kb = new InlineKeyboard();
-    for (const r of openRaffles) {
-      kb.text(`${escapeHtml(r.title)} (#${r.id})`, `edit_pick_${r.id}`).row();
-    }
-
-    await ctx.api.sendMessage(
-      userId,
-      `✏️ <b>Which raffle do you want to edit?</b>`,
-      { parse_mode: "HTML", reply_markup: kb }
-    );
-
-    const notice = await ctx.reply(
-      `✏️ Check your DMs @${ctx.from!.username || ctx.from!.first_name} — pick a raffle to edit.`
-    );
-    setTimeout(async () => {
-      try {
-        await ctx.api.deleteMessage(ctx.chat!.id, notice.message_id);
-      } catch {}
-    }, 5000);
-  } catch {
-    await replyPrivately(ctx, "Please start a DM with me first, then try /editraffle again.");
+  const keyboard = new InlineKeyboard();
+  for (const raffle of openRaffles) {
+    keyboard.text(`${raffle.title.slice(0, 34)} (#${raffle.id})`, `edit_pick_${raffle.id}`).row();
   }
+  await ctx.reply("✏️ <b>Which raffle do you want to edit?</b>", {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
 }
 
 // /language - Set the bot language for this chat
 export async function handleLanguage(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "language");
     return;
   }
 
@@ -1722,16 +1966,20 @@ export async function handleLanguage(ctx: Context): Promise<void> {
     return;
   }
 
-  const current = db.getChatLanguage(ctx.chat.id);
+  await showLanguageForChat(ctx, ctx.chat.id);
+}
+
+async function showLanguageForChat(ctx: Context, chatId: number): Promise<void> {
+  const current = db.getChatLanguage(chatId);
   const langs = getAvailableLanguages();
   const keyboard = new InlineKeyboard();
   for (const l of langs) {
     const marker = l.code === current ? " ✅" : "";
-    keyboard.text(`${l.name}${marker}`, `langset_${ctx.chat.id}_${l.code}`).row();
+    keyboard.text(`${l.name}${marker}`, `langset_${chatId}_${l.code}`).row();
   }
   keyboard.text("❌ Close", "langset_close");
 
-  await replyPrivately(ctx, `🌐 <b>${t(current, "misc.lang_current", { lang: getLanguageName(current) })}</b>\n\nPick a language:`, {
+  await ctx.reply(`🌐 <b>${t(current, "misc.lang_current", { lang: getLanguageName(current) })}</b>\n\nPick a language:`, {
     parse_mode: "HTML",
     reply_markup: keyboard,
   });
@@ -1802,8 +2050,9 @@ function buildGroupTimezoneKeyboard(chatId: number, current: string): InlineKeyb
 
 // /timezone - View or set the chat's timezone (admin only in groups)
 export async function handleTimezone(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "timezone");
     return;
   }
 
@@ -1814,16 +2063,20 @@ export async function handleTimezone(ctx: Context): Promise<void> {
     return;
   }
 
+  await showTimezoneForChat(ctx, ctx.chat.id);
+}
+
+async function showTimezoneForChat(ctx: Context, chatId: number): Promise<void> {
   const { formatInTimezone } = await import("./timezone");
-  const current = db.getChatTimezone(ctx.chat.id);
+  const current = db.getChatTimezone(chatId);
   const nowInTz = formatInTimezone(new Date(), current);
-  await replyPrivately(ctx,
+  await ctx.reply(
     `🕐 <b>Group timezone:</b> <code>${escapeHtml(current)}</code>\n` +
       `Current time: <b>${escapeHtml(nowInTz)}</b>\n\n` +
       `Pick the timezone this group's raffle wizards should use:`,
     {
       parse_mode: "HTML",
-      reply_markup: buildGroupTimezoneKeyboard(ctx.chat.id, current),
+      reply_markup: buildGroupTimezoneKeyboard(chatId, current),
     }
   );
 }
@@ -2795,8 +3048,9 @@ export async function handleReferralStats(ctx: Context): Promise<void> {
 
 // /groupstats — Show raffle stats for this group (admin only)
 export async function handleGroupStats(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "stats");
     return;
   }
 
@@ -2806,7 +3060,11 @@ export async function handleGroupStats(ctx: Context): Promise<void> {
     return; // silently ignore for non-admins
   }
 
-  const stats = db.getGroupStats(ctx.chat.id);
+  await showGroupStatsForChat(ctx, ctx.chat.id);
+}
+
+async function showGroupStatsForChat(ctx: Context, chatId: number): Promise<void> {
+  const stats = db.getGroupStats(chatId);
 
   let msg = `📊 <b>Group Raffle Stats</b>\n\n`;
 
@@ -2839,7 +3097,7 @@ export async function handleGroupStats(ctx: Context): Promise<void> {
     });
   }
 
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await ctx.reply(msg, { parse_mode: "HTML" });
 }
 
 function formatGroupDefaults(chatId: number): string {
@@ -2861,20 +3119,29 @@ function formatGroupDefaults(chatId: number): string {
   return msg;
 }
 
-function buildDefaultsKeyboard(): InlineKeyboard {
+function buildDefaultsKeyboard(chatId: number): InlineKeyboard {
+  const callback = (action: string) => `def_${chatId}_${action}`;
   return new InlineKeyboard()
-    .text("🏆 Winners", "def_pick_winners").text("⏰ Duration", "def_pick_duration").row()
-    .text("👥 Max Entries", "def_pick_max").row()
-    .text("👁 Toggle Hidden", "def_toggle_anon").text("📌 Toggle Pin", "def_toggle_pin").row()
-    .text("📛 Toggle Username", "def_toggle_user").text("🎡 Toggle Animation", "def_toggle_anim").row()
-    .text("📅 Min Age", "def_pick_age").text("🛡 Cooldown", "def_pick_cooldown").row()
-    .text("🔗 Referrals", "def_pick_referrals").text("🗑 Toggle Revoke", "def_toggle_revoke").row()
-    .text("♻️ Clear Defaults", "def_clear").text("❌ Close", "def_close");
+    .text("🏆 Winners", callback("pick_winners")).text("⏰ Duration", callback("pick_duration")).row()
+    .text("👥 Max Entries", callback("pick_max")).row()
+    .text("👁 Toggle Hidden", callback("toggle_anon")).text("📌 Toggle Pin", callback("toggle_pin")).row()
+    .text("📛 Toggle Username", callback("toggle_user")).text("🎡 Toggle Animation", callback("toggle_anim")).row()
+    .text("📅 Min Age", callback("pick_age")).text("🛡 Cooldown", callback("pick_cooldown")).row()
+    .text("🔗 Referrals", callback("pick_referrals")).text("🗑 Toggle Revoke", callback("toggle_revoke")).row()
+    .text("♻️ Clear Defaults", callback("clear")).text("❌ Close", callback("close"));
+}
+
+async function showDefaultsForChat(ctx: Context, chatId: number): Promise<void> {
+  await ctx.reply(formatGroupDefaults(chatId), {
+    parse_mode: "HTML",
+    reply_markup: buildDefaultsKeyboard(chatId),
+  });
 }
 
 export async function handleDefaults(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "defaults");
     return;
   }
   const userId = ctx.from!.id;
@@ -2882,17 +3149,17 @@ export async function handleDefaults(ctx: Context): Promise<void> {
     await replyPrivately(ctx, "Only group admins can manage defaults.");
     return;
   }
-  await ctx.reply(formatGroupDefaults(ctx.chat.id), {
-    parse_mode: "HTML",
-    reply_markup: buildDefaultsKeyboard(),
-  });
+  await showDefaultsForChat(ctx, ctx.chat.id);
 }
 
 export async function handleDefaultsCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data;
-  const chatId = ctx.callbackQuery?.message?.chat.id;
-  if (!data || !ctx.from || !chatId) return;
-  if (!(await isGroupAdmin(ctx, ctx.from.id))) {
+  if (!data || !ctx.from) return;
+  const match = data.match(/^def_(-?\d+)_(.+)$/);
+  if (!match) return;
+  const chatId = parseInt(match[1], 10);
+  const action = match[2];
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
     await ctx.answerCallbackQuery({ text: "Only group admins can manage defaults.", show_alert: true });
     return;
   }
@@ -2906,96 +3173,102 @@ export async function handleDefaultsCallback(ctx: Context): Promise<void> {
 
   const picker = async (text: string, kb: InlineKeyboard) =>
     ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: kb });
+  const callback = (name: string) => `def_${chatId}_${name}`;
 
-  if (data === "def_close") {
+  if (action === "close") {
     try { await ctx.deleteMessage(); } catch {}
     return;
   }
-  if (data === "def_clear") {
+  if (action === "clear") {
     db.clearGroupDefaults(chatId);
-  } else if (data === "def_pick_winners") {
+  } else if (action === "pick_winners") {
     await picker("🏆 <b>Default winners</b>", new InlineKeyboard()
-      .text("Ask", "def_winners_null").text("1", "def_winners_1").text("2", "def_winners_2").row()
-      .text("3", "def_winners_3").text("5", "def_winners_5").text("10", "def_winners_10").row()
-      .text("⬅️ Back", "def_back"));
+      .text("Ask", callback("winners_null")).text("1", callback("winners_1")).text("2", callback("winners_2")).row()
+      .text("3", callback("winners_3")).text("5", callback("winners_5")).text("10", callback("winners_10")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data.startsWith("def_winners_")) {
-    const val = data.replace("def_winners_", "");
+  } else if (action.startsWith("winners_")) {
+    const val = action.replace("winners_", "");
     update({ max_winners: val === "null" ? null : parseInt(val, 10) });
-  } else if (data === "def_pick_duration") {
+  } else if (action === "pick_duration") {
     await picker("⏰ <b>Default duration</b>", new InlineKeyboard()
-      .text("Ask", "def_duration_null").text("30m", "def_duration_30").text("1h", "def_duration_60").row()
-      .text("6h", "def_duration_360").text("1d", "def_duration_1440").text("7d", "def_duration_10080").row()
-      .text("⬅️ Back", "def_back"));
+      .text("Ask", callback("duration_null")).text("30m", callback("duration_30")).text("1h", callback("duration_60")).row()
+      .text("6h", callback("duration_360")).text("1d", callback("duration_1440")).text("7d", callback("duration_10080")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data.startsWith("def_duration_")) {
-    const val = data.replace("def_duration_", "");
+  } else if (action.startsWith("duration_")) {
+    const val = action.replace("duration_", "");
     update({ duration_minutes: val === "null" ? null : parseInt(val, 10) });
-  } else if (data === "def_pick_max") {
+  } else if (action === "pick_max") {
     await picker("👥 <b>Default max entries</b>", new InlineKeyboard()
-      .text("None", "def_max_null").text("50", "def_max_50").text("100", "def_max_100").row()
-      .text("250", "def_max_250").text("500", "def_max_500").text("1000", "def_max_1000").row()
-      .text("⬅️ Back", "def_back"));
+      .text("None", callback("max_null")).text("50", callback("max_50")).text("100", callback("max_100")).row()
+      .text("250", callback("max_250")).text("500", callback("max_500")).text("1000", callback("max_1000")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data.startsWith("def_max_")) {
-    const val = data.replace("def_max_", "");
+  } else if (action.startsWith("max_")) {
+    const val = action.replace("max_", "");
     update({ max_entries: val === "null" ? null : parseInt(val, 10) });
-  } else if (data === "def_toggle_anon") {
+  } else if (action === "toggle_anon") {
     update({ anonymous: current?.anonymous ? 0 : 1 });
-  } else if (data === "def_toggle_pin") {
+  } else if (action === "toggle_pin") {
     update({ auto_pin: current?.auto_pin ? 0 : 1 });
-  } else if (data === "def_toggle_user") {
+  } else if (action === "toggle_user") {
     update({ require_username: current?.require_username ? 0 : 1 });
-  } else if (data === "def_toggle_anim") {
+  } else if (action === "toggle_anim") {
     update({ show_animation: current?.show_animation === 0 ? 1 : 0 });
-  } else if (data === "def_pick_age") {
+  } else if (action === "pick_age") {
     await picker("📅 <b>Default minimum account age</b>", new InlineKeyboard()
-      .text("Off", "def_age_0").text("7d", "def_age_7").text("30d", "def_age_30").row()
-      .text("90d", "def_age_90").text("180d", "def_age_180").row()
-      .text("⬅️ Back", "def_back"));
+      .text("Off", callback("age_0")).text("7d", callback("age_7")).text("30d", callback("age_30")).row()
+      .text("90d", callback("age_90")).text("180d", callback("age_180")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data.startsWith("def_age_")) {
-    update({ min_account_age_days: parseInt(data.replace("def_age_", ""), 10) });
-  } else if (data === "def_pick_cooldown") {
+  } else if (action.startsWith("age_")) {
+    update({ min_account_age_days: parseInt(action.replace("age_", ""), 10) });
+  } else if (action === "pick_cooldown") {
     await picker("🛡 <b>Default winner cooldown</b>", new InlineKeyboard()
-      .text("Off", "def_cooldown_0").text("1", "def_cooldown_1").text("3", "def_cooldown_3").row()
-      .text("5", "def_cooldown_5").text("10", "def_cooldown_10").row()
-      .text("⬅️ Back", "def_back"));
+      .text("Off", callback("cooldown_0")).text("1", callback("cooldown_1")).text("3", callback("cooldown_3")).row()
+      .text("5", callback("cooldown_5")).text("10", callback("cooldown_10")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data.startsWith("def_cooldown_")) {
-    update({ winner_cooldown: parseInt(data.replace("def_cooldown_", ""), 10) });
-  } else if (data === "def_pick_referrals") {
+  } else if (action.startsWith("cooldown_")) {
+    update({ winner_cooldown: parseInt(action.replace("cooldown_", ""), 10) });
+  } else if (action === "pick_referrals") {
     await picker("🔗 <b>Default referrals</b>", new InlineKeyboard()
-      .text("Off", "def_ref_0").text("Unlimited", "def_ref_on_0").row()
-      .text("Max 5", "def_ref_on_5").text("Max 10", "def_ref_on_10").row()
-      .text("⬅️ Back", "def_back"));
+      .text("Off", callback("ref_0")).text("Unlimited", callback("ref_on_0")).row()
+      .text("Max 5", callback("ref_on_5")).text("Max 10", callback("ref_on_10")).row()
+      .text("⬅️ Back", callback("back")));
     return;
-  } else if (data === "def_ref_0") {
+  } else if (action === "ref_0") {
     update({ referral_enabled: 0, max_referral_entries: 0 });
-  } else if (data.startsWith("def_ref_on_")) {
-    update({ referral_enabled: 1, max_referral_entries: parseInt(data.replace("def_ref_on_", ""), 10) });
-  } else if (data === "def_toggle_revoke") {
+  } else if (action.startsWith("ref_on_")) {
+    update({ referral_enabled: 1, max_referral_entries: parseInt(action.replace("ref_on_", ""), 10) });
+  } else if (action === "toggle_revoke") {
     update({ revoke_referral_links: current?.revoke_referral_links ? 0 : 1 });
   }
 
   await ctx.editMessageText(formatGroupDefaults(chatId), {
     parse_mode: "HTML",
-    reply_markup: buildDefaultsKeyboard(),
+    reply_markup: buildDefaultsKeyboard(chatId),
   });
 }
 
 export async function handleSetupCheck(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "setup");
     return;
   }
   if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
     await replyPrivately(ctx, "Only group admins can run setup checks.");
     return;
   }
+  await showSetupCheckForChat(ctx, ctx.chat.id);
+}
+
+async function showSetupCheckForChat(ctx: Context, chatId: number): Promise<void> {
   let msg = `🧪 <b>Raffle Bot Setup Check</b>\n\n`;
   try {
-    const member = await ctx.api.getChatMember(ctx.chat.id, ctx.me.id);
+    const member = await ctx.api.getChatMember(chatId, ctx.me.id);
     const admin = member.status === "administrator";
     msg += `Admin status: ${admin ? "✅ administrator" : "⚠️ not admin"}\n`;
     if (member.status === "administrator") {
@@ -3007,33 +3280,38 @@ export async function handleSetupCheck(ctx: Context): Promise<void> {
   } catch {
     msg += `Admin status: ⚠️ could not verify\n`;
   }
-  msg += `\nTimezone: <code>${escapeHtml(db.getChatTimezone(ctx.chat.id))}</code>\n`;
-  msg += `Language: <code>${escapeHtml(db.getChatLanguage(ctx.chat.id))}</code>\n`;
-  msg += `Open raffles: <b>${db.getOpenRafflesForChat(ctx.chat.id).length}</b>\n`;
-  msg += `Templates: <b>${db.getTemplatesForChat(ctx.chat.id).length}</b>\n`;
+  msg += `\nTimezone: <code>${escapeHtml(db.getChatTimezone(chatId))}</code>\n`;
+  msg += `Language: <code>${escapeHtml(db.getChatLanguage(chatId))}</code>\n`;
+  msg += `Open raffles: <b>${db.getOpenRafflesForChat(chatId).length}</b>\n`;
+  msg += `Templates: <b>${db.getTemplatesForChat(chatId).length}</b>\n`;
   msg += `\n<i>If any permission is missing, promote the bot again with the requested rights.</i>`;
-  await replyPrivately(ctx, msg, { parse_mode: "HTML" });
+  await ctx.reply(msg, { parse_mode: "HTML" });
 }
 
 export async function handleReferrals(ctx: Context): Promise<void> {
-  if (!ctx.chat || ctx.chat.type === "private") {
-    await ctx.reply("Use this command in a group chat.");
+  if (!ctx.chat) return;
+  if (ctx.chat.type === "private") {
+    await showAdminGroupPicker(ctx, false, "referrals");
     return;
   }
   if (!(await isGroupAdmin(ctx, ctx.from!.id))) {
     await replyPrivately(ctx, "Only group admins can view referral stats.");
     return;
   }
-  const raffles = db.getOpenRafflesForChat(ctx.chat.id).filter((r) => r.referral_enabled);
+  await showReferralsForChat(ctx, ctx.chat.id);
+}
+
+async function showReferralsForChat(ctx: Context, chatId: number): Promise<void> {
+  const raffles = db.getOpenRafflesForChat(chatId).filter((r) => r.referral_enabled);
   if (raffles.length === 0) {
-    await replyPrivately(ctx, "No active referral raffles in this group.");
+    await ctx.reply("No active referral raffles in this group.");
     return;
   }
   const kb = new InlineKeyboard();
   for (const r of raffles.slice(0, 20)) {
-    kb.text(r.title.slice(0, 32), `refdash_${ctx.chat.id}_${r.id}`).row();
+    kb.text(r.title.slice(0, 32), `refdash_${chatId}_${r.id}`).row();
   }
-  await replyPrivately(ctx, `🔗 <b>Referral Raffles</b>\n\nPick a raffle to view this group's referral stats:`, {
+  await ctx.reply(`🔗 <b>Referral Raffles</b>\n\nPick a raffle to view this group's referral stats:`, {
     parse_mode: "HTML",
     reply_markup: kb,
   });

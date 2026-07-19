@@ -105,4 +105,41 @@ describe("database optimization helpers", () => {
     expect(winners).toHaveLength(3);
     expect(new Set(winners.map((w) => w.user_id)).size).toBe(3);
   });
+
+  it("remembers and removes verified admin groups per user", () => {
+    db.upsertBotGroup(-1001, "Alpha", "administrator");
+    db.upsertBotGroup(-1002, "Beta", "administrator");
+
+    db.rememberUserAdminGroup(10, -1002);
+    db.rememberUserAdminGroup(10, -1001);
+    db.rememberUserAdminGroup(20, -1002);
+
+    expect(db.getUserAdminGroups(10).map((group) => group.title)).toEqual([
+      "Alpha",
+      "Beta",
+    ]);
+
+    db.forgetUserAdminGroup(10, -1001);
+    expect(db.getUserAdminGroups(10).map((group) => group.chat_id)).toEqual([
+      -1002,
+    ]);
+
+    db.clearUserAdminGroups(10);
+    expect(db.getUserAdminGroups(10)).toEqual([]);
+    expect(db.getUserAdminGroups(20)).toHaveLength(1);
+  });
+
+  it("lists a participant's open raffle entries across groups", () => {
+    const first = db.createRaffle(raffleInput({ chat_id: -1001, title: "First" }));
+    const second = db.createRaffle(raffleInput({ chat_id: -1002, title: "Second" }));
+    const closed = db.createRaffle(raffleInput({ chat_id: -1003, title: "Closed" }));
+    db.addEntry(first.id, 50, "person", "Person");
+    db.addEntry(second.id, 50, "person", "Person");
+    db.addEntry(closed.id, 50, "person", "Person");
+    db.closeRaffle(closed.id);
+
+    const entries = db.getOpenRafflesEnteredByUser(50);
+    expect(entries.map((raffle) => raffle.title).sort()).toEqual(["First", "Second"]);
+    expect(db.getOpenRafflesEnteredByUser(99)).toEqual([]);
+  });
 });

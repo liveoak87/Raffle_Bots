@@ -22,6 +22,8 @@ import {
 import {
   handleStart,
   handleHelp,
+  handleManage,
+  handleAdminCallback,
   handleNewRaffle,
   handleListRaffles,
   handleDraw,
@@ -346,9 +348,57 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
+// Legacy group commands are redirected to a private button. The public command
+// menu is empty, but this keeps old typed commands from creating group clutter.
+const PRIVATE_ADMIN_ACTIONS: Record<string, string> = {
+  newraffle: "create",
+  draw: "draw",
+  cancelraffle: "cancel",
+  rafflehistory: "history",
+  exportentries: "export",
+  rerun: "rerun",
+  savetemplate: "templates",
+  templates: "templates",
+  deletetemplate: "templates",
+  usetemplate: "templates",
+  recurring: "templates",
+  editraffle: "edit",
+  language: "language",
+  timezone: "timezone",
+  groupstats: "stats",
+  defaults: "defaults",
+  setupcheck: "setup",
+  referrals: "referrals",
+};
+
+bot.use(async (ctx, next) => {
+  if (!ctx.chat || ctx.chat.type === "private" || !ctx.from) return next();
+  const text = ctx.message?.text || "";
+  const match = text.match(/^\/([a-z]+)(?:@\w+)?(?:\s|$)/i);
+  const action = match ? PRIVATE_ADMIN_ACTIONS[match[1].toLowerCase()] : undefined;
+  if (!action) return next();
+
+  try { await ctx.deleteMessage(); } catch {}
+  try {
+    await ctx.api.sendMessage(
+      ctx.from.id,
+      `<b>${escapeHtml(ctx.chat.title || "Group")} Admin Center</b>\n\nContinue this action privately:`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard()
+          .text("Continue", `admin_do_${action}_${ctx.chat.id}`).row()
+          .text("Choose Another Group", "admin_groups"),
+      }
+    );
+  } catch {
+    // The user has not started the bot in DMs yet. Stay silent in the group.
+  }
+});
+
 // --- Register commands ---
 bot.command("start", handleStart);
 bot.command("help", handleHelp);
+bot.command("manage", handleManage);
 bot.command("newraffle", handleNewRaffle);
 bot.command("raffles", handleListRaffles);
 bot.command("draw", handleDraw);
@@ -402,6 +452,7 @@ bot.callbackQuery(/^leave_\d+$/, handleLeaveCallback);
 bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
 bot.callbackQuery(/^draw_/, handleDrawCallback);
 bot.callbackQuery(/^export_/, handleExportCallback);
+bot.callbackQuery(/^admin_/, handleAdminCallback);
 
 // --- Wizard callback queries ---
 bot.callbackQuery(/^wiz_winners_\d+$/, handleWinnersCallback);
@@ -1468,27 +1519,28 @@ bot.on("my_chat_member", async (ctx) => {
     `• Winners & creator notified via DM\n\n` +
     `<b>📋 Templates & Recurring</b>\n` +
     `• Save raffle configs as reusable templates\n` +
-    `• One-tap template hub: /templates\n` +
+    `• One-tap private template hub\n` +
     `• Recurring raffles on a schedule (hourly, daily, weekly)\n\n` +
     `<b>🛡 Entry Verification</b>\n` +
     `• Require Telegram username\n` +
     `• Minimum account age filter\n` +
     `• Winner cooldown (exclude recent winners)\n\n` +
     `<b>📊 Management Tools</b>\n` +
-    `• /editraffle — edit active raffles live\n` +
-    `• /rerun — re-run a past raffle with same participants\n` +
-    `• /exportentries — export participant list as CSV\n` +
-    `• /groupstats — view raffle stats for your group\n` +
-    `• /rafflehistory — browse past raffles\n\n` +
+    `• Edit active raffles live\n` +
+    `• Re-run past raffles with the same participants\n` +
+    `• Export participant lists as CSV\n` +
+    `• View group statistics and raffle history\n\n` +
     `<b>🌐 Multi-Language</b>\n` +
     `• English, Español, Português, Русский, Français, Deutsch\n` +
-    `• Set with /language\n\n` +
-    `<b>🚀 Get started:</b> Type /newraffle in ${escapeHtml(chatTitle)} to create your first raffle!\n\n` +
-    `Questions or bugs? Use /bugreport to send feedback.`;
+    `• Change it privately from the Admin Center\n\n` +
+    `<b>🚀 Get started:</b> Open my private chat, choose Admin Center, then select ${escapeHtml(chatTitle)}. All setup and management stays out of the group chat.`;
 
   // Try to DM the person who added the bot
   try {
-    await ctx.api.sendMessage(addedBy.id, welcomeMsg, { parse_mode: "HTML" });
+    await ctx.api.sendMessage(addedBy.id, welcomeMsg, {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
+    });
   } catch {
     // User hasn't started a DM with the bot — can't message them.
     // That's fine, they'll discover features via /help.
@@ -1599,27 +1651,19 @@ async function main(): Promise<void> {
   // Admin/stats HTTP endpoint for the control tower (mode-independent).
   startAdminServer();
 
-  // Set bot commands for the menu
-  await bot.api.setMyCommands([
-    { command: "newraffle", description: "Create a new raffle" },
-    { command: "raffles", description: "List open raffles" },
-    { command: "draw", description: "Draw winners" },
-    { command: "templates", description: "Manage raffle templates" },
-    { command: "editraffle", description: "Edit an active raffle" },
-    { command: "cancelraffle", description: "Cancel a raffle" },
-    { command: "rerun", description: "Re-run a past raffle" },
-    { command: "exportentries", description: "Export participant list" },
-    { command: "myentries", description: "See your active entries" },
-    { command: "rafflehistory", description: "View past raffles" },
-    { command: "groupstats", description: "View group raffle stats" },
-    { command: "defaults", description: "Set group raffle defaults" },
-    { command: "setupcheck", description: "Check bot setup and permissions" },
-    { command: "referrals", description: "View group referral stats" },
-    { command: "bugreport", description: "Report a bug" },
-    { command: "language", description: "Set bot language" },
-    { command: "timezone", description: "Set group timezone (admin)" },
-    { command: "help", description: "Show help" },
-  ]);
+  // Administrative work belongs in DMs. Clear the old global menu so it no
+  // longer appears in groups, then publish a short private-chat menu.
+  await bot.api.deleteMyCommands();
+  await bot.api.deleteMyCommands({ scope: { type: "all_group_chats" } });
+  await bot.api.setMyCommands(
+    [
+      { command: "manage", description: "Open your group Admin Center" },
+      { command: "myentries", description: "See your active entries" },
+      { command: "bugreport", description: "Report a bug" },
+      { command: "help", description: "Show help" },
+    ],
+    { scope: { type: "all_private_chats" } }
+  );
 
   // Initialize bot info (needed for bot.botInfo.id before bot.start())
   await bot.init();

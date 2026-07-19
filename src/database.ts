@@ -155,6 +155,13 @@ export function initDatabase(dbPath: string): Database.Database {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS user_admin_groups (
+      user_id INTEGER NOT NULL,
+      chat_id INTEGER NOT NULL,
+      verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, chat_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_raffles_chat_id ON raffles(chat_id);
     CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status);
     CREATE INDEX IF NOT EXISTS idx_raffles_status_ends ON raffles(status, ends_at);
@@ -166,6 +173,7 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_templates_recurring_due ON raffle_templates(recurring_active, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
+    CREATE INDEX IF NOT EXISTS idx_user_admin_groups_user ON user_admin_groups(user_id);
   `);
 
   // Run migrations for existing databases
@@ -421,6 +429,18 @@ export function getOpenRafflesForChat(chatId: number): Raffle[] {
       "SELECT * FROM raffles WHERE chat_id = ? AND status = 'open' ORDER BY created_at DESC"
     )
     .all(chatId) as Raffle[];
+}
+
+export function getOpenRafflesEnteredByUser(userId: number): Raffle[] {
+  return getDb()
+    .prepare(
+      `SELECT r.*
+       FROM raffles r
+       JOIN raffle_entries e ON e.raffle_id = r.id
+       WHERE e.user_id = ? AND r.status = 'open'
+       ORDER BY r.created_at DESC`
+    )
+    .all(userId) as Raffle[];
 }
 
 export function getRecentRafflesForChat(
@@ -1457,6 +1477,38 @@ export function getAdminBotGroups(): BotGroup[] {
   return getDb()
     .prepare("SELECT * FROM bot_groups WHERE bot_status = 'administrator' ORDER BY title COLLATE NOCASE")
     .all() as BotGroup[];
+}
+
+export function rememberUserAdminGroup(userId: number, chatId: number): void {
+  getDb()
+    .prepare(
+      `INSERT INTO user_admin_groups (user_id, chat_id, verified_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(user_id, chat_id) DO UPDATE SET verified_at = datetime('now')`
+    )
+    .run(userId, chatId);
+}
+
+export function forgetUserAdminGroup(userId: number, chatId: number): void {
+  getDb()
+    .prepare("DELETE FROM user_admin_groups WHERE user_id = ? AND chat_id = ?")
+    .run(userId, chatId);
+}
+
+export function clearUserAdminGroups(userId: number): void {
+  getDb().prepare("DELETE FROM user_admin_groups WHERE user_id = ?").run(userId);
+}
+
+export function getUserAdminGroups(userId: number): BotGroup[] {
+  return getDb()
+    .prepare(
+      `SELECT bg.*
+       FROM user_admin_groups uag
+       JOIN bot_groups bg ON bg.chat_id = uag.chat_id
+       WHERE uag.user_id = ?
+       ORDER BY bg.title COLLATE NOCASE`
+    )
+    .all(userId) as BotGroup[];
 }
 
 /**

@@ -22,6 +22,7 @@ import {
   startTemplateWizard,
   handleStartDeepLink,
   startEditWizard,
+  startBugReport,
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
@@ -134,7 +135,30 @@ function formatDurationHuman(ms: number): string {
   return parts.length > 0 ? parts.join(" ") : "< 1m";
 }
 
-// /start - Welcome message (works in private chat)
+function buildPrivateHomeKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🎛 Manage My Groups", "admin_groups").row()
+    .text("🎟 My Active Entries", "home_entries").row()
+    .text("🐛 Report a Bug", "home_bugreport").text("❓ Help", "home_help");
+}
+
+async function showPrivateHome(ctx: Context): Promise<void> {
+  const message =
+    `🎟 <b>Raffle Bot</b>\n\n` +
+    `Choose what you want to do. Group setup and raffle management stay in this private chat.`;
+  const options = {
+    parse_mode: "HTML" as const,
+    reply_markup: buildPrivateHomeKeyboard(),
+  };
+
+  if (ctx.chat?.type === "private") {
+    await ctx.reply(message, options);
+  } else if (ctx.from) {
+    try { await ctx.api.sendMessage(ctx.from.id, message, options); } catch {}
+  }
+}
+
+// /start - Open the private button-based home screen.
 export async function handleStart(ctx: Context): Promise<void> {
   // Check for deep link payload (e.g., /start newraffle_-1001234567890)
   const text = ctx.message?.text || "";
@@ -148,20 +172,7 @@ export async function handleStart(ctx: Context): Promise<void> {
     }
   }
 
-  const message =
-    `🎟 <b>Raffle Bot</b>\n\n` +
-      `I help you run raffles in Telegram group chats!\n\n` +
-      `<b>Group admins:</b> Open the private Admin Center, select a group, and manage everything with buttons.\n\n` +
-      `<b>Participants:</b> Use the raffle buttons in your groups to enter or leave.`;
-  const options = {
-    parse_mode: "HTML" as const,
-    reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
-  };
-  if (ctx.chat?.type === "private") {
-    await ctx.reply(message, options);
-  } else if (ctx.from) {
-    try { await ctx.api.sendMessage(ctx.from.id, message, options); } catch {}
-  }
+  await showPrivateHome(ctx);
 }
 
 // /help
@@ -189,8 +200,30 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `<b>Supported languages:</b> English, Espanol, Portugues, Русский, Francais, Deutsch`,
     {
       parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
+      reply_markup: buildPrivateHomeKeyboard(),
     });
+}
+
+export async function handleHomeCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !ctx.from) return;
+  await ctx.answerCallbackQuery();
+
+  if (data === "home_main") {
+    await showPrivateHome(ctx);
+    return;
+  }
+  if (data === "home_entries") {
+    await handleMyEntries(ctx);
+    return;
+  }
+  if (data === "home_bugreport") {
+    await startBugReport(ctx, ctx.from.id, "Direct Message");
+    return;
+  }
+  if (data === "home_help") {
+    await handleHelp(ctx);
+  }
 }
 
 // /newraffle - Create a raffle
@@ -329,7 +362,8 @@ function buildAdminDashboardKeyboard(chatId: number, isOwner: boolean): InlineKe
     keyboard.text("🔐 Admin Access", `admin_do_access_${chatId}`).row();
   }
   return keyboard
-    .text("↔️ Change Group", "admin_groups").text("❌ Close", "admin_close");
+    .text("🐛 Report a Bug", `admin_bug_${chatId}`).row()
+    .text("↔️ Change Group", "admin_groups").text("🏠 Main Menu", "home_main");
 }
 
 async function discoverAdminGroups(ctx: Context, userId: number): Promise<ReturnType<typeof db.getUserAdminGroups>> {
@@ -390,7 +424,7 @@ async function showAdminGroupPicker(
     ).row();
   }
   keyboard.text("🔄 Refresh My Groups", `admin_refresh_${action}`).row();
-  keyboard.text("❌ Close", "admin_close");
+  keyboard.text("🐛 Report a Bug", "home_bugreport").text("🏠 Main Menu", "home_main");
 
   const text = groups.length > 0
     ? `<b>Select a group to manage</b>\n\nI found ${groups.length} group${groups.length === 1 ? "" : "s"} where you are an admin.`
@@ -476,6 +510,13 @@ export async function handleAdminCallback(ctx: Context): Promise<void> {
   }
   if (data === "admin_groups") {
     await showAdminGroupPicker(ctx);
+    return;
+  }
+  const bugMatch = data.match(/^admin_bug_(-?\d+)$/);
+  if (bugMatch) {
+    const chatId = parseInt(bugMatch[1], 10);
+    const group = db.getBotGroup(chatId);
+    await startBugReport(ctx, chatId, group?.title || "Selected Group");
     return;
   }
   const refreshMatch = data.match(/^admin_refresh_([a-z]+)$/);
@@ -837,7 +878,11 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
     const message = inDm
       ? "You don't have any active raffle entries."
       : "You haven't entered any active raffles in this group.";
-    if (inDm) await ctx.reply(message);
+    if (inDm) {
+      await ctx.reply(message, {
+        reply_markup: new InlineKeyboard().text("🏠 Main Menu", "home_main"),
+      });
+    }
     else await replyPrivately(ctx, message);
     return;
   }
@@ -861,7 +906,12 @@ export async function handleMyEntries(ctx: Context): Promise<void> {
     }
   }
 
-  if (inDm) await ctx.reply(msg, { parse_mode: "HTML" });
+  if (inDm) {
+    await ctx.reply(msg, {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "home_main"),
+    });
+  }
   else await replyPrivately(ctx, msg, { parse_mode: "HTML" });
 }
 
@@ -3523,8 +3573,6 @@ export async function handleReferralsCallback(ctx: Context): Promise<void> {
 // /bugreport — Start a bug report (works anywhere)
 export async function handleBugReport(ctx: Context): Promise<void> {
   if (!ctx.from) return;
-
-  const { startBugReport } = await import("./wizard");
 
   const chatId = ctx.chat?.id || ctx.from.id;
   let chatTitle = "Direct Message";

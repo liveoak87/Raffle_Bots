@@ -23,6 +23,7 @@ import {
   handleStart,
   handleHelp,
   handleManage,
+  handleHomeCallback,
   handleAdminCallback,
   handleAccessCallback,
   handleNewRaffle,
@@ -454,6 +455,7 @@ bot.callbackQuery(/^entries_\d+(_\d+)?$/, handleEntriesCallback);
 bot.callbackQuery(/^draw_/, handleDrawCallback);
 bot.callbackQuery(/^export_/, handleExportCallback);
 bot.callbackQuery(/^admin_/, handleAdminCallback);
+bot.callbackQuery(/^home_/, handleHomeCallback);
 bot.callbackQuery(/^access_/, handleAccessCallback);
 
 // --- Wizard callback queries ---
@@ -1653,19 +1655,11 @@ async function main(): Promise<void> {
   // Admin/stats HTTP endpoint for the control tower (mode-independent).
   startAdminServer();
 
-  // Administrative work belongs in DMs. Clear the old global menu so it no
-  // longer appears in groups, then publish a short private-chat menu.
+  // All user-facing navigation is button-based in private chat. Keep command
+  // handlers for old deep links, but do not publish slash-command menus.
   await bot.api.deleteMyCommands();
   await bot.api.deleteMyCommands({ scope: { type: "all_group_chats" } });
-  await bot.api.setMyCommands(
-    [
-      { command: "manage", description: "Open your group Admin Center" },
-      { command: "myentries", description: "See your active entries" },
-      { command: "bugreport", description: "Report a bug" },
-      { command: "help", description: "Show help" },
-    ],
-    { scope: { type: "all_private_chats" } }
-  );
+  await bot.api.deleteMyCommands({ scope: { type: "all_private_chats" } });
 
   // Initialize bot info (needed for bot.botInfo.id before bot.start())
   await bot.init();

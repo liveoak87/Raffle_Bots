@@ -27,6 +27,13 @@ import {
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
 import { getGroupManagementAccess, isGroupOwner } from "./access";
+import {
+  decodeRerunDestination,
+  encodeRerunDestination,
+  resolveRerunThread,
+  sendWithGeneralFallback,
+  type RerunDestination,
+} from "./rerun";
 
 // --- Smart debounced post updates ---
 // Pattern: first entry refreshes the message immediately (so users see their
@@ -458,7 +465,12 @@ async function showAdminDashboard(ctx: Context, chatId: number): Promise<void> {
   );
 }
 
-async function runAdminAction(ctx: Context, action: AdminAction, chatId: number): Promise<void> {
+async function runAdminAction(
+  ctx: Context,
+  action: AdminAction,
+  chatId: number,
+  rerunDestination?: RerunDestination
+): Promise<void> {
   if (!ctx.from) return;
   const access = await getGroupManagementAccess(ctx.api, chatId, ctx.from.id);
   if (!access.allowed) {
@@ -476,7 +488,7 @@ async function runAdminAction(ctx: Context, action: AdminAction, chatId: number)
     case "draw": await showDrawForChat(ctx, chatId); return;
     case "edit": await showEditForChat(ctx, chatId); return;
     case "cancel": await showCancelForChat(ctx, chatId); return;
-    case "rerun": await showRerunForChat(ctx, chatId); return;
+    case "rerun": await showRerunForChat(ctx, chatId, false, rerunDestination); return;
     case "export": await showExportForChat(ctx, chatId); return;
     case "history": await showRaffleHistoryForChat(ctx, chatId); return;
     case "stats": await showGroupStatsForChat(ctx, chatId); return;
@@ -533,9 +545,14 @@ export async function handleAdminCallback(ctx: Context): Promise<void> {
     );
     return;
   }
-  const actionMatch = data.match(/^admin_do_([a-z]+)_(-?\d+)$/);
+  const actionMatch = data.match(/^admin_do_([a-z]+)_(-?\d+)(?:_(s|g|t\d+))?$/);
   if (actionMatch) {
-    await runAdminAction(ctx, actionMatch[1] as AdminAction, parseInt(actionMatch[2], 10));
+    await runAdminAction(
+      ctx,
+      actionMatch[1] as AdminAction,
+      parseInt(actionMatch[2], 10),
+      actionMatch[3] ? decodeRerunDestination(actionMatch[3]) : undefined
+    );
   }
 }
 
@@ -1215,10 +1232,22 @@ export async function handleRerun(ctx: Context): Promise<void> {
     return;
   }
 
-  await showRerunForChat(ctx, ctx.chat.id);
+  await showRerunForChat(
+    ctx,
+    ctx.chat.id,
+    false,
+    ctx.message?.message_thread_id
+      ? { kind: "topic", threadId: ctx.message.message_thread_id }
+      : { kind: "general" }
+  );
 }
 
-async function showRerunForChat(ctx: Context, chatId: number, edit = false): Promise<void> {
+async function showRerunForChat(
+  ctx: Context,
+  chatId: number,
+  edit = false,
+  destination: RerunDestination = { kind: "source" }
+): Promise<void> {
   const drawnRaffles = db
     .getRecentRafflesForChat(chatId, 20)
     .filter((r) => r.status === "drawn" || r.status === "closed");
@@ -1229,11 +1258,12 @@ async function showRerunForChat(ctx: Context, chatId: number, edit = false): Pro
   }
 
   const keyboard = new InlineKeyboard();
+  const destinationToken = encodeRerunDestination(destination);
   for (const r of drawnRaffles.slice(0, 10)) {
     const count = db.getEntryCount(r.id);
     keyboard.text(
       `${escapeHtml(r.title)} (${count} entries)`,
-      `rerun_pick_${r.id}`
+      `rerun_pick_${r.id}_${destinationToken}`
     );
     keyboard.row();
   }
@@ -1257,9 +1287,11 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
   }
 
   // Pick a raffle to preview
-  if (data.startsWith("rerun_pick_")) {
-    const sourceId = parseInt(data.replace("rerun_pick_", ""), 10);
-    if (isNaN(sourceId)) return;
+  const pickMatch = data.match(/^rerun_pick_(\d+)(?:_(s|g|t\d+))?$/);
+  if (pickMatch) {
+    const sourceId = parseInt(pickMatch[1], 10);
+    const destination = decodeRerunDestination(pickMatch[2]);
+    const destinationToken = encodeRerunDestination(destination);
 
     const sourceRaffle = db.getRaffleById(sourceId);
     if (!sourceRaffle) {
@@ -1290,9 +1322,9 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
     await ctx.answerCallbackQuery();
 
     const keyboard = new InlineKeyboard()
-      .text("✅ Re-run This Raffle", `rerun_confirm_${sourceId}`)
+      .text("✅ Re-run This Raffle", `rerun_confirm_${sourceId}_${destinationToken}`)
       .row()
-      .text("⬅️ Back", `rerun_back_${sourceRaffle.chat_id}`);
+      .text("⬅️ Back", `rerun_back_${sourceRaffle.chat_id}_${destinationToken}`);
 
     await ctx.editMessageText(
       `🔄 <b>Re-run: ${escapeHtml(sourceRaffle.title)}</b>\n\n` +
@@ -1308,22 +1340,25 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
   }
 
   // Back to raffle list
-  const backMatch = data.match(/^rerun_back_(-?\d+)$/);
+  const backMatch = data.match(/^rerun_back_(-?\d+)(?:_(s|g|t\d+))?$/);
   if (backMatch) {
     const chatId = parseInt(backMatch[1], 10);
+    const destination = decodeRerunDestination(backMatch[2]);
     if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
       await ctx.answerCallbackQuery({ text: "You are no longer an admin of that group.", show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
-    await showRerunForChat(ctx, chatId, true);
+    await showRerunForChat(ctx, chatId, true, destination);
     return;
   }
 
   // Confirm re-run
-  if (data.startsWith("rerun_confirm_")) {
-    const sourceId = parseInt(data.replace("rerun_confirm_", ""), 10);
-    if (isNaN(sourceId)) return;
+  const confirmMatch = data.match(/^rerun_confirm_(\d+)(?:_(s|g|t\d+))?$/);
+  if (confirmMatch) {
+    const sourceId = parseInt(confirmMatch[1], 10);
+    const destination = decodeRerunDestination(confirmMatch[2]);
+    const destinationToken = encodeRerunDestination(destination);
 
     const sourceRaffle = db.getRaffleById(sourceId);
     if (!sourceRaffle) {
@@ -1342,11 +1377,9 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       return;
     }
 
-    await ctx.answerCallbackQuery();
-
-    // Remove the selection message
+    await ctx.answerCallbackQuery({ text: "Creating re-run..." });
     try {
-      await ctx.deleteMessage();
+      await ctx.editMessageText("🔄 Creating the re-run...");
     } catch {}
 
     const displayName = getUserDisplayName(
@@ -1370,68 +1403,125 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
       }
     }
 
-    // Create a new raffle with the same settings
-    const newRaffle = db.createRaffle({
-      chat_id: chatId,
-      thread_id: sourceRaffle.thread_id,
-      creator_id: ctx.from.id,
-      creator_name: displayName,
-      title: `${sourceRaffle.title} (Re-run)`,
-      description: sourceRaffle.description,
-      prize: sourceRaffle.prize,
-      prizes: sourceRaffle.prizes,
-      max_entries: null,
-      max_winners: sourceRaffle.max_winners,
-      ends_at: newEndsAt,
-      starts_at: null,
-      display_timezone: db.getChatTimezone(chatId),
-      required_chat_id: sourceRaffle.required_chat_id,
-      required_chat_title: sourceRaffle.required_chat_title,
-      sponsor_name: sourceRaffle.sponsor_name,
-      anonymous: sourceRaffle.anonymous,
-      image_file_id: sourceRaffle.image_file_id,
-      auto_pin: sourceRaffle.auto_pin,
-      min_account_age_days: sourceRaffle.min_account_age_days,
-      require_username: sourceRaffle.require_username,
-      winner_cooldown: sourceRaffle.winner_cooldown,
-      show_animation: sourceRaffle.show_animation,
-      referral_enabled: sourceRaffle.referral_enabled,
-      max_referral_entries: sourceRaffle.max_referral_entries,
-      revoke_referral_links: sourceRaffle.revoke_referral_links,
-    });
+    const preferredThreadId = resolveRerunThread(destination, sourceRaffle.thread_id);
+    let newRaffleId: number | null = null;
+    let postedMessageId: number | null = null;
 
-    // Copy all entries from the source raffle
-    const added = db.bulkAddEntries(
-      newRaffle.id,
-      sourceEntries.map((e) => ({
-        user_id: e.user_id,
-        user_name: e.user_name,
-        user_display_name: e.user_display_name,
-      }))
-    );
+    try {
+      // Create a new raffle with the same settings
+      const newRaffle = db.createRaffle({
+        chat_id: chatId,
+        thread_id: preferredThreadId,
+        creator_id: ctx.from.id,
+        creator_name: displayName,
+        title: `${sourceRaffle.title} (Re-run)`,
+        description: sourceRaffle.description,
+        prize: sourceRaffle.prize,
+        prizes: sourceRaffle.prizes,
+        max_entries: null,
+        max_winners: sourceRaffle.max_winners,
+        ends_at: newEndsAt,
+        starts_at: null,
+        display_timezone: db.getChatTimezone(chatId),
+        required_chat_id: sourceRaffle.required_chat_id,
+        required_chat_title: sourceRaffle.required_chat_title,
+        sponsor_name: sourceRaffle.sponsor_name,
+        anonymous: sourceRaffle.anonymous,
+        image_file_id: sourceRaffle.image_file_id,
+        auto_pin: sourceRaffle.auto_pin,
+        min_account_age_days: sourceRaffle.min_account_age_days,
+        require_username: sourceRaffle.require_username,
+        winner_cooldown: sourceRaffle.winner_cooldown,
+        show_animation: sourceRaffle.show_animation,
+        referral_enabled: sourceRaffle.referral_enabled,
+        max_referral_entries: sourceRaffle.max_referral_entries,
+        revoke_referral_links: sourceRaffle.revoke_referral_links,
+      });
+      newRaffleId = newRaffle.id;
 
-    const rerunLang = db.getChatLanguage(chatId);
-    const botUsername = ctx.me.username;
+      // Copy all entries from the source raffle
+      const added = db.bulkAddEntries(
+        newRaffle.id,
+        sourceEntries.map((e) => ({
+          user_id: e.user_id,
+          user_name: e.user_name,
+          user_display_name: e.user_display_name,
+        }))
+      );
 
-    const raffleKeyboard = buildRaffleKeyboard(newRaffle, added, rerunLang, botUsername);
+      const rerunLang = db.getChatLanguage(chatId);
+      const botUsername = ctx.me.username;
 
-    const caption = formatRaffleMessage(newRaffle, added, rerunLang) +
-      `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`;
+      const raffleKeyboard = buildRaffleKeyboard(newRaffle, added, rerunLang, botUsername);
 
-    const msgId = await sendRafflePost(
-      ctx.api,
-      chatId,
-      "open",
-      caption,
-      raffleKeyboard,
-      newRaffle.image_file_id,
-      newRaffle.thread_id
-    );
+      const caption = formatRaffleMessage(newRaffle, added, rerunLang) +
+        `\n\n🔄 <i>Re-run of "${escapeHtml(sourceRaffle.title)}" with ${added} participants copied.</i>`;
 
-    if (msgId) {
-      db.updateRaffleMessageId(newRaffle.id, msgId);
+      const posted = await sendWithGeneralFallback(
+        (threadId) => sendRafflePost(
+          ctx.api,
+          chatId,
+          "open",
+          caption,
+          raffleKeyboard,
+          newRaffle.image_file_id,
+          threadId
+        ),
+        preferredThreadId
+      );
+
+      if (!posted) {
+        db.deleteRaffle(newRaffle.id);
+        newRaffleId = null;
+        await ctx.editMessageText(
+          "❌ <b>The re-run could not be posted.</b>\n\nThe selected topic and the group’s General topic are not accepting posts. No raffle was created. Choose another raffle or open the destination topic and try again.",
+          {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🔄 Try Again", `rerun_back_${chatId}_${destinationToken}`)
+              .row()
+              .text("⬅️ Admin Center", `admin_do_menu_${chatId}`),
+          }
+        );
+        return;
+      }
+      postedMessageId = posted.messageId;
+
+      if (posted.threadId !== preferredThreadId) {
+        db.updateRaffleFields(newRaffle.id, { thread_id: posted.threadId });
+      }
+      db.updateRaffleMessageId(newRaffle.id, posted.messageId);
+
+      const link = buildMessageLink(chatId, posted.messageId);
+      const keyboard = new InlineKeyboard();
+      if (link) keyboard.url("🎟 Open Raffle", link).row();
+      keyboard.text("⬅️ Admin Center", `admin_do_menu_${chatId}`);
+
+      const fallbackNote = posted.threadId !== preferredThreadId
+        ? "\n\n<i>The selected topic was unavailable, so the raffle was posted in General.</i>"
+        : "";
+      await ctx.editMessageText(
+        `✅ <b>Re-run posted</b>\n\n${added} participants were copied into the new raffle.${fallbackNote}`,
+        { parse_mode: "HTML", reply_markup: keyboard }
+      );
+    } catch (err) {
+      if (newRaffleId !== null && postedMessageId === null) {
+        try { db.deleteRaffle(newRaffleId); } catch {}
+      }
+      console.error(`Failed to create re-run from raffle ${sourceId}:`, err);
+      await ctx.editMessageText(
+        postedMessageId === null
+          ? "❌ <b>The re-run could not be created.</b>\n\nNo raffle was posted. Please try again."
+          : "⚠️ <b>The raffle was posted, but its confirmation could not be completed.</b>\n\nPlease check the group before trying again.",
+        {
+          parse_mode: "HTML",
+          reply_markup: new InlineKeyboard()
+            .text("🔄 Try Again", `rerun_back_${chatId}_${destinationToken}`)
+            .row()
+            .text("⬅️ Admin Center", `admin_do_menu_${chatId}`),
+        }
+      );
     }
-
   }
 }
 

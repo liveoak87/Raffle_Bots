@@ -79,6 +79,7 @@ import {
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
+import { encodeRerunDestination } from "./rerun";
 import {
   handleWizardMessage,
   handleWizardPhoto,
@@ -415,13 +416,21 @@ bot.use(async (ctx, next) => {
     return;
   }
   try {
+    const rerunDestination = encodeRerunDestination(
+      ctx.message?.message_thread_id
+        ? { kind: "topic", threadId: ctx.message.message_thread_id }
+        : { kind: "general" }
+    );
+    const callbackData = action === "rerun"
+      ? `admin_do_${action}_${ctx.chat.id}_${rerunDestination}`
+      : `admin_do_${action}_${ctx.chat.id}`;
     await ctx.api.sendMessage(
       ctx.from.id,
       `<b>${escapeHtml(ctx.chat.title || "Group")} Admin Center</b>\n\nContinue this action privately:`,
       {
         parse_mode: "HTML",
         reply_markup: new InlineKeyboard()
-          .text("Continue", `admin_do_${action}_${ctx.chat.id}`).row()
+          .text("Continue", callbackData).row()
           .text("Choose Another Group", "admin_groups"),
       }
     );

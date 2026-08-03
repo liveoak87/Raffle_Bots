@@ -100,7 +100,7 @@ npm start
 | Command | Description | Who Can Use |
 |---------|-------------|-------------|
 | `/newraffle` | Create a new raffle | Group admins |
-| `/setraffletopic` | Save the current topic as the Command Central default | Group admins |
+| `/setraffletopic <name>` | Save the current topic as the Command Central default | Group admins |
 | `/raffles` | List open raffles in this chat | Everyone |
 | `/draw [id]` | Draw winners for a raffle | Group admins |
 | `/cancelraffle [id]` | Cancel a raffle | Group admins |

@@ -260,7 +260,7 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
   if (ctx.chat.type === "private") {
     await ctx.reply(
       `Open the group, enter the topic where raffles should be posted, then send ` +
-        `<code>/setraffletopic</code> inside that topic.`,
+        `<code>/setraffletopic Topic Name</code> inside that topic.`,
       { parse_mode: "HTML" }
     );
     return;
@@ -277,14 +277,28 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
     await replyPrivately(
       ctx,
       `📍 <b>No topic detected</b>\n\nOpen the desired raffle topic first, then send ` +
-        `<code>/setraffletopic</code> inside that topic.`,
+        `<code>/setraffletopic Topic Name</code> inside that topic.`,
       { parse_mode: "HTML" }
     );
     return;
   }
 
-  db.upsertGroupDefaults(chatId, { thread_id: threadId });
-  const wizardUpdate = setActiveWizardDestination(ctx.from.id, chatId, threadId);
+  const topicName = (ctx.message?.text || "")
+    .replace(/^\/setraffletopic(?:@\w+)?(?:\s+|$)/i, "")
+    .trim();
+  if (!topicName || topicName.length > 128) {
+    await replyPrivately(
+      ctx,
+      `📍 <b>Add the topic name</b>\n\nSend the command again inside this topic with its name:\n` +
+        `<code>/setraffletopic Raffles</code>\n\n` +
+        `<i>Use the name you want displayed in Command Central.</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  db.upsertGroupDefaults(chatId, { thread_id: threadId, thread_name: topicName });
+  const wizardUpdate = setActiveWizardDestination(ctx.from.id, chatId, threadId, topicName);
   const groupTitle = ctx.chat.title || db.getBotGroup(chatId)?.title || "this group";
   const keyboard = new InlineKeyboard();
   if (wizardUpdate === "options") {
@@ -294,7 +308,7 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
 
   const confirmation =
     `✅ <b>Default raffle topic saved</b>\n\n` +
-      `<b>${escapeHtml(groupTitle)}</b> will use <b>Topic #${threadId}</b> for new raffles started from Command Central.\n\n` +
+      `<b>${escapeHtml(groupTitle)}</b> will use <b>${escapeHtml(topicName)}</b> for new raffles started from Command Central.\n\n` +
       (wizardUpdate
         ? `Your current raffle has also been updated to post there.\n\n`
         : "") +
@@ -3471,7 +3485,7 @@ function formatGroupDefaults(chatId: number): string {
   const d = db.getGroupDefaults(chatId);
   const line = (label: string, value: string) => `  ${label}: <b>${escapeHtml(value)}</b>\n`;
   let msg = `⚙️ <b>Group Raffle Defaults</b>\n\n`;
-  msg += line("Raffle destination", d?.thread_id ? `Topic #${d.thread_id}` : "General (not set)");
+  msg += line("Raffle destination", d?.thread_id ? (d.thread_name || "Saved raffle topic") : "General (not set)");
   msg += line("Winners", d?.max_winners ? String(d.max_winners) : "ask each time");
   msg += line("Duration", d?.duration_minutes ? formatDurationHuman(d.duration_minutes * 60000) : "ask each time");
   msg += line("Max entries", d?.max_entries ? String(d.max_entries) : "no default");
@@ -3553,7 +3567,7 @@ export async function handleDefaultsCallback(ctx: Context): Promise<void> {
   } else if (action === "pick_topic") {
     const group = db.getBotGroup(chatId);
     await picker(
-      buildDefaultTopicSetupText(group?.title || "this group", current?.thread_id),
+      buildDefaultTopicSetupText(group?.title || "this group", current?.thread_name),
       new InlineKeyboard()
         .text("🧹 Clear Saved Topic", callback("clear_topic"))
         .row()
@@ -3561,7 +3575,7 @@ export async function handleDefaultsCallback(ctx: Context): Promise<void> {
     );
     return;
   } else if (action === "clear_topic") {
-    update({ thread_id: null });
+    update({ thread_id: null, thread_name: null });
   } else if (action === "pick_winners") {
     await picker("🏆 <b>Default winners</b>", new InlineKeyboard()
       .text("Ask", callback("winners_null")).text("1", callback("winners_1")).text("2", callback("winners_2")).row()

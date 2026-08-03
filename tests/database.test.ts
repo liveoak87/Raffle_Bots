@@ -43,16 +43,22 @@ describe("database optimization helpers", () => {
   }
 
   it("stores and clears a default raffle topic without losing other defaults", () => {
-    db.upsertGroupDefaults(-1001, { max_winners: 3, thread_id: 13803 });
+    db.upsertGroupDefaults(-1001, {
+      max_winners: 3,
+      thread_id: 13803,
+      thread_name: "Raffles",
+    });
     expect(db.getGroupDefaults(-1001)).toMatchObject({
       max_winners: 3,
       thread_id: 13803,
+      thread_name: "Raffles",
     });
 
-    db.upsertGroupDefaults(-1001, { thread_id: null });
+    db.upsertGroupDefaults(-1001, { thread_id: null, thread_name: null });
     expect(db.getGroupDefaults(-1001)).toMatchObject({
       max_winners: 3,
       thread_id: null,
+      thread_name: null,
     });
   });
 

@@ -155,6 +155,7 @@ export interface GroupDefaults {
   chat_id: number;
   /** Default forum topic for new raffles started from Command Central. */
   thread_id: number | null;
+  thread_name: string | null;
   max_entries: number | null;
   max_winners: number | null;
   duration_minutes: number | null;

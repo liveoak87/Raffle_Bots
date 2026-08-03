@@ -44,6 +44,7 @@ interface WizardState {
     | "options_referral_max";
   targetChatId: number;
   targetThreadId: number | null;
+  targetThreadName?: string | null;
   targetChatTitle: string;
   dmChatId: number;
   userId: number;
@@ -108,7 +109,10 @@ function applyGroupDefaults(state: WizardState, includeDefaultThread = false): W
   const defaults = db.getGroupDefaults(state.targetChatId);
   if (!defaults) return state;
 
-  if (includeDefaultThread) state.targetThreadId = defaults.thread_id;
+  if (includeDefaultThread) {
+    state.targetThreadId = defaults.thread_id;
+    state.targetThreadName = defaults.thread_name;
+  }
   state.maxEntries = defaults.max_entries;
   if (defaults.max_winners && defaults.max_winners > 0) {
     state.maxWinners = defaults.max_winners;
@@ -155,7 +159,7 @@ export async function startWizard(ctx: Context): Promise<void> {
     const dmMsg = await ctx.api.sendMessage(
       userId,
       `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-        `📍 Destination: <b>${commandThreadId ? `Topic #${commandThreadId}` : "General"}</b>\n\n` +
+        `📍 Destination: <b>${commandThreadId ? "This topic" : "General"}</b>\n\n` +
         `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
         `<i>Just type it and send. Or /cancel to stop.</i>`,
       { parse_mode: "HTML" }
@@ -165,6 +169,7 @@ export async function startWizard(ctx: Context): Promise<void> {
       step: "title",
       targetChatId: groupChatId,
       targetThreadId: commandThreadId,
+      targetThreadName: null,
       targetChatTitle: groupTitle,
       dmChatId: dmMsg.chat.id,
       userId,
@@ -218,6 +223,7 @@ export async function startRaffleWizardForGroup(
     step: "title",
     targetChatId: groupChatId,
     targetThreadId: targetThreadId ?? null,
+    targetThreadName: null,
     targetChatTitle: resolvedTitle,
     dmChatId: ctx.chat.id,
     userId: ctx.from.id,
@@ -230,7 +236,7 @@ export async function startRaffleWizardForGroup(
 
   await ctx.reply(
     `📝 <b>Create a Raffle</b> for <b>${escapeHtml(resolvedTitle)}</b>\n\n` +
-      `📍 Destination: <b>${state.targetThreadId ? `Topic #${state.targetThreadId}${defaultLabel}` : "General"}</b>\n\n` +
+      `📍 Destination: <b>${escapeHtml(formatWizardDestination(state))}${defaultLabel}</b>\n\n` +
       `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
       `<i>Just type it and send. Or /cancel to stop.</i>`,
     { parse_mode: "HTML" }
@@ -407,11 +413,13 @@ export async function handleStartDeepLink(
 export function setActiveWizardDestination(
   userId: number,
   groupChatId: number,
-  threadId: number
+  threadId: number,
+  threadName: string
 ): "options" | "active" | null {
   const state = getActiveWizard(userId);
   if (!state || state.targetChatId !== groupChatId) return null;
   state.targetThreadId = threadId;
+  state.targetThreadName = threadName;
   return state.step.startsWith("options") ? "options" : "active";
 }
 
@@ -760,10 +768,15 @@ async function handleCustomTimeStep(
 
 // --- Options screen ---
 
+function formatWizardDestination(state: WizardState): string {
+  if (!state.targetThreadId) return "General";
+  return state.targetThreadName || "Selected topic";
+}
+
 function buildOptionsText(state: WizardState): string {
   let msg = `⚙️ <b>Options</b> — tap to change, then Create:\n\n`;
 
-  msg += `📍 <b>Post in:</b> ${state.targetThreadId ? `Topic #${state.targetThreadId}` : "General"}\n`;
+  msg += `📍 <b>Post in:</b> ${escapeHtml(formatWizardDestination(state))}\n`;
 
   msg += `📝 <b>Rules/description:</b> ${state.description ? "Added ✅" : "None"}\n`;
 
@@ -818,7 +831,7 @@ function buildOptionsKeyboard(state: WizardState): InlineKeyboard {
   const kb = new InlineKeyboard();
 
   kb.text(
-    state.targetThreadId ? `📍 Topic #${state.targetThreadId}` : "📍 Destination: General",
+    state.targetThreadId ? `📍 ${formatWizardDestination(state).slice(0, 48)}` : "📍 Destination: General",
     "wiz_opt_destination"
   );
   kb.row();
@@ -1157,7 +1170,8 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
       const savedThreadId = db.getGroupDefaults(state.targetChatId)?.thread_id;
       const keyboard = new InlineKeyboard();
       if (savedThreadId) {
-        keyboard.text(`✅ Use Default Topic #${savedThreadId}`, "wiz_opt_destination_default").row();
+        const savedName = db.getGroupDefaults(state.targetChatId)?.thread_name || "Saved raffle topic";
+        keyboard.text(`✅ Use ${savedName.slice(0, 42)}`, "wiz_opt_destination_default").row();
       }
       keyboard
         .text("📣 Use General This Time", "wiz_opt_destination_general")
@@ -1167,9 +1181,9 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
         .text("⬅️ Back to Options", "wiz_opt_destination_back");
       await ctx.editMessageText(
         `📍 <b>Raffle Destination</b>\n\n` +
-          `Current: <b>${state.targetThreadId ? `Topic #${state.targetThreadId}` : "General"}</b>\n\n` +
+          `Current: <b>${escapeHtml(formatWizardDestination(state))}</b>\n\n` +
           (savedThreadId
-            ? `Saved group default: <b>Topic #${savedThreadId}</b>\n\nChoose where to post this raffle.`
+            ? `Saved group default: <b>${escapeHtml(db.getGroupDefaults(state.targetChatId)?.thread_name || "Raffle topic")}</b>\n\nChoose where to post this raffle.`
             : `No default raffle topic has been saved for this group yet.`),
         { parse_mode: "HTML", reply_markup: keyboard }
       );
@@ -1178,7 +1192,11 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
 
     case "wiz_opt_destination_default": {
       const savedThreadId = db.getGroupDefaults(state.targetChatId)?.thread_id;
-      if (savedThreadId) state.targetThreadId = savedThreadId;
+      if (savedThreadId) {
+        const defaults = db.getGroupDefaults(state.targetChatId);
+        state.targetThreadId = savedThreadId;
+        state.targetThreadName = defaults?.thread_name || "Raffle topic";
+      }
       await sendOptionsScreen(ctx, state);
       break;
     }
@@ -1186,7 +1204,7 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
     case "wiz_opt_destination_setup":
       state.step = "options_destination";
       await ctx.editMessageText(
-        buildDefaultTopicSetupText(state.targetChatTitle, state.targetThreadId),
+        buildDefaultTopicSetupText(state.targetChatTitle, state.targetThreadName),
         {
           parse_mode: "HTML",
           reply_markup: new InlineKeyboard()
@@ -1199,6 +1217,7 @@ export async function handleOptionsCallback(ctx: Context): Promise<void> {
 
     case "wiz_opt_destination_general":
       state.targetThreadId = null;
+      state.targetThreadName = null;
       await sendOptionsScreen(ctx, state);
       break;
 
@@ -1405,17 +1424,18 @@ async function handleOptionsDescriptionText(
 
 export function buildDefaultTopicSetupText(
   groupTitle: string,
-  currentThreadId?: number | null
+  currentThreadName?: string | null
 ): string {
-  const current = currentThreadId
-    ? `\n\nCurrent destination: <b>Topic #${currentThreadId}</b>`
+  const current = currentThreadName
+    ? `\n\nCurrent destination: <b>${escapeHtml(currentThreadName)}</b>`
     : "";
   return (
     `📍 <b>Set the Default Raffle Topic</b>\n\n` +
     `Do this once for <b>${escapeHtml(groupTitle)}</b>:\n\n` +
     `1. Open the group.\n` +
     `2. Enter the topic where raffles should always be posted.\n` +
-    `3. Send <code>/setraffletopic</code> inside that topic.\n\n` +
+    `3. Send <code>/setraffletopic Topic Name</code> inside that topic.\n` +
+    `   Example: <code>/setraffletopic Raffles</code>\n\n` +
     `The bot will delete the command, save the topic, and confirm here in DM. ` +
     `Future raffles started from Command Central will use it automatically.${current}`
   );
@@ -2057,7 +2077,7 @@ async function createRaffleFromWizard(
 
   await ctx.reply(
     `✅ Raffle <b>${escapeHtml(raffle.title)}</b> has been posted to <b>${escapeHtml(state.targetChatTitle)}</b>` +
-      `${raffle.thread_id ? ` in topic #${raffle.thread_id}` : " in General"}!`,
+      `${raffle.thread_id ? ` in ${escapeHtml(state.targetThreadName || "the selected topic")}` : " in General"}!`,
     { parse_mode: "HTML" }
   );
 

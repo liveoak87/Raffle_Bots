@@ -157,6 +157,14 @@ export function initDatabase(dbPath: string): Database.Database {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS forum_topics (
+      chat_id INTEGER NOT NULL,
+      thread_id INTEGER NOT NULL,
+      thread_name TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chat_id, thread_id)
+    );
+
     CREATE TABLE IF NOT EXISTS user_admin_groups (
       user_id INTEGER NOT NULL,
       chat_id INTEGER NOT NULL,
@@ -1324,6 +1332,44 @@ export function updateRaffleFields(
 }
 
 // --- Group defaults ---
+
+export function getForumTopicName(chatId: number, threadId: number): string | null {
+  const row = getDb()
+    .prepare("SELECT thread_name FROM forum_topics WHERE chat_id = ? AND thread_id = ?")
+    .get(chatId, threadId) as { thread_name: string } | undefined;
+  return row?.thread_name || null;
+}
+
+export function rememberForumTopicName(
+  chatId: number,
+  threadId: number,
+  threadName: string,
+  overwrite = true
+): void {
+  const cleanedName = threadName.trim();
+  if (!cleanedName) return;
+
+  if (!overwrite) {
+    getDb()
+      .prepare(
+        `INSERT INTO forum_topics (chat_id, thread_id, thread_name)
+         VALUES (?, ?, ?)
+         ON CONFLICT(chat_id, thread_id) DO NOTHING`
+      )
+      .run(chatId, threadId, cleanedName);
+    return;
+  }
+
+  getDb()
+    .prepare(
+      `INSERT INTO forum_topics (chat_id, thread_id, thread_name)
+       VALUES (?, ?, ?)
+       ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+         thread_name = excluded.thread_name,
+         updated_at = datetime('now')`
+    )
+    .run(chatId, threadId, cleanedName);
+}
 
 export function getGroupDefaults(chatId: number): GroupDefaults | undefined {
   return getDb()

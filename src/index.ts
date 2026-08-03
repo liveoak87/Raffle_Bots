@@ -81,7 +81,11 @@ import {
 import type { Raffle } from "./types";
 import { t } from "./i18n";
 import { encodeRerunDestination } from "./rerun";
-import { getForumTopicId, getForumTopicName } from "./forumTopics";
+import {
+  getForumTopicId,
+  getForumTopicName,
+  resolveTemplateThreadId,
+} from "./forumTopics";
 import {
   handleWizardMessage,
   handleWizardPhoto,
@@ -349,10 +353,20 @@ bot.use(async (ctx, next) => {
     const isTopicServiceMessage = Boolean(
       ctx.message?.forum_topic_created || ctx.message?.forum_topic_edited
     );
-    if (isTopicServiceMessage && topicName && topicId) {
+    if (topicName && topicId) {
       const defaults = db.getGroupDefaults(chatId);
-      if (defaults?.thread_id === topicId && defaults.thread_name !== topicName) {
-        db.upsertGroupDefaults(chatId, { thread_name: topicName });
+      if (!isTopicServiceMessage && defaults?.thread_id === topicId && defaults.thread_name) {
+        db.rememberForumTopicName(chatId, topicId, defaults.thread_name, false);
+      }
+      db.rememberForumTopicName(chatId, topicId, topicName, isTopicServiceMessage);
+      const resolvedName = db.getForumTopicName(chatId, topicId);
+      if (
+        isTopicServiceMessage &&
+        resolvedName &&
+        defaults?.thread_id === topicId &&
+        defaults.thread_name !== resolvedName
+      ) {
+        db.upsertGroupDefaults(chatId, { thread_name: resolvedName });
       }
     }
   }
@@ -1266,9 +1280,13 @@ async function checkRecurringTemplates(): Promise<void> {
         startsAt = startDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
       }
 
+      const resolvedThreadId = resolveTemplateThreadId(
+        template.thread_id,
+        db.getGroupDefaults(template.chat_id)?.thread_id
+      );
       const raffle = db.createRaffle({
         chat_id: template.chat_id,
-        thread_id: template.thread_id,
+        thread_id: resolvedThreadId,
         creator_id: template.creator_id,
         creator_name: "Recurring Raffle",
         title: template.title,
@@ -1318,6 +1336,8 @@ async function checkRecurringTemplates(): Promise<void> {
               await bot.api.pinChatMessage(template.chat_id, msgId, { disable_notification: true });
             } catch {}
           }
+        } else {
+          db.deleteRaffle(raffle.id);
         }
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);

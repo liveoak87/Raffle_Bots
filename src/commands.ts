@@ -28,7 +28,7 @@ import {
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
-import { getForumTopicName } from "./forumTopics";
+import { getForumTopicName, resolveTemplateThreadId } from "./forumTopics";
 import { getGroupManagementAccess, isGroupOwner } from "./access";
 import {
   decodeRerunDestination,
@@ -286,8 +286,9 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
 
   const existing = db.getGroupDefaults(chatId);
   const topicName =
-    getForumTopicName(ctx.message) ||
-    (existing?.thread_id === threadId ? existing.thread_name : null);
+    (existing?.thread_id === threadId ? existing.thread_name : null) ||
+    db.getForumTopicName(chatId, threadId) ||
+    getForumTopicName(ctx.message);
   if (!topicName) {
     await replyPrivately(
       ctx,
@@ -298,6 +299,7 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
     return;
   }
 
+  db.rememberForumTopicName(chatId, threadId, topicName);
   db.upsertGroupDefaults(chatId, { thread_id: threadId, thread_name: topicName });
   const wizardUpdate = setActiveWizardDestination(ctx.from.id, chatId, threadId, topicName);
   const groupTitle = ctx.chat.title || db.getBotGroup(chatId)?.title || "this group";
@@ -1607,7 +1609,15 @@ export async function handleRerunCallback(ctx: Context): Promise<void> {
 /** Format template details for preview */
 function formatTemplateSummary(tmpl: ReturnType<typeof db.getTemplateById>): string {
   if (!tmpl) return "Template not found.";
+  const defaults = db.getGroupDefaults(tmpl.chat_id);
+  const resolvedThreadId = resolveTemplateThreadId(tmpl.thread_id, defaults?.thread_id);
+  const destinationName = resolvedThreadId
+    ? db.getForumTopicName(tmpl.chat_id, resolvedThreadId) ||
+      (defaults?.thread_id === resolvedThreadId ? defaults.thread_name : null) ||
+      "Saved raffle topic"
+    : "General";
   let msg = "";
+  msg += `📍 <b>Destination:</b> ${escapeHtml(destinationName)}\n`;
   msg += `📝 <b>Title:</b> ${escapeHtml(tmpl.title)}\n`;
   if (tmpl.description) {
     msg += `📄 <b>Rules:</b> ${escapeHtml(tmpl.description.slice(0, 120))}${tmpl.description.length > 120 ? "..." : ""}\n`;
@@ -1809,9 +1819,11 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       startsAt = startDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
     }
 
+    const groupDefaults = db.getGroupDefaults(chatId);
+    const resolvedThreadId = resolveTemplateThreadId(tmpl.thread_id, groupDefaults?.thread_id);
     const raffle = db.createRaffle({
       chat_id: chatId,
-      thread_id: tmpl.thread_id,
+      thread_id: resolvedThreadId,
       creator_id: ctx.from.id,
       creator_name: displayName,
       title: tmpl.title,
@@ -1853,14 +1865,31 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
       raffle.thread_id
     );
 
-    if (msgId) {
-      db.updateRaffleMessageId(raffle.id, msgId);
-      if (raffle.auto_pin) {
-        try {
-          await ctx.api.pinChatMessage(chatId, msgId, { disable_notification: true });
-        } catch {}
-      }
+    if (!msgId) {
+      db.deleteRaffle(raffle.id);
+      await ctx.reply(
+        `❌ The raffle could not be posted to its saved destination. ` +
+          `Check that the topic is open, or change the group’s raffle topic and try again.`
+      );
+      return;
     }
+
+    db.updateRaffleMessageId(raffle.id, msgId);
+    if (raffle.auto_pin) {
+      try {
+        await ctx.api.pinChatMessage(chatId, msgId, { disable_notification: true });
+      } catch {}
+    }
+
+    const postedDestination = resolvedThreadId
+      ? db.getForumTopicName(chatId, resolvedThreadId) ||
+        (groupDefaults?.thread_id === resolvedThreadId ? groupDefaults.thread_name : null) ||
+        "the saved raffle topic"
+      : "General";
+    await ctx.reply(
+      `✅ Raffle <b>${escapeHtml(raffle.title)}</b> posted to <b>${escapeHtml(postedDestination)}</b>.`,
+      { parse_mode: "HTML" }
+    );
 
     return;
   }

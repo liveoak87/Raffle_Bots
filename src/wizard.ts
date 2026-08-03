@@ -11,6 +11,7 @@ import {
   replyPrivately,
 } from "./helpers";
 import { t } from "./i18n";
+import { getForumTopicName } from "./forumTopics";
 import { sendCustomImage, sendRafflePost } from "./banners";
 import { formatInTimezone } from "./timezone";
 import { canManageGroup } from "./access";
@@ -149,6 +150,9 @@ export async function startWizard(ctx: Context): Promise<void> {
   const groupTitle = ctx.chat!.title || "this group";
   const userId = ctx.from!.id;
   const commandThreadId = ctx.message?.message_thread_id ?? null;
+  const commandThreadName = commandThreadId
+    ? db.getForumTopicName(groupChatId, commandThreadId) || getForumTopicName(ctx.message)
+    : null;
 
   if (!(await canManageGroup(ctx.api, groupChatId, userId))) {
     await replyPrivately(ctx, "You do not have permission to manage raffles in this group.");
@@ -159,7 +163,7 @@ export async function startWizard(ctx: Context): Promise<void> {
     const dmMsg = await ctx.api.sendMessage(
       userId,
       `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-        `📍 Destination: <b>${commandThreadId ? "This topic" : "General"}</b>\n\n` +
+        `📍 Destination: <b>${escapeHtml(commandThreadName || (commandThreadId ? "This topic" : "General"))}</b>\n\n` +
         `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
         `<i>Just type it and send. Or /cancel to stop.</i>`,
       { parse_mode: "HTML" }
@@ -169,7 +173,7 @@ export async function startWizard(ctx: Context): Promise<void> {
       step: "title",
       targetChatId: groupChatId,
       targetThreadId: commandThreadId,
-      targetThreadName: null,
+      targetThreadName: commandThreadName,
       targetChatTitle: groupTitle,
       dmChatId: dmMsg.chat.id,
       userId,
@@ -219,11 +223,14 @@ export async function startRaffleWizardForGroup(
     } catch {}
   }
 
+  const explicitThreadName = targetThreadId
+    ? db.getForumTopicName(groupChatId, targetThreadId)
+    : null;
   const state = applyGroupDefaults({
     step: "title",
     targetChatId: groupChatId,
     targetThreadId: targetThreadId ?? null,
-    targetThreadName: null,
+    targetThreadName: explicitThreadName,
     targetChatTitle: resolvedTitle,
     dmChatId: ctx.chat.id,
     userId: ctx.from.id,

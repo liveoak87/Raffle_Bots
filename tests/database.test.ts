@@ -62,6 +62,14 @@ describe("database optimization helpers", () => {
     });
   });
 
+  it("persists the newest observed forum topic name without reverting to its creation name", () => {
+    db.rememberForumTopicName(-1001, 163, "Raffles");
+    db.rememberForumTopicName(-1001, 163, "Weekly Raffles");
+    db.rememberForumTopicName(-1001, 163, "Raffles", false);
+
+    expect(db.getForumTopicName(-1001, 163)).toBe("Weekly Raffles");
+  });
+
   it("claimDueRecurringTemplates advances due rows once", () => {
     const template = db.createTemplate({
       chat_id: -1001,

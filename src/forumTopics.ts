@@ -32,3 +32,11 @@ export function getForumTopicName(message?: ForumTopicMessage): string | null {
 export function getForumTopicId(message?: ForumTopicMessage): number | null {
   return message?.message_thread_id ?? (message?.forum_topic_created ? message.message_id : null);
 }
+
+/** Explicit template destinations win; otherwise templates follow the group default. */
+export function resolveTemplateThreadId(
+  templateThreadId: number | null | undefined,
+  defaultThreadId: number | null | undefined
+): number | null {
+  return templateThreadId ?? defaultThreadId ?? null;
+}

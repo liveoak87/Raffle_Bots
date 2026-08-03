@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { getForumTopicId, getForumTopicName } from "../src/forumTopics";
+import {
+  getForumTopicId,
+  getForumTopicName,
+  resolveTemplateThreadId,
+} from "../src/forumTopics";
 
 describe("forum topic detection", () => {
   it("reads the topic name attached to a normal command message", () => {
@@ -41,5 +45,11 @@ describe("forum topic detection", () => {
         reply_to_message: {},
       })
     ).toBeNull();
+  });
+
+  it("uses an explicit template destination before the group default", () => {
+    expect(resolveTemplateThreadId(200, 163)).toBe(200);
+    expect(resolveTemplateThreadId(null, 163)).toBe(163);
+    expect(resolveTemplateThreadId(null, null)).toBeNull();
   });
 });

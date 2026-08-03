@@ -28,6 +28,7 @@ import {
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+import { getForumTopicName } from "./forumTopics";
 import { getGroupManagementAccess, isGroupOwner } from "./access";
 import {
   decodeRerunDestination,
@@ -260,7 +261,7 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
   if (ctx.chat.type === "private") {
     await ctx.reply(
       `Open the group, enter the topic where raffles should be posted, then send ` +
-        `<code>/setraffletopic Topic Name</code> inside that topic.`,
+        `<code>/setraffletopic</code> inside that topic.`,
       { parse_mode: "HTML" }
     );
     return;
@@ -277,21 +278,21 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
     await replyPrivately(
       ctx,
       `📍 <b>No topic detected</b>\n\nOpen the desired raffle topic first, then send ` +
-        `<code>/setraffletopic Topic Name</code> inside that topic.`,
+        `<code>/setraffletopic</code> inside that topic.`,
       { parse_mode: "HTML" }
     );
     return;
   }
 
-  const topicName = (ctx.message?.text || "")
-    .replace(/^\/setraffletopic(?:@\w+)?(?:\s+|$)/i, "")
-    .trim();
-  if (!topicName || topicName.length > 128) {
+  const existing = db.getGroupDefaults(chatId);
+  const topicName =
+    getForumTopicName(ctx.message) ||
+    (existing?.thread_id === threadId ? existing.thread_name : null);
+  if (!topicName) {
     await replyPrivately(
       ctx,
-      `📍 <b>Add the topic name</b>\n\nSend the command again inside this topic with its name:\n` +
-        `<code>/setraffletopic Raffles</code>\n\n` +
-        `<i>Use the name you want displayed in Command Central.</i>`,
+      `📍 <b>Topic name not detected</b>\n\nSend <code>/setraffletopic</code> as a new message ` +
+        `inside the topic, rather than as a reply to another message.`,
       { parse_mode: "HTML" }
     );
     return;

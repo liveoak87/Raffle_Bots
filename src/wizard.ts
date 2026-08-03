@@ -1434,8 +1434,7 @@ export function buildDefaultTopicSetupText(
     `Do this once for <b>${escapeHtml(groupTitle)}</b>:\n\n` +
     `1. Open the group.\n` +
     `2. Enter the topic where raffles should always be posted.\n` +
-    `3. Send <code>/setraffletopic Topic Name</code> inside that topic.\n` +
-    `   Example: <code>/setraffletopic Raffles</code>\n\n` +
+    `3. Send <code>/setraffletopic</code> inside that topic.\n\n` +
     `The bot will delete the command, save the topic, and confirm here in DM. ` +
     `Future raffles started from Command Central will use it automatically.${current}`
   );

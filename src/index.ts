@@ -81,6 +81,7 @@ import {
 import type { Raffle } from "./types";
 import { t } from "./i18n";
 import { encodeRerunDestination } from "./rerun";
+import { getForumTopicId, getForumTopicName } from "./forumTopics";
 import {
   handleWizardMessage,
   handleWizardPhoto,
@@ -339,6 +340,21 @@ bot.use(async (ctx, next) => {
       // Update title if it changed
       db.upsertBotGroup(chatId, title, existing.bot_status);
     }
+
+    // Keep a saved default's label current when Telegram sends a topic rename
+    // service message. A normal /setraffletopic command discovers the initial
+    // name from its nested topic-creation service message.
+    const topicName = getForumTopicName(ctx.message);
+    const topicId = getForumTopicId(ctx.message);
+    const isTopicServiceMessage = Boolean(
+      ctx.message?.forum_topic_created || ctx.message?.forum_topic_edited
+    );
+    if (isTopicServiceMessage && topicName && topicId) {
+      const defaults = db.getGroupDefaults(chatId);
+      if (defaults?.thread_id === topicId && defaults.thread_name !== topicName) {
+        db.upsertGroupDefaults(chatId, { thread_name: topicName });
+      }
+    }
   }
 
   const isCommand = ctx.message?.text?.startsWith("/");
@@ -364,7 +380,7 @@ const GROUP_MEMBER_COMMANDS = [
 
 const GROUP_ADMIN_COMMANDS = [
   { command: "newraffle", description: "Start a new raffle wizard" },
-  { command: "setraffletopic", description: "Save this as the default raffle topic" },
+  { command: "setraffletopic", description: "Save this topic as the raffle default" },
   { command: "raffles", description: "View open raffles privately" },
   { command: "draw", description: "Draw raffle winners privately" },
   { command: "templates", description: "Manage raffle templates privately" },

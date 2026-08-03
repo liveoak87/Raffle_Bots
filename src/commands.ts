@@ -23,6 +23,8 @@ import {
   handleStartDeepLink,
   startEditWizard,
   startBugReport,
+  buildDefaultTopicSetupText,
+  setActiveWizardDestination,
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
 import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
@@ -249,6 +251,64 @@ export async function handleNewRaffle(ctx: Context): Promise<void> {
   }
 
   await startWizard(ctx);
+}
+
+// /setraffletopic - Save the current forum topic for future Command Central raffles
+export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
+  if (!ctx.chat || !ctx.from) return;
+
+  if (ctx.chat.type === "private") {
+    await ctx.reply(
+      `Open the group, enter the topic where raffles should be posted, then send ` +
+        `<code>/setraffletopic</code> inside that topic.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const chatId = ctx.chat.id;
+  if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+    await replyPrivately(ctx, "Only group admins can set the default raffle topic.");
+    return;
+  }
+
+  const threadId = ctx.message?.message_thread_id;
+  if (!threadId) {
+    await replyPrivately(
+      ctx,
+      `📍 <b>No topic detected</b>\n\nOpen the desired raffle topic first, then send ` +
+        `<code>/setraffletopic</code> inside that topic.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  db.upsertGroupDefaults(chatId, { thread_id: threadId });
+  const wizardUpdate = setActiveWizardDestination(ctx.from.id, chatId, threadId);
+  const groupTitle = ctx.chat.title || db.getBotGroup(chatId)?.title || "this group";
+  const keyboard = new InlineKeyboard();
+  if (wizardUpdate === "options") {
+    keyboard.text("✅ Continue Current Raffle", "wiz_opt_destination_back").row();
+  }
+  keyboard.text("⚙️ View Group Defaults", `admin_do_defaults_${chatId}`);
+
+  const confirmation =
+    `✅ <b>Default raffle topic saved</b>\n\n` +
+      `<b>${escapeHtml(groupTitle)}</b> will use <b>Topic #${threadId}</b> for new raffles started from Command Central.\n\n` +
+      (wizardUpdate
+        ? `Your current raffle has also been updated to post there.\n\n`
+        : "") +
+      `<i>Sending /newraffle inside another topic will use that topic for that raffle only.</i>`;
+  try {
+    await ctx.api.sendMessage(ctx.from.id, confirmation, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  } catch {
+    // If the admin has not opened the bot's DM yet, keep the group fallback
+    // short and avoid exposing Command Central controls in the topic.
+    await replyPrivately(ctx, confirmation, { parse_mode: "HTML" });
+  }
 }
 
 // /raffles - List open raffles
@@ -3411,6 +3471,7 @@ function formatGroupDefaults(chatId: number): string {
   const d = db.getGroupDefaults(chatId);
   const line = (label: string, value: string) => `  ${label}: <b>${escapeHtml(value)}</b>\n`;
   let msg = `⚙️ <b>Group Raffle Defaults</b>\n\n`;
+  msg += line("Raffle destination", d?.thread_id ? `Topic #${d.thread_id}` : "General (not set)");
   msg += line("Winners", d?.max_winners ? String(d.max_winners) : "ask each time");
   msg += line("Duration", d?.duration_minutes ? formatDurationHuman(d.duration_minutes * 60000) : "ask each time");
   msg += line("Max entries", d?.max_entries ? String(d.max_entries) : "no default");
@@ -3429,6 +3490,7 @@ function formatGroupDefaults(chatId: number): string {
 function buildDefaultsKeyboard(chatId: number): InlineKeyboard {
   const callback = (action: string) => `def_${chatId}_${action}`;
   return new InlineKeyboard()
+    .text("📍 Set Raffle Topic", callback("pick_topic")).text("🧹 Clear Topic", callback("clear_topic")).row()
     .text("🏆 Winners", callback("pick_winners")).text("⏰ Duration", callback("pick_duration")).row()
     .text("👥 Max Entries", callback("pick_max")).row()
     .text("👁 Toggle Hidden", callback("toggle_anon")).text("📌 Toggle Pin", callback("toggle_pin")).row()
@@ -3488,6 +3550,18 @@ export async function handleDefaultsCallback(ctx: Context): Promise<void> {
   }
   if (action === "clear") {
     db.clearGroupDefaults(chatId);
+  } else if (action === "pick_topic") {
+    const group = db.getBotGroup(chatId);
+    await picker(
+      buildDefaultTopicSetupText(group?.title || "this group", current?.thread_id),
+      new InlineKeyboard()
+        .text("🧹 Clear Saved Topic", callback("clear_topic"))
+        .row()
+        .text("⬅️ Back", callback("back"))
+    );
+    return;
+  } else if (action === "clear_topic") {
+    update({ thread_id: null });
   } else if (action === "pick_winners") {
     await picker("🏆 <b>Default winners</b>", new InlineKeyboard()
       .text("Ask", callback("winners_null")).text("1", callback("winners_1")).text("2", callback("winners_2")).row()

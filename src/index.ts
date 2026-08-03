@@ -27,6 +27,7 @@ import {
   handleAdminCallback,
   handleAccessCallback,
   handleNewRaffle,
+  handleSetRaffleTopic,
   handleListRaffles,
   handleDraw,
   handleDrawCallback,
@@ -363,6 +364,7 @@ const GROUP_MEMBER_COMMANDS = [
 
 const GROUP_ADMIN_COMMANDS = [
   { command: "newraffle", description: "Start a new raffle wizard" },
+  { command: "setraffletopic", description: "Save this as the default raffle topic" },
   { command: "raffles", description: "View open raffles privately" },
   { command: "draw", description: "Draw raffle winners privately" },
   { command: "templates", description: "Manage raffle templates privately" },
@@ -444,6 +446,7 @@ bot.command("start", handleStart);
 bot.command("help", handleHelp);
 bot.command("manage", handleManage);
 bot.command("newraffle", handleNewRaffle);
+bot.command("setraffletopic", handleSetRaffleTopic);
 bot.command("raffles", handleListRaffles);
 bot.command("draw", handleDraw);
 bot.command("cancelraffle", handleCancelRaffle);

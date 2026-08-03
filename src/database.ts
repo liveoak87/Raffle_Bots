@@ -137,6 +137,7 @@ export function initDatabase(dbPath: string): Database.Database {
 
     CREATE TABLE IF NOT EXISTS group_defaults (
       chat_id INTEGER PRIMARY KEY,
+      thread_id INTEGER,
       max_entries INTEGER,
       max_winners INTEGER,
       duration_minutes INTEGER,
@@ -354,6 +355,7 @@ function migrateDatabase(): void {
   getDb().exec(`
     CREATE TABLE IF NOT EXISTS group_defaults (
       chat_id INTEGER PRIMARY KEY,
+      thread_id INTEGER,
       max_entries INTEGER,
       max_winners INTEGER,
       duration_minutes INTEGER,
@@ -372,6 +374,15 @@ function migrateDatabase(): void {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  try {
+    const groupDefaultColumns = tableInfo("group_defaults").map((c) => c.name);
+    if (!groupDefaultColumns.includes("thread_id")) {
+      getDb().exec("ALTER TABLE group_defaults ADD COLUMN thread_id INTEGER DEFAULT NULL");
+    }
+  } catch {
+    // Table may not exist yet
+  }
 
   // Create persistent job queue table — survives bot restarts.
   // Used for fire-and-forget background tasks (winner DMs, banner ops, etc.)
@@ -1322,6 +1333,7 @@ export function upsertGroupDefaults(
   const existing = getGroupDefaults(chatId);
   const defaults: Omit<GroupDefaults, "updated_at"> = {
     chat_id: chatId,
+    thread_id: null,
     max_entries: null,
     max_winners: null,
     duration_minutes: null,
@@ -1344,18 +1356,19 @@ export function upsertGroupDefaults(
   getDb()
     .prepare(
       `INSERT INTO group_defaults (
-        chat_id, max_entries, max_winners, duration_minutes, sponsor_name,
+        chat_id, thread_id, max_entries, max_winners, duration_minutes, sponsor_name,
         anonymous, auto_pin, min_account_age_days, require_username,
         winner_cooldown, show_animation, referral_enabled, max_referral_entries,
         revoke_referral_links, required_chat_id, required_chat_title, updated_at
       )
       VALUES (
-        @chat_id, @max_entries, @max_winners, @duration_minutes, @sponsor_name,
+        @chat_id, @thread_id, @max_entries, @max_winners, @duration_minutes, @sponsor_name,
         @anonymous, @auto_pin, @min_account_age_days, @require_username,
         @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries,
         @revoke_referral_links, @required_chat_id, @required_chat_title, datetime('now')
       )
       ON CONFLICT(chat_id) DO UPDATE SET
+        thread_id = excluded.thread_id,
         max_entries = excluded.max_entries,
         max_winners = excluded.max_winners,
         duration_minutes = excluded.duration_minutes,

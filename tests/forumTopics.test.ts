@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getAuthoritativeForumTopicName,
   getForumTopicId,
   getForumTopicName,
   resolveTemplateThreadId,
@@ -26,6 +27,20 @@ describe("forum topic detection", () => {
         forum_topic_edited: { name: "Weekly Raffles" },
       })
     ).toBe("Weekly Raffles");
+  });
+
+  it("does not treat an icon-only edit as a topic-name change", () => {
+    const message = {
+      message_id: 202,
+      message_thread_id: 163,
+      forum_topic_edited: { icon_custom_emoji_id: "emoji-id" },
+      reply_to_message: {
+        forum_topic_created: { name: "Original Name" },
+      },
+    };
+
+    expect(getAuthoritativeForumTopicName(message)).toBeNull();
+    expect(getForumTopicName(message)).toBe("Original Name");
   });
 
   it("uses a topic-create service message ID when no thread ID is present", () => {

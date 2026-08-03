@@ -1,11 +1,11 @@
-interface ForumTopicMessage {
+export interface ForumTopicMessage {
   message_thread_id?: number;
   message_id: number;
   forum_topic_created?: { name: string };
-  forum_topic_edited?: { name?: string };
+  forum_topic_edited?: { name?: string; icon_custom_emoji_id?: string };
   reply_to_message?: {
     forum_topic_created?: { name: string };
-    forum_topic_edited?: { name?: string };
+    forum_topic_edited?: { name?: string; icon_custom_emoji_id?: string };
   };
 }
 
@@ -25,6 +25,14 @@ export function getForumTopicName(message?: ForumTopicMessage): string | null {
     cleanTopicName(message?.forum_topic_created?.name) ||
     cleanTopicName(message?.reply_to_message?.forum_topic_edited?.name) ||
     cleanTopicName(message?.reply_to_message?.forum_topic_created?.name)
+  );
+}
+
+/** A name carried directly by a create/rename event is safe to overwrite in the cache. */
+export function getAuthoritativeForumTopicName(message?: ForumTopicMessage): string | null {
+  return (
+    cleanTopicName(message?.forum_topic_edited?.name) ||
+    cleanTopicName(message?.forum_topic_created?.name)
   );
 }
 

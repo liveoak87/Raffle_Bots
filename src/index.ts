@@ -81,11 +81,9 @@ import {
 import type { Raffle } from "./types";
 import { t } from "./i18n";
 import { encodeRerunDestination } from "./rerun";
-import {
-  getForumTopicId,
-  getForumTopicName,
-  resolveTemplateThreadId,
-} from "./forumTopics";
+import { handleRecurringPostFailure } from "./recurring";
+import { resolveTemplateThreadId } from "./forumTopics";
+import { rememberForumTopicFromMessage } from "./topicCache";
 import {
   handleWizardMessage,
   handleWizardPhoto,
@@ -348,27 +346,7 @@ bot.use(async (ctx, next) => {
     // Keep a saved default's label current when Telegram sends a topic rename
     // service message. A normal /setraffletopic command discovers the initial
     // name from its nested topic-creation service message.
-    const topicName = getForumTopicName(ctx.message);
-    const topicId = getForumTopicId(ctx.message);
-    const isTopicServiceMessage = Boolean(
-      ctx.message?.forum_topic_created || ctx.message?.forum_topic_edited
-    );
-    if (topicName && topicId) {
-      const defaults = db.getGroupDefaults(chatId);
-      if (!isTopicServiceMessage && defaults?.thread_id === topicId && defaults.thread_name) {
-        db.rememberForumTopicName(chatId, topicId, defaults.thread_name, false);
-      }
-      db.rememberForumTopicName(chatId, topicId, topicName, isTopicServiceMessage);
-      const resolvedName = db.getForumTopicName(chatId, topicId);
-      if (
-        isTopicServiceMessage &&
-        resolvedName &&
-        defaults?.thread_id === topicId &&
-        defaults.thread_name !== resolvedName
-      ) {
-        db.upsertGroupDefaults(chatId, { thread_name: resolvedName });
-      }
-    }
+    rememberForumTopicFromMessage(chatId, ctx.message);
   }
 
   const isCommand = ctx.message?.text?.startsWith("/");
@@ -1280,10 +1258,16 @@ async function checkRecurringTemplates(): Promise<void> {
         startsAt = startDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
       }
 
+      const groupDefaults = db.getGroupDefaults(template.chat_id);
       const resolvedThreadId = resolveTemplateThreadId(
         template.thread_id,
-        db.getGroupDefaults(template.chat_id)?.thread_id
+        groupDefaults?.thread_id
       );
+      const resolvedDestinationName = resolvedThreadId
+        ? db.getForumTopicName(template.chat_id, resolvedThreadId) ||
+          (groupDefaults?.thread_id === resolvedThreadId ? groupDefaults.thread_name : null) ||
+          "the saved raffle topic"
+        : "General";
       const raffle = db.createRaffle({
         chat_id: template.chat_id,
         thread_id: resolvedThreadId,
@@ -1313,6 +1297,7 @@ async function checkRecurringTemplates(): Promise<void> {
         revoke_referral_links: template.revoke_referral_links,
       });
 
+      let postSucceeded = false;
       try {
         const recLang = db.getChatLanguage(template.chat_id);
         const botUsername = bot.botInfo.username;
@@ -1328,6 +1313,7 @@ async function checkRecurringTemplates(): Promise<void> {
           raffle.image_file_id,
           raffle.thread_id
         );
+        postSucceeded = Boolean(msgId);
 
         if (msgId) {
           db.updateRaffleMessageId(raffle.id, msgId);
@@ -1337,10 +1323,35 @@ async function checkRecurringTemplates(): Promise<void> {
             } catch {}
           }
         } else {
-          db.deleteRaffle(raffle.id);
+          const notified = await handleRecurringPostFailure(
+            bot.api,
+            template,
+            raffle.id,
+            resolvedDestinationName
+          );
+          console.error(
+            `Recurring raffle post failed for template ${template.id}; template paused` +
+              (notified ? " and creator notified" : "; creator notification failed")
+          );
         }
       } catch (err) {
         console.error(`Failed to post recurring raffle for template ${template.id}:`, err);
+        if (postSucceeded) {
+          console.error(
+            `Recurring raffle ${raffle.id} was posted but final database processing failed; ` +
+              `leaving the template active to avoid deleting a live raffle`
+          );
+          continue;
+        }
+        const notified = await handleRecurringPostFailure(
+          bot.api,
+          template,
+          raffle.id,
+          resolvedDestinationName
+        );
+        if (!notified) {
+          console.error(`Failed to notify creator for paused recurring template ${template.id}`);
+        }
       }
 
       // Next run was claimed before work began, so crashes cannot duplicate this occurrence.

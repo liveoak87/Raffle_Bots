@@ -3504,8 +3504,16 @@ function formatGroupDefaults(chatId: number): string {
 
 function buildDefaultsKeyboard(chatId: number): InlineKeyboard {
   const callback = (action: string) => `def_${chatId}_${action}`;
+  const savedTopicName = db.getGroupDefaults(chatId)?.thread_name?.trim();
+  const topicCharacters = Array.from(savedTopicName || "");
+  const displayedTopicName = topicCharacters.length > 44
+    ? `${topicCharacters.slice(0, 43).join("")}…`
+    : savedTopicName;
+  const topicButtonLabel = displayedTopicName
+    ? `📍 Topic: ${displayedTopicName}`
+    : "📍 Set Raffle Topic";
   return new InlineKeyboard()
-    .text("📍 Set Raffle Topic", callback("pick_topic")).text("🧹 Clear Topic", callback("clear_topic")).row()
+    .text(topicButtonLabel, callback("pick_topic")).text("🧹 Clear Topic", callback("clear_topic")).row()
     .text("🏆 Winners", callback("pick_winners")).text("⏰ Duration", callback("pick_duration")).row()
     .text("👥 Max Entries", callback("pick_max")).row()
     .text("👁 Toggle Hidden", callback("toggle_anon")).text("📌 Toggle Pin", callback("toggle_pin")).row()

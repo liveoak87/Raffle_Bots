@@ -592,6 +592,27 @@ function buildRemoveMenuMessages(raffle, picks) {
   return messages;
 }
 
+function buildRemoveConfirmation(raffle, pick, menuIndex = -1) {
+  const slotNumber = pick.slot_number;
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_remove_${raffle.id}_${slotNumber}_${menuIndex}`)
+      .setLabel(`Remove #${slotNumber}`)
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('\uD83D\uDDD1\uFE0F'),
+    new ButtonBuilder()
+      .setCustomId(`abort_remove_${raffle.id}_${slotNumber}_${menuIndex}`)
+      .setLabel(`Keep #${slotNumber}`)
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return {
+    content: `\u26A0\uFE0F **Remove spot #${slotNumber}?**\n\nThis spot is currently assigned to **${pick.username}**. Confirming will free it for someone else to claim.`,
+    embeds: [],
+    components: [row]
+  };
+}
+
 // Legacy single-message version (kept for small raffles ≤125 claimed)
 function buildRemovePanel(raffle, picks) {
   const claimedPicks = picks.filter(p => p.slot_number >= 1 && p.user_id);
@@ -752,6 +773,7 @@ module.exports = {
   buildRemovePanel,
   buildRemoveHeader,
   buildRemoveMenuMessages,
+  buildRemoveConfirmation,
   buildAdminRow,
   buildAdminPanel,
   buildHelpEmbed,

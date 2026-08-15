@@ -5,7 +5,8 @@ const {
   buildWinnerEmbeds,
   buildWinnerAnnouncementEmbeds,
   buildMentionChunks,
-  getExtensionIndexesForSlots
+  getExtensionIndexesForSlots,
+  buildRemoveConfirmation
 } = require('../src/board');
 
 function embedTextLength(embed) {
@@ -60,4 +61,20 @@ test('winner mentions are unique and split below the message limit', () => {
 test('only overflow messages containing changed slots are targeted', () => {
   assert.deepEqual(getExtensionIndexesForSlots([1, 24]), []);
   assert.deepEqual(getExtensionIndexesForSlots([25, 49, 50, 74, 75, 25]), [0, 1, 2]);
+});
+
+test('remove confirmation identifies the selected spot and requires an explicit choice', () => {
+  const confirmation = buildRemoveConfirmation(
+    { id: 42 },
+    { slot_number: 17, username: 'LuckyUser' },
+    3
+  );
+  const json = confirmation.components[0].toJSON();
+
+  assert.match(confirmation.content, /Remove spot #17\?/);
+  assert.match(confirmation.content, /LuckyUser/);
+  assert.equal(json.components[0].custom_id, 'confirm_remove_42_17_3');
+  assert.equal(json.components[0].label, 'Remove #17');
+  assert.equal(json.components[1].custom_id, 'abort_remove_42_17_3');
+  assert.equal(json.components[1].label, 'Keep #17');
 });

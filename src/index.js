@@ -1,7 +1,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Partials, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
 const db = require('./database');
-const { buildBoardEmbed, buildComponents, buildExtensionComponents, getExtensionIndexesForSlots, buildWinnerEmbeds, buildWinnerAnnouncementEmbeds, buildMentionChunks, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
+const { buildBoardEmbed, buildComponents, buildExtensionComponents, getExtensionIndexesForSlots, buildWinnerEmbeds, buildWinnerAnnouncementEmbeds, buildMentionChunks, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildRemoveConfirmation, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
 const { buildCreateModal, buildRulesModal, parseModalValues } = require('./wizard');
 const { generateBanner, clearBannerCache } = require('./banner');
 const dashboard = require('./dashboard/server');
@@ -99,6 +99,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleMarkAllUnpaid(interaction);
       } else if (id.startsWith('remove_pick_')) {
         await handleRemovePick(interaction);
+      } else if (id.startsWith('confirm_remove_')) {
+        await handleRemoveConfirm(interaction);
+      } else if (id.startsWith('abort_remove_')) {
+        await handleRemoveAbort(interaction);
       } else if (id.startsWith('wizard_add_rules_')) {
         await handleWizardAddRules(interaction);
       } else if (id.startsWith('wizard_lock_')) {
@@ -1666,20 +1670,7 @@ async function handleRemovePick(interaction) {
   }
   if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
-  db.removePick(raffleId, slotNumber);
-  console.log(`[ADMIN] Removed pick — raffle=${raffleId} slot=#${slotNumber}`);
-
-  // Refresh the remove panel
-  const picks = db.getPicks(raffleId);
-  const panel = buildRemovePanel(raffle, picks);
-
-  if (picks.filter(p => p.user_id).length === 0) {
-    await interaction.update({ content: 'All picks have been removed.', embeds: [], components: [] });
-  } else {
-    await interaction.update(panel);
-  }
-
-  queueRaffleUpdate(raffle, [slotNumber]);
+  await showRemoveConfirmation(interaction, raffle, slotNumber, -1);
 }
 
 async function handleRemoveSelect(interaction) {
@@ -1694,25 +1685,99 @@ async function handleRemoveSelect(interaction) {
   }
   if (isDrawLocked(raffleId)) return interaction.reply({ content: 'The draw is in progress.', ephemeral: true });
 
-  db.removePick(raffleId, slotNumber);
-  console.log(`[ADMIN] Removed pick (select) — raffle=${raffleId} slot=#${slotNumber}`);
-
-  // Refresh the menu message that was interacted with
-  const picks = db.getPicks(raffleId);
-  const menuMessages = buildRemoveMenuMessages(raffle, picks);
-
-  // Figure out which message index was clicked based on menuIndex in customId
   const menuIndex = parseInt(parts[3], 10);
+  await showRemoveConfirmation(interaction, raffle, slotNumber, menuIndex);
+}
+
+async function showRemoveConfirmation(interaction, raffle, slotNumber, menuIndex) {
+  const pick = db.getSlot(raffle.id, slotNumber);
+  if (!pick) {
+    return interaction.update({
+      content: `Spot #${slotNumber} is no longer claimed.`,
+      embeds: [],
+      components: []
+    });
+  }
+
+  await interaction.update(buildRemoveConfirmation(raffle, pick, menuIndex));
+}
+
+function parseRemoveConfirmationId(customId) {
+  const parts = customId.split('_');
+  const parsedMenuIndex = parseInt(parts[4], 10);
+  return {
+    raffleId: parseInt(parts[2], 10),
+    slotNumber: parseInt(parts[3], 10),
+    menuIndex: Number.isInteger(parsedMenuIndex) ? parsedMenuIndex : -1
+  };
+}
+
+function buildRemoveMenuUpdate(raffle, picks, menuIndex, content) {
+  if (menuIndex < 0) {
+    const claimedPicks = picks.filter(p => p.user_id);
+    if (claimedPicks.length === 0) {
+      return { content, embeds: [], components: [] };
+    }
+    return { ...buildRemovePanel(raffle, picks), content };
+  }
+
+  const menuMessages = buildRemoveMenuMessages(raffle, picks);
   const msgIndex = Math.floor(menuIndex / 5); // 5 menus per message
 
   if (menuMessages[msgIndex]) {
-    await interaction.update(menuMessages[msgIndex]);
-  } else {
-    // This message has no more picks — clear it
-    await interaction.update({ content: `✅ Removed #${slotNumber}. No more picks in this range.`, components: [] });
+    return { ...menuMessages[msgIndex], content, embeds: [] };
+  }
+  return { content, embeds: [], components: [] };
+}
+
+async function handleRemoveConfirm(interaction) {
+  const { raffleId, slotNumber, menuIndex } = parseRemoveConfirmationId(interaction.customId);
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
+    return interaction.update({
+      content: 'Only the creator can remove picks from an active randomizer.',
+      embeds: [],
+      components: []
+    });
+  }
+  if (isDrawLocked(raffleId)) {
+    return interaction.update({ content: 'The draw is in progress.', embeds: [], components: [] });
   }
 
+  const pick = db.getSlot(raffleId, slotNumber);
+  if (!pick || !db.removePick(raffleId, slotNumber)) {
+    return interaction.update({
+      content: `Spot #${slotNumber} is no longer claimed.`,
+      embeds: [],
+      components: []
+    });
+  }
+
+  console.log(`[ADMIN] Removed pick after confirmation — raffle=${raffleId} slot=#${slotNumber}`);
+  const picks = db.getPicks(raffleId);
+  const receipt = `✅ **Removed spot #${slotNumber}** from **${pick.username}**. The spot is now available.`;
+  await interaction.update(buildRemoveMenuUpdate(raffle, picks, menuIndex, receipt));
+
   queueRaffleUpdate(raffle, [slotNumber]);
+}
+
+async function handleRemoveAbort(interaction) {
+  const { raffleId, slotNumber, menuIndex } = parseRemoveConfirmationId(interaction.customId);
+  const raffle = db.getRaffleById(raffleId);
+  if (!raffle || raffle.status !== 'active' || !isCreator(raffle, interaction.user.id)) {
+    return interaction.update({
+      content: 'Only the creator can manage picks on an active randomizer.',
+      embeds: [],
+      components: []
+    });
+  }
+
+  const pick = db.getSlot(raffleId, slotNumber);
+  const content = pick
+    ? `Spot #${slotNumber} was kept and is still assigned to **${pick.username}**.`
+    : `Spot #${slotNumber} is no longer claimed.`;
+  const picks = db.getPicks(raffleId);
+  await interaction.update(buildRemoveMenuUpdate(raffle, picks, menuIndex, content));
 }
 
 // ── Admin: Assign Spot (step 1 — show user select menu) ─────────────────────

@@ -178,3 +178,60 @@ test('direct assignment acknowledges before a fallback lookup and keeps the user
   assert.deepEqual(events, ['ack', 'lookup', 'edit']);
   assert.equal(db.getSlot(id, 1).username, 'Recipient');
 });
+
+test('button and multi-slot slash picks refresh the correct messages after response failure', async () => {
+  const id = active('pick', 29);
+  const edits = [];
+  client.channels.cache.set('pick', { messages: { edit(message, payload) { edits.push([message, payload]); } } });
+  const reject = async () => { throw new Error('simulated callback failure'); };
+  await dispatch(interaction('button', 'pick_' + id + '_1', {
+    message: { id: 'board' }, channelId: 'pick', deferUpdate: reject
+  }));
+  await dispatch(interaction('command', null, {
+    commandName: 'pick', options: { getString: () => '25,26' }, user: { id: 'second', username: 'second' },
+    channelId: 'pick', reply: reject
+  }));
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.deepEqual(db.getPicks(id).map(p => p.slot_number), [1, 25, 26]);
+  assert.deepEqual(edits.map(([message]) => message).sort(), ['board', 'ext']);
+  const disabled = edits.flatMap(([, payload]) => payload.components.flatMap(row => row.components))
+    .filter(button => button.data.disabled).map(button => button.data.label);
+  assert.deepEqual(disabled.sort(), ['1', '25', '26']);
+});
+
+for (const mode of ['auto', 'manual']) {
+  test(mode + ' draw acknowledges before blocked board edits and waits before selecting winners', async () => {
+    const slot = mode === 'manual' ? 25 : 1;
+    const id = active(mode, Math.max(2, slot));
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const events = [];
+    client.channels.cache.set(mode, {
+      messages: {
+        async edit(message) {
+          if (message === 'ext') throw new Error('overflow message unavailable');
+          events.push('edit');
+          await pending;
+        },
+        delete() {}
+      },
+      send() { events.push('countdown'); return { edit() {} }; }
+    });
+    await dispatch(interaction('button', 'pick_' + id + '_' + slot, { channelId: mode, message: { id: slot === 1 ? 'board' : 'ext' } }));
+    const draw = interaction('button', 'draw_mode_' + mode + '_' + id + '_early', {
+      channelId: mode, update() { events.push('ack'); }
+    });
+    const running = dispatch(draw);
+    await new Promise(resolve => setImmediate(resolve));
+    try {
+      assert.deepEqual(events, ['ack', 'edit']);
+      assert.equal(db.getDrawSession(id).pool, null);
+    } finally {
+      release();
+      await running;
+    }
+    assert.ok(events.includes('countdown'));
+    if (mode === 'auto') assert.equal(db.getRaffleById(id).winner_slot, 1);
+    else assert.equal(db.getDrawSession(id).drawnWinners[0].slot_number, slot);
+  });
+}

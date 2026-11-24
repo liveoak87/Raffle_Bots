@@ -29,12 +29,7 @@ const pendingAssignments = new Map();
 // Key: `${raffleId}_${userId}` → { headerMsgId, followUpIds: [msgId, ...] }
 const paymentPanelSessions = new Map();
 
-const queueRaffleUpdate = createSingleFlightUpdateQueue(async (raffle, slots) => {
-  await Promise.all([
-    updateMainBoard(raffle),
-    updateExtensionMessagesForSlots(raffle, slots)
-  ]);
-}, 250, (err, raffle) => {
+const queueRaffleUpdate = createSingleFlightUpdateQueue(updateBoardMessageFull, 250, (err, raffle) => {
   console.error(`[BOARD] Queued update failed — raffle=${raffle.id}:`, err.message);
 });
 
@@ -531,10 +526,8 @@ async function handlePick(interaction) {
     }
   }
 
-  // Acknowledge the interaction first (3s deadline), then do the slower board
-  // edit. Editing before replying risked a 10062 "Unknown interaction" under load.
-  await interaction.reply({ content: fitMessageContent(results.join('\n')), ephemeral: true });
   if (claimedSlots.length > 0) queueRaffleUpdate(raffle, claimedSlots);
+  await interaction.reply({ content: fitMessageContent(results.join('\n')), ephemeral: true });
 }
 
 // ── Button click handler ─────────────────────────────────────────────────────
@@ -616,14 +609,8 @@ async function handleButtonPick(interaction) {
   }
 
   console.log(`[PICK] Button claimed — user=${username}(${interaction.user.id}) raffle=${raffle.id} slot=#${slotNumber}`);
-  const picks = db.getPicks(raffle.id);
-  console.log(`[PICK] Raffle ${raffle.id} progress: ${picks.length}/${raffle.total_slots} slots filled`);
-
-  // Acknowledge immediately, then route every board edit through the per-raffle
-  // queue. Mixing interaction.update() edits with queued REST edits allowed an
-  // older payload to land last under concurrent picks.
-  await interaction.deferUpdate();
   queueRaffleUpdate(raffle, [slotNumber]);
+  await interaction.deferUpdate();
 }
 
 // ── Modal submit handler ─────────────────────────────────────────────────────
@@ -967,11 +954,11 @@ async function handleDrawModeManual(interaction) {
       return interaction.update(buildAutomaticResumePayload(raffleId));
     }
 
-    await queueRaffleUpdate.flush(raffleId);
     await interaction.update({
       content: started.success ? 'Starting manual draw...' : 'Resuming manual draw...',
       components: []
     });
+    await queueRaffleUpdate.flush(raffleId);
     let session = started.session || db.getDrawSession(raffleId);
     let initializedNow = false;
     const picks = started.picks || db.getPicks(raffleId);
@@ -1205,11 +1192,11 @@ async function runAutomaticDraw(interaction, raffle, drawMode) {
       return interaction.update(buildManualDrawPayload(raffleId, started.session));
     }
 
-    await queueRaffleUpdate.flush(raffleId);
     await interaction.update({
       content: started.success ? 'Drawing winners...' : 'Resuming saved automatic draw...',
       components: []
     });
+    await queueRaffleUpdate.flush(raffleId);
     let session = started.session || db.getDrawSession(raffleId);
     const picks = started.picks || session?.pool || db.getPicks(raffleId);
     if (!session?.pool) {
@@ -2200,10 +2187,12 @@ async function updateBoardMessage(raffle) {
 }
 
 async function updateBoardMessageFull(raffle, slotNumbers = []) {
-  await Promise.all([
+  const results = await Promise.allSettled([
     updateMainBoard(raffle),
     updateExtensionMessagesForSlots(raffle, slotNumbers)
   ]);
+  const failure = results.find(result => result.status === 'rejected');
+  if (failure) throw failure.reason;
 }
 
 // Update just the main board embed + components (no banner)

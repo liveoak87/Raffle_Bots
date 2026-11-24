@@ -40,3 +40,13 @@ test('raffle wizard rejects partial numbers and impossible limits', () => {
   assert.match(parseModalValues(interactionWith({ ...base, num_winners: '1e2' })).error, /winners/);
   assert.match(parseModalValues(interactionWith({ ...base, prize: '   ' })).error, /Prize/);
 });
+
+test('production prize and rule limits survive release upgrades', () => {
+  const { buildCreateModal, buildRulesModal } = require('../src/wizard');
+  const prizeField = buildCreateModal().toJSON().components[0].components[0];
+  const rulesField = buildRulesModal('setup').toJSON().components[0].components[0];
+  assert.equal(prizeField.max_length, 400);
+  assert.equal(rulesField.max_length, 300);
+  const prize = 'A'.repeat(395) + '\nGift';
+  assert.equal(parseModalValues(interactionWith({ prize, slots: '2' })).prize, prize);
+});

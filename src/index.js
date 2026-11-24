@@ -19,7 +19,10 @@ const drawOperations = new Set();
 // Reposts publish multiple Discord messages before atomically switching IDs.
 const repostOperations = new Set();
 
-// Pending assignment sessions (raffleId -> { userId, username })
+// Only creations inherited from a previous process can be cancelled mid-setup.
+const interruptedCreations = new Set(db.getCreatingRaffleIds());
+
+// Assignment menus are independent, including menus opened by the same admin.
 const pendingAssignments = new Map();
 
 // Track donation panel follow-up message IDs so we can update them on toggle/mark-all
@@ -48,10 +51,38 @@ client.once(Events.ClientReady, (c) => {
   if (savedDraws.length > 0) {
     console.warn(`[DRAW] Recovered ${savedDraws.length} persisted draw session(s); creators can resume from Draw Winner.`);
   }
+  recoverInterruptedCreations().catch(err => {
+    console.error('[CREATE] Interrupted board recovery failed:', err.message);
+  });
   recoverPendingDrawPublications().catch(err => {
     console.error('[DRAW] Pending publication recovery failed:', err.message);
   });
 });
+
+async function recoverInterruptedCreations() {
+  for (const raffleId of interruptedCreations) {
+    const raffle = db.getRaffleById(raffleId);
+    if (!raffle || raffle.status !== 'creating' || !raffle.message_id) continue;
+    try {
+      const extensions = db.getExtensionMessages(raffleId);
+      if (extensions.length !== buildExtensionComponents(raffle, []).length) continue;
+      const channel = await client.channels.fetch(raffle.channel_id);
+      for (const id of [raffle.message_id, ...extensions]) {
+        const message = await channel.messages.fetch({ message: id, force: true });
+        if (message.author.id !== client.user.id) throw new Error('Unexpected board message author');
+      }
+      if (db.activateRaffle(raffleId)) interruptedCreations.delete(raffleId);
+    } catch (err) {
+      console.warn(`[CREATE] Could not verify interrupted board — raffle=${raffleId}:`, err.message);
+    }
+  }
+}
+
+function existingBoardMessage(raffle) {
+  if (raffle.status === 'active') return 'There is already an active randomizer in this channel. Cancel or draw it first.';
+  if (interruptedCreations.has(raffle.id)) return 'Board setup was interrupted. The creator can clear it with `/randomizer cancel` and start again.';
+  return 'A board is being posted in this channel. Please wait for setup to finish.';
+}
 
 // ── Event Router ─────────────────────────────────────────────────────────────
 
@@ -203,10 +234,10 @@ async function handleRandomizer(interaction) {
   const sub = interaction.options.getSubcommand();
 
   if (sub === 'create') {
-    const existing = db.getActiveRaffle(interaction.channelId);
+    const existing = db.getCreatingOrActiveRaffle(interaction.channelId);
     if (existing) {
       return interaction.reply({
-        content: 'There is already an active randomizer in this channel. Cancel or draw it first.',
+        content: existingBoardMessage(existing),
         ephemeral: true
       });
     }
@@ -279,13 +310,16 @@ async function handleDraw(interaction) {
 // ── Cancel ───────────────────────────────────────────────────────────────────
 
 async function handleCancel(interaction) {
-  const raffle = db.getActiveRaffle(interaction.channelId);
+  const raffle = db.getCreatingOrActiveRaffle(interaction.channelId);
   if (!raffle) {
     return interaction.reply({ content: 'No active randomizer in this channel.', ephemeral: true });
   }
 
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.reply({ content: 'Only the creator can cancel this randomizer.', ephemeral: true });
+  }
+  if (raffle.status === 'creating' && !interruptedCreations.has(raffle.id)) {
+    return interaction.reply({ content: existingBoardMessage(raffle), ephemeral: true });
   }
   if (isDrawLocked(raffle.id)) {
     return interaction.reply({ content: 'The draw is in progress; this randomizer cannot be cancelled.', ephemeral: true });
@@ -304,7 +338,7 @@ async function showCancelConfirmation(interaction, raffle) {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`confirm_cancel_${raffle.id}`)
+      .setCustomId(`confirm_cancel_${raffle.id}${raffle.status === 'creating' ? '_setup' : ''}`)
       .setLabel('Yes, Cancel It')
       .setStyle(ButtonStyle.Danger)
       .setEmoji('⚠️'),
@@ -325,26 +359,19 @@ async function showCancelConfirmation(interaction, raffle) {
 // Actually perform the cancel (called after confirmation)
 async function performCancel(raffle, byUserId) {
   console.log(`[ADMIN] Cancelling raffle — id=${raffle.id} by=${byUserId}`);
-  if (!db.cancelRaffle(raffle.id)) return false;
+  if (!db.cancelRaffle(raffle.id, raffle.status)) return false;
+  interruptedCreations.delete(raffle.id);
   clearBannerCache(raffle.id);
 
   try {
     const channel = await client.channels.fetch(raffle.channel_id);
     if (channel) {
-      try {
-        const boardMsg = await channel.messages.fetch(raffle.message_id);
-        if (boardMsg) await boardMsg.delete();
-      } catch (err) {
-        console.warn(`[ADMIN] Cancel: board message already gone — raffle=${raffle.id}:`, err.message);
-      }
-
-      const extIds = db.getExtensionMessages(raffle.id);
-      for (const extId of extIds) {
+      const messageIds = [raffle.message_id, ...db.getExtensionMessages(raffle.id)].filter(Boolean);
+      for (const id of messageIds) {
         try {
-          const extMsg = await channel.messages.fetch(extId);
-          if (extMsg) await extMsg.delete();
+          await channel.messages.delete(id);
         } catch (err) {
-          console.warn(`[ADMIN] Cancel: extension already gone — ext=${extId}:`, err.message);
+          console.warn(`[ADMIN] Cancel: could not remove message ${id} — raffle=${raffle.id}:`, err.message);
         }
       }
 
@@ -362,8 +389,9 @@ async function performCancel(raffle, byUserId) {
 async function handleCancelConfirm(interaction) {
   const raffleId = parseInt(interaction.customId.replace('confirm_cancel_', ''), 10);
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle || raffle.status !== 'active') {
-    return interaction.update({ content: 'This randomizer is no longer active.', components: [] });
+  const expectedStatus = interaction.customId.endsWith('_setup') ? 'creating' : 'active';
+  if (!raffle || raffle.status !== expectedStatus || (expectedStatus === 'creating' && !interruptedCreations.has(raffleId))) {
+    return interaction.update({ content: 'This randomizer changed. Open the cancel command again if needed.', components: [] });
   }
   if (!isCreator(raffle, interaction.user.id)) {
     return interaction.update({ content: 'Only the creator can cancel this randomizer.', components: [] });
@@ -766,7 +794,7 @@ async function createRaffleFromPending(interaction, pending, rules) {
   if (alreadyActive) {
     console.log(`[CREATE] Aborted — channel already has active raffle ${alreadyActive.id} (channel=${pending.channelId})`);
     try {
-      const msg = { content: 'There is already an active randomizer in this channel. Cancel or draw it first.', components: [], embeds: [] };
+      const msg = { content: existingBoardMessage(alreadyActive), components: [], embeds: [] };
       if (interaction.replied || interaction.deferred) await interaction.editReply(msg);
       else await interaction.reply({ ...msg, ephemeral: true });
     } catch (_) { /* ephemeral cleanup */ }
@@ -783,14 +811,10 @@ async function createRaffleFromPending(interaction, pending, rules) {
     pending.userId,
     maxPicksPerUser,
     rules,
-    numWinners || 1
+    numWinners || 1,
+    pending.assignOnly
   );
   console.log('[CREATE] Raffle created, ID:', raffleId);
-
-  // Apply lock mode if set in wizard
-  if (pending.assignOnly) {
-    db.toggleAssignOnly(raffleId);
-  }
 
   const raffle = db.getRaffleById(raffleId);
   const picks = [];
@@ -806,6 +830,7 @@ async function createRaffleFromPending(interaction, pending, rules) {
     channel = await client.channels.fetch(pending.channelId);
     const msg = await channel.send({ embeds: [embed], components, files: [attachment] });
     postedIds.push(msg.id);
+    db.setRaffleMessage(raffleId, msg.id);
 
     const extIds = [];
     const extMessageSets = buildExtensionComponents(raffle, picks);
@@ -813,9 +838,10 @@ async function createRaffleFromPending(interaction, pending, rules) {
       const extMsg = await channel.send({ components: extMessageSets[ei] });
       extIds.push(extMsg.id);
       postedIds.push(extMsg.id);
+      if (!db.replaceRaffleMessages(raffleId, msg.id, extIds)) throw new Error('Could not save board messages');
     }
 
-    if (!db.replaceRaffleMessages(raffleId, msg.id, extIds) || !db.activateRaffle(raffleId)) {
+    if (!db.activateRaffle(raffleId)) {
       throw new Error('Could not activate the new randomizer');
     }
     console.log(`[CREATE] Board activated — raffle=${raffleId} message=${msg.id} extensions=${extIds.length}`);

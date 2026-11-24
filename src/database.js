@@ -122,12 +122,12 @@ function hydrateDrawSession(row) {
 // ── Queries ──────────────────────────────────────────────────────────────────
 
 module.exports = {
-  createRaffle(guildId, channelId, prize, price, totalSlots, createdBy, maxPicksPerUser = 0, rules = null, numWinners = 1) {
+  createRaffle(guildId, channelId, prize, price, totalSlots, createdBy, maxPicksPerUser = 0, rules = null, numWinners = 1, assignOnly = false) {
     const stmt = db.prepare(`
-      INSERT INTO raffles (guild_id, channel_id, prize, price, total_slots, status, created_by, max_picks_per_user, rules, num_winners)
-      VALUES (?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?)
+      INSERT INTO raffles (guild_id, channel_id, prize, price, total_slots, status, created_by, max_picks_per_user, rules, num_winners, assign_only)
+      VALUES (?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?)
     `);
-    const id = stmt.run(guildId, channelId, prize, price, totalSlots, createdBy, maxPicksPerUser, rules, numWinners).lastInsertRowid;
+    const id = stmt.run(guildId, channelId, prize, price, totalSlots, createdBy, maxPicksPerUser, rules, numWinners, Number(Boolean(assignOnly))).lastInsertRowid;
     console.log(`[DB] Raffle created — id=${id} guild=${guildId} channel=${channelId} slots=${totalSlots} winners=${numWinners}`);
     return id;
   },
@@ -136,6 +136,10 @@ module.exports = {
     return db.prepare(
       "SELECT * FROM raffles WHERE channel_id = ? AND status = 'active'"
     ).get(channelId);
+  },
+
+  getCreatingRaffleIds() {
+    return db.prepare("SELECT id FROM raffles WHERE status = 'creating'").pluck().all();
   },
 
   getCreatingOrActiveRaffle(channelId) {
@@ -474,10 +478,10 @@ module.exports = {
     return true;
   },
 
-  cancelRaffle(raffleId) {
+  cancelRaffle(raffleId, expectedStatus = null) {
     const info = db.prepare(
-      "UPDATE raffles SET status = 'cancelled' WHERE id = ? AND status IN ('creating', 'active') AND NOT EXISTS (SELECT 1 FROM draw_sessions WHERE raffle_id = ?)"
-    ).run(raffleId, raffleId);
+      "UPDATE raffles SET status = 'cancelled' WHERE id = ? AND status IN ('creating', 'active') AND status = COALESCE(?, status) AND NOT EXISTS (SELECT 1 FROM draw_sessions WHERE raffle_id = ?)"
+    ).run(raffleId, expectedStatus, raffleId);
     if (info.changes === 1) console.log(`[DB] Raffle cancelled — id=${raffleId}`);
     return info.changes === 1;
   },

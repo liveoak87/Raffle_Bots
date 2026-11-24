@@ -1836,6 +1836,24 @@ async function handleAdminAssign(interaction) {
 
 // ── Admin: Assign Spot (step 2 — user selected, show available slots) ───────
 
+async function assignmentDisplayName(interaction, user, guildId) {
+  const member = interaction.members.get(user.id) || interaction.guild?.members.cache.get(user.id);
+  if (member) return member.displayName || member.nick || user.displayName || user.username;
+
+  await interaction.deferUpdate();
+  try {
+    const guild = interaction.guild || await client.guilds.fetch(guildId);
+    return (await guild.members.fetch(user.id)).displayName;
+  } catch (err) {
+    console.warn(`[ASSIGN] Member lookup failed — user=${user.id}:`, err.message);
+    return user.displayName || user.username;
+  }
+}
+
+function updateAssignmentMenu(interaction, payload) {
+  return interaction.deferred ? interaction.editReply(payload) : interaction.update(payload);
+}
+
 async function handleAssignUserSelect(interaction) {
   const raffleId = parseInt(interaction.customId.replace('assign_user_', ''), 10);
   const raffle = db.getRaffleById(raffleId);
@@ -1852,26 +1870,8 @@ async function handleAssignUserSelect(interaction) {
     return interaction.reply({ content: 'No user selected.', ephemeral: true });
   }
 
-  // Get the member's display name from the guild
-  let displayName = selectedUser.username;
-  try {
-    const guild = await client.guilds.fetch(raffle.guild_id);
-    const member = await guild.members.fetch(selectedUser.id);
-    displayName = member.displayName || selectedUser.username;
-  } catch (_) { /* fallback to username */ }
-
-  // Store the pending assignment
-  const assignment = {
-    userId: selectedUser.id,
-    username: displayName,
-    adminId: interaction.user.id
-  };
-  pendingAssignments.set(raffleId, assignment);
-
-  // Auto-expire after 60 minutes
-  setTimeout(() => {
-    if (pendingAssignments.get(raffleId) === assignment) pendingAssignments.delete(raffleId);
-  }, 60 * 60 * 1000).unref?.();
+  const displayName = await assignmentDisplayName(interaction, selectedUser, raffle.guild_id);
+  const messageId = interaction.message.id;
 
   // Build available slots dropdown(s)
   const picks = db.getPicks(raffleId);
@@ -1884,8 +1884,7 @@ async function handleAssignUserSelect(interaction) {
   }
 
   if (available.length === 0) {
-    pendingAssignments.delete(raffleId);
-    return interaction.update({ content: 'All spots are taken — no available slots to assign.', components: [] });
+    return updateAssignmentMenu(interaction, { content: 'All spots are taken — no available slots to assign.', components: [] });
   }
 
   // Split available slots into select menus (max 25 options each, max 5 menus)
@@ -1899,7 +1898,7 @@ async function handleAssignUserSelect(interaction) {
       : `#${chunk[0]}`;
 
     const menu = new StringSelectMenuBuilder()
-      .setCustomId(`assign_slot_select_${raffleId}_${menuIndex}`)
+      .setCustomId(`assign_slot_select_${raffleId}_${menuIndex}_${selectedUser.id}`)
       .setPlaceholder(`Pick a slot — ${rangeLabel}`)
       .addOptions(
         chunk.map(slot => ({
@@ -1912,7 +1911,13 @@ async function handleAssignUserSelect(interaction) {
     rows.push(new ActionRowBuilder().addComponents(menu));
   }
 
-  await interaction.update({
+  const assignment = { raffleId, userId: selectedUser.id, username: displayName, adminId: interaction.user.id };
+  pendingAssignments.set(messageId, assignment);
+  setTimeout(() => {
+    if (pendingAssignments.get(messageId) === assignment) pendingAssignments.delete(messageId);
+  }, 60 * 60 * 1000).unref?.();
+
+  await updateAssignmentMenu(interaction, {
     content: `**Step 2:** Assigning to **${displayName}** — select a spot:`,
     components: rows
   });
@@ -1922,7 +1927,7 @@ async function handleAssignUserSelect(interaction) {
 
 async function handleAssignSlotConfirm(interaction) {
   const parts = interaction.customId.split('_');
-  // assign_slot_select_{raffleId}_{menuIndex}
+  // assign_slot_select_{raffleId}_{menuIndex}_{userId}
   const raffleId = parseInt(parts[3], 10);
   const slotNumber = parseInt(interaction.values[0], 10);
 
@@ -1934,8 +1939,8 @@ async function handleAssignSlotConfirm(interaction) {
     return interaction.update({ content: 'This assignment can no longer be completed.', components: [] });
   }
 
-  const assignment = pendingAssignments.get(raffleId);
-  if (!assignment) {
+  const assignment = pendingAssignments.get(interaction.message.id);
+  if (!assignment || assignment.raffleId !== raffleId || assignment.userId !== parts[5]) {
     return interaction.update({ content: 'Assignment session expired. Please start over.', components: [] });
   }
   if (assignment.adminId !== interaction.user.id) {
@@ -1945,19 +1950,17 @@ async function handleAssignSlotConfirm(interaction) {
   // Perform the pick (bypass max_picks limit for admin assignment)
   const result = db.pickSlot(raffle.id, slotNumber, assignment.userId, assignment.username);
 
-  pendingAssignments.delete(raffleId);
+  pendingAssignments.delete(interaction.message.id);
 
   if (!result) {
     return interaction.update({ content: `Spot #${slotNumber} is already taken.`, components: [] });
   }
 
+  queueRaffleUpdate(raffle, [slotNumber]);
   await interaction.update({
     content: `\u2705 **Assigned spot #${slotNumber}** to **${assignment.username}**`,
     components: []
   });
-
-  // Update the board
-  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Admin: Direct assign (click number → pick member → done) ────────────────
@@ -1981,26 +1984,19 @@ async function handleAssignDirect(interaction) {
     return interaction.update({ content: 'No user selected.', components: [] });
   }
 
-  // Get display name from guild
-  let displayName = selectedUser.username;
-  try {
-    const guild = await client.guilds.fetch(raffle.guild_id);
-    const member = await guild.members.fetch(selectedUser.id);
-    displayName = member.displayName || selectedUser.username;
-  } catch (err) {
-    console.warn(`[ASSIGN] Failed to fetch guild member display name — user=${selectedUser.id}:`, err.message);
-  }
+  const displayName = await assignmentDisplayName(interaction, selectedUser, raffle.guild_id);
 
   // Assign the slot
   const result = db.pickSlot(raffle.id, slotNumber, selectedUser.id, displayName);
 
   if (!result) {
     console.log(`[ASSIGN] Direct assign failed (taken) — raffle=${raffle.id} slot=#${slotNumber}`);
-    return interaction.update({ content: `Spot #${slotNumber} is already taken.`, components: [] });
+    return updateAssignmentMenu(interaction, { content: `Spot #${slotNumber} is already taken.`, components: [] });
   }
   console.log(`[ASSIGN] Direct assign success — raffle=${raffle.id} slot=#${slotNumber} user=${displayName}(${selectedUser.id})`);
 
-  await interaction.update({
+  queueRaffleUpdate(raffle, [slotNumber]);
+  await updateAssignmentMenu(interaction, {
     content: `\u2705 **Spot #${slotNumber}** assigned to **${displayName}**`,
     components: []
   });
@@ -2011,9 +2007,6 @@ async function handleAssignDirect(interaction) {
       await interaction.deleteReply();
     } catch (_) { /* already dismissed */ }
   }, 3000);
-
-  // Update the board
-  queueRaffleUpdate(raffle, [slotNumber]);
 }
 
 // ── Admin: Lock/Unlock board toggle ─────────────────────────────────────────

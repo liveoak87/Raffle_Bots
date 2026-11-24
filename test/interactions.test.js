@@ -137,3 +137,44 @@ test('wizard checkpoints every posted message with the chosen settings before ac
   assert.deepEqual([raffle.prize, raffle.rules, raffle.price, raffle.max_picks_per_user, raffle.num_winners, raffle.assign_only],
     ['First\nSecond', 'Custom rules', '$5', 2, 2, 1]);
 });
+
+test('independent menus assign the displayed member once, using the supplied nickname', async t => {
+  const id = active('assign');
+  const lookup = t.mock.method(client.guilds, 'fetch', () => { throw new Error('unexpected lookup'); });
+  const menus = [];
+  for (const userId of ['alice', 'bob']) {
+    const user = interaction('user', 'assign_user_' + id, {
+      users: { first: () => ({ id: userId, username: userId }) },
+      members: new Map([[userId, { nick: userId + ' nick' }]]), message: { id: userId + '-menu' }
+    });
+    await dispatch(user);
+    menus.push(user.response.components[0].components[0].data.custom_id);
+  }
+  assert.equal(lookup.mock.callCount(), 0);
+  const click = (customId, message, slot, admin = 'owner') => interaction('slot', customId, {
+    user: { id: admin }, message: { id: message }, values: [String(slot)]
+  });
+  await dispatch(click(menus[0], 'bob-menu', 1));
+  await dispatch(click(menus[0], 'alice-menu', 1, 'other'));
+  assert.equal(db.getPicks(id).length, 0);
+  await dispatch(click(menus[0], 'alice-menu', 1));
+  await dispatch(click(menus[0], 'alice-menu', 2));
+  await dispatch(click(menus[1], 'bob-menu', 2));
+  assert.deepEqual(db.getPicks(id).map(p => [p.user_id, p.username]), [['alice', 'alice nick'], ['bob', 'bob nick']]);
+  client.channels.cache.set('assign', { messages: { edit() {} } });
+});
+
+test('direct assignment acknowledges before a fallback lookup and keeps the username when the lookup fails', async t => {
+  const id = active('direct');
+  const events = [];
+  t.mock.method(client.guilds, 'fetch', async () => { events.push('lookup'); throw new Error('offline'); });
+  const select = interaction('user', 'assign_direct_' + id + '_1', {
+    members: new Map(), users: { first: () => ({ id: 'recipient', username: 'Recipient' }) },
+    deferUpdate() { this.deferred = true; events.push('ack'); },
+    editReply() { events.push('edit'); }, deleteReply() {}
+  });
+  client.channels.cache.set('direct', { messages: { edit() {} } });
+  await dispatch(select);
+  assert.deepEqual(events, ['ack', 'lookup', 'edit']);
+  assert.equal(db.getSlot(id, 1).username, 'Recipient');
+});

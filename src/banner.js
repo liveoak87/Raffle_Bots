@@ -90,8 +90,17 @@ async function generateBanner(prize, raffleId = null) {
 
   // ── Prize text ───────────────────────────────────────────────────────────
   ctx.fillStyle = '#CCCCCC';
-  ctx.font = '22px sans-serif';
-  const prizeText = prize.length > 50 ? prize.substring(0, 47) + '...' : prize;
+  ctx.font = '22px sans-serif, "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Emoji"';
+  let prizeText = prize.split(/[\r\n]/, 1)[0];
+  const maxTextWidth = width - 100;
+  if (prizeText.length > 50 || ctx.measureText(prizeText).width > maxTextWidth) {
+    const characters = Array.from(prizeText);
+    do {
+      characters.pop();
+      prizeText = characters.join('');
+    } while (characters.length && (prizeText.length > 47 || ctx.measureText(prizeText + '...').width > maxTextWidth));
+    prizeText += '...';
+  }
   ctx.fillText(prizeText, width / 2, 140);
 
   // ── Encode to PNG buffer ─────────────────────────────────────────────────

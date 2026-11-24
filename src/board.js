@@ -43,6 +43,22 @@ function getStatusTitle(status) {
   }
 }
 
+function buildTextFields(name, lines, inline = false) {
+  const fields = [];
+  let value = '';
+  for (const line of lines) {
+    if (value && value.length + line.length + 1 > 1024) {
+      fields.push({ name: fields.length ? `${name} (continued)` : name, value, inline });
+      value = '';
+    }
+    value += (value ? '\n' : '') + line;
+  }
+  if (value) {
+    fields.push({ name: fields.length ? `${name} (continued)` : name, value, inline });
+  }
+  return fields;
+}
+
 // ── Board Embed ──────────────────────────────────────────────────────────────
 
 function buildBoardEmbed(raffle, picks) {
@@ -83,10 +99,14 @@ function buildBoardEmbed(raffle, picks) {
   desc += '\u2501'.repeat(28);
   embed.setDescription(desc);
 
+  if (status === 'open') {
+    embed.setFooter({ text: '\uD83D\uDFE2 Available  \uD83D\uDD34 Claimed  \u2B50 Donated  \u2502  Use buttons or /pick to claim a spot' });
+  } else if (status === 'closed') {
+    embed.setFooter({ text: 'All spots have been claimed!' });
+  }
+
   // Number grid — split into columns (max 1024 chars per embed field)
   const pad = raffle.total_slots >= 100 ? 3 : (raffle.total_slots >= 10 ? 2 : 1);
-  // Truncate usernames in grid to keep fields under 1024 chars
-  const maxNameLen = raffle.total_slots > 60 ? 10 : 14;
 
   let columns;
   if (raffle.total_slots <= 20) {
@@ -99,6 +119,9 @@ function buildBoardEmbed(raffle, picks) {
 
   const perCol = Math.ceil(raffle.total_slots / columns);
   const cols = Array.from({ length: columns }, () => '');
+  // Reserve each row's icon, number and spacing, plus the field names.
+  const nameBudget = Math.floor((6000 - embed.length - columns) / raffle.total_slots) - (pad + 8);
+  const maxNameLen = Math.min(raffle.total_slots > 60 ? 10 : 14, nameBudget);
 
   for (let i = 1; i <= raffle.total_slots; i++) {
     const colIdx = Math.floor((i - 1) / perCol);
@@ -119,7 +142,7 @@ function buildBoardEmbed(raffle, picks) {
 
     // Truncate long names to stay under field char limit
     if (name.length > maxNameLen) {
-      name = name.substring(0, maxNameLen - 1) + '\u2026';
+      name = name.substring(0, maxNameLen - 1).replace(/[\uD800-\uDBFF]$/, '') + '\u2026';
     }
 
     cols[colIdx] += `${indicator} \`${num}.\` ${name}\n`;
@@ -132,13 +155,6 @@ function buildBoardEmbed(raffle, picks) {
       value: cols[c] || '\u200b',
       inline: true
     });
-  }
-
-  // Footer
-  if (status === 'open') {
-    embed.setFooter({ text: '\uD83D\uDFE2 Available  \uD83D\uDD34 Claimed  \u2B50 Donated  \u2502  Use buttons or /pick to claim a spot' });
-  } else if (status === 'closed') {
-    embed.setFooter({ text: 'All spots have been claimed!' });
   }
 
   embed.setImage('attachment://banner.png');
@@ -452,7 +468,8 @@ function buildWinnerEmbeds(raffle, picks, winners) {
     `**${getOrdinal(i + 1)}:** #${w.slot_number} \u2014 <@${w.user_id}> (${w.username})`
   );
 
-  const available = Math.max(80, Math.min(1024, 6000 - getEmbedTextLength(embed) - fieldName.length - 20));
+  const available = Math.min(1024, 6000 - getEmbedTextLength(embed) - fieldName.length);
+  if (available < 80) return [embed];
   let summary = '';
   let shown = 0;
   for (const line of winnerLines) {
@@ -523,13 +540,13 @@ function buildSettingsEmbed(raffle, picks) {
     : settingsPrizes.map((p, i) => `${i + 1}. ${p}`).join('\n');
 
   embed.addFields(
-      { name: settingsPrizes.length > 1 ? 'Prizes' : 'Prize', value: prizeDisplay, inline: settingsPrizes.length <= 1 },
+      ...buildTextFields(settingsPrizes.length > 1 ? 'Prizes' : 'Prize', prizeDisplay.split('\n'), settingsPrizes.length <= 1 && prizeDisplay.length <= 100),
       { name: 'Spots', value: `${picks.length}/${raffle.total_slots}`, inline: true },
       { name: 'Status', value: status.toUpperCase(), inline: true },
       { name: 'Donation', value: raffle.price || 'Free', inline: true },
       { name: 'Max Picks/Person', value: raffle.max_picks_per_user > 0 ? String(raffle.max_picks_per_user) : 'Unlimited', inline: true },
       { name: 'Winners', value: String(raffle.num_winners || 1), inline: true },
-      { name: 'Rules', value: raffle.rules || 'None', inline: true },
+      { name: 'Rules', value: raffle.rules || 'None', inline: (raffle.rules || '').length <= 100 },
       { name: 'Created By', value: `<@${raffle.created_by}>`, inline: true }
     );
 

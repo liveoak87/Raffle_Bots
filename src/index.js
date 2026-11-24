@@ -2,7 +2,7 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, Events, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Partials, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
 const db = require('./database');
 const { buildBoardEmbed, buildComponents, buildExtensionComponents, getExtensionIndexesForSlots, buildWinnerEmbeds, buildWinnerAnnouncementEmbeds, buildMentionChunks, buildSettingsEmbed, buildPaymentPanel, buildPaymentHeader, buildPaymentSlotMessages, buildRemovePanel, buildRemoveHeader, buildRemoveMenuMessages, buildRemoveConfirmation, buildAdminPanel, buildHelpEmbed, buildSetupGuideEmbed } = require('./board');
-const { buildCreateModal, buildRulesModal, parseModalValues } = require('./wizard');
+const { buildCreateModal, buildRulesModal, parseModalValues, MAX_RULES_LENGTH } = require('./wizard');
 const { generateBanner, clearBannerCache } = require('./banner');
 const dashboard = require('./dashboard/server');
 const { cryptoShuffle } = require('./random');
@@ -763,8 +763,11 @@ async function handleRulesModalSubmit(interaction) {
     return interaction.reply({ content: 'This setup has expired. Please run `/randomizer create` again.', ephemeral: true });
   }
 
-  pendingRaffles.delete(pendingKey);
   const rules = interaction.fields.getTextInputValue('rules')?.trim() || null;
+  if (rules && rules.length > MAX_RULES_LENGTH) {
+    return interaction.reply({ content: `Rules must be ${MAX_RULES_LENGTH} characters or fewer.`, ephemeral: true });
+  }
+  pendingRaffles.delete(pendingKey);
   await interaction.deferReply({ ephemeral: true });
   await createRaffleFromPending(interaction, pending, rules);
 }

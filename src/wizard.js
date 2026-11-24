@@ -5,6 +5,9 @@ const {
   ActionRowBuilder
 } = require('discord.js');
 
+const MAX_PRIZE_LENGTH = 400;
+const MAX_RULES_LENGTH = 300;
+
 // ── Main settings modal ─────────────────────────────────────────────────────
 
 function buildCreateModal() {
@@ -14,11 +17,11 @@ function buildCreateModal() {
 
   const prizeInput = new TextInputBuilder()
     .setCustomId('prize')
-    .setLabel('Prize(s) — separate multiple with commas')
+    .setLabel('Prize(s) — commas or new lines (400 max)')
     .setPlaceholder('PS5 Bundle  or  PS5, Gift Card, T-Shirt')
-    .setStyle(TextInputStyle.Short)
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
-    .setMaxLength(200);
+    .setMaxLength(MAX_PRIZE_LENGTH);
 
   const slotsInput = new TextInputBuilder()
     .setCustomId('slots')
@@ -72,11 +75,11 @@ function buildRulesModal(pendingKey) {
 
   const rulesInput = new TextInputBuilder()
     .setCustomId('rules')
-    .setLabel('Rules / Restrictions')
+    .setLabel('Rules / Restrictions (300 max)')
     .setPlaceholder('Must be 18+, one entry per household, etc.')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
-    .setMaxLength(200);
+    .setMaxLength(MAX_RULES_LENGTH);
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(rulesInput)
@@ -93,6 +96,10 @@ function parseModalValues(interaction) {
   const price = interaction.fields.getTextInputValue('price')?.trim() || null;
   const maxPicksRaw = interaction.fields.getTextInputValue('max_picks')?.trim() || '0';
   const numWinnersRaw = interaction.fields.getTextInputValue('num_winners')?.trim() || '1';
+
+  if (prizeRaw.length > MAX_PRIZE_LENGTH) {
+    return { error: `Prizes must be ${MAX_PRIZE_LENGTH} characters or fewer.` };
+  }
 
   if (!prizeRaw) {
     return { error: 'Prize is required.' };
@@ -116,11 +123,14 @@ function parseModalValues(interaction) {
     return { error: `Number of winners (${numWinners}) can't exceed total spots (${totalSlots}).` };
   }
 
-  // Normalize comma-separated prizes to newline-separated for storage
-  const prizes = prizeRaw.split(',').map(p => p.trim()).filter(Boolean);
+  // Normalize comma-separated or multiline prizes to one prize per line.
+  const prizes = prizeRaw.split(/[,\r\n]/).map(p => p.trim()).filter(Boolean);
+  if (prizes.length === 0) {
+    return { error: 'Enter at least one prize.' };
+  }
   const prize = prizes.join('\n');
 
   return { prize, totalSlots, price, maxPicksPerUser, numWinners };
 }
 
-module.exports = { buildCreateModal, buildRulesModal, parseModalValues };
+module.exports = { buildCreateModal, buildRulesModal, parseModalValues, MAX_RULES_LENGTH };

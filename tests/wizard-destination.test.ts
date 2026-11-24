@@ -18,6 +18,7 @@ describe("raffle wizard destinations", () => {
       from: { id: userId, first_name: "Admin", is_bot: false },
       chat: { id: userId, type: "private", first_name: "Admin" },
       api: {
+        config: { use: vi.fn() },
         getChatMember: vi.fn().mockResolvedValue({ status: "creator" }),
       },
       reply,

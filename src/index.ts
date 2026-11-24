@@ -3,16 +3,20 @@ import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
-import { autoRetry } from "@grammyjs/auto-retry";
+import type { Context } from "grammy";
+import { finishOpenPostEdits, pruneRenderedPosts, refreshOpenRafflePost } from "./rafflePost";
+import { createGroupThrottle, createTelegramHealth, POLLING_OPTIONS, TELEGRAM_API_TIMEOUT_SECONDS, telegramRetry } from "./telegramTransport";
 import { run, sequentialize } from "@grammyjs/runner";
 import { initDatabase } from "./database";
 import * as db from "./database";
 import { logger } from "./logger";
+import { workflowMiddleware, workflowUpdateKeys } from "./workflowSessions";
+import { getTelegramApiRoot, getWebhookConfig } from "./config";
 import { startAdminServer } from "./adminServer";
 import { startHeartbeat } from "./heartbeat";
 import { metrics } from "./metrics";
 import {
-  enqueue,
+  enqueueOnce,
   processJobs,
   registerHandler,
   recoverOrphanedJobs,
@@ -31,6 +35,7 @@ import {
   handleListRaffles,
   handleDraw,
   handleDrawCallback,
+  isAnnouncingDraw,
   handleCancelRaffle,
   handleCancelCallback,
   handleRepostCallback,
@@ -77,6 +82,7 @@ import {
   getUserDisplayName,
   buildMessageLink,
   buildRaffleKeyboard,
+  getBackupDirectory,
 } from "./helpers";
 import type { Raffle } from "./types";
 import { t } from "./i18n";
@@ -85,8 +91,6 @@ import { handleRecurringPostFailure } from "./recurring";
 import { resolveTemplateThreadId } from "./forumTopics";
 import { rememberForumTopicFromMessage } from "./topicCache";
 import {
-  handleWizardMessage,
-  handleWizardPhoto,
   handleWinnersCallback,
   handleWinnersCustomCallback,
   handleTimeCallback,
@@ -94,27 +98,23 @@ import {
   handleSchedPickerCallback,
   handleCalendarPickerCallback,
   handleStandaloneTzCallback,
-  handleStartDeepLink,
-  getActiveWizard,
   handleEditCallback,
-  handleEditTextMessage,
-  handleEditPhotoMessage,
-  getActiveEditWizard,
-  startEditWizard,
-  getActiveTemplateWizard,
-  handleTemplateWizardMessage,
-  handleTemplateWizardPhoto,
   handleTmplWinnersCallback,
   handleTmplWinnersCustomCallback,
   handleTmplTimeCallback,
   handleTmplOptionsCallback,
-  getActiveBugReport,
-  handleBugReportMessage,
-  handleBugReportPhoto,
   handleBugReportSkip,
   startWizard,
+  cleanupExpiredRaffleWizards,
+  handleWorkflowMessage,
 } from "./wizard";
-import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+import { sendWheelSpin, sendRafflePost, editClosedBanner, sendWinnerPost } from "./banners";
+import {
+  RAFFLE_COMMAND_NAMES,
+  classifyTelegramCommand,
+  filterAndCleanRaffleCommands,
+  type RaffleCommandName,
+} from "./commandRegistry";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -124,6 +124,30 @@ if (!BOT_TOKEN) {
 }
 
 const DB_PATH = process.env.DATABASE_PATH || "./raffle.db";
+const backgroundIntervals: NodeJS.Timeout[] = [];
+const backgroundTasks = new Set<Promise<void>>();
+
+function trackBackground(callback: () => void | Promise<void>): Promise<void> {
+  const task = Promise.resolve().then(callback);
+  backgroundTasks.add(task);
+  void task.then(
+    () => backgroundTasks.delete(task),
+    (err) => {
+      backgroundTasks.delete(task);
+      logger.error({ err }, "Background task failed");
+    }
+  );
+  return task;
+}
+
+function scheduleInterval(
+  callback: () => void | Promise<void>,
+  intervalMs: number
+): NodeJS.Timeout {
+  const timer = setInterval(() => { void trackBackground(callback); }, intervalMs);
+  backgroundIntervals.push(timer);
+  return timer;
+}
 
 // Data retention: hours to keep completed raffle data (0 = keep forever)
 const DATA_RETENTION_HOURS = parseInt(
@@ -135,8 +159,6 @@ const DATA_RETENTION_HOURS = parseInt(
 initDatabase(DB_PATH);
 console.log(`Database initialized at ${DB_PATH}`);
 
-// Clear banner cache on startup to ensure fresh banners are used
-db.clearBannerCache();
 if (DATA_RETENTION_HOURS > 0) {
   console.log(
     `Data retention: completed raffle data will be purged after ${DATA_RETENTION_HOURS} hours`
@@ -146,85 +168,10 @@ if (DATA_RETENTION_HOURS > 0) {
 }
 
 // Create bot
-const bot = new Bot(BOT_TOKEN);
-
-// Auto-retry on rate limits (429) with exponential backoff.
-// Telegram regularly returns 30-60s waits on bursts, so we let retries wait that long.
-bot.api.config.use(autoRetry({
-  maxRetryAttempts: 3,
-  maxDelaySeconds: 90,
-}));
-
-// --- Per-chat outbound throttle (P1 load protection) ---
-// Telegram's true sustained limit per group chat is ~1 message/second.
-// At 50+ active raffles per chat (announced, ChiTown-style load), countdown
-// refreshes alone would burst past this. This transformer queues outbound
-// API calls per chat so they never exceed CHAT_API_MIN_INTERVAL_MS apart.
-const CHAT_API_MIN_INTERVAL_MS = 1100; // 1.1s — safely under Telegram's 1/sec
-const chatApiQueues = new Map<number, Promise<void>>();
-const lastChatApiSendAt = new Map<number, number>();
-
-async function chatApiThrottle(chatId: number): Promise<void> {
-  const previous = chatApiQueues.get(chatId) ?? Promise.resolve();
-  const next = previous
-    .catch(() => {})
-    .then(async () => {
-      const last = lastChatApiSendAt.get(chatId);
-      if (last !== undefined) {
-        const elapsed = Date.now() - last;
-        if (elapsed < CHAT_API_MIN_INTERVAL_MS) {
-          await new Promise((r) => setTimeout(r, CHAT_API_MIN_INTERVAL_MS - elapsed));
-        }
-      }
-      lastChatApiSendAt.set(chatId, Date.now());
-    });
-  chatApiQueues.set(chatId, next);
-  return next;
-}
-
-// Periodic cleanup of stale chat throttle entries
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60_000; // 10 min idle
-  for (const [chatId, t] of lastChatApiSendAt) {
-    if (t < cutoff) {
-      lastChatApiSendAt.delete(chatId);
-      chatApiQueues.delete(chatId);
-    }
-  }
-}, 5 * 60_000);
-
-// Methods that target a specific chat — throttle per-chat
-const CHAT_TARGETED_METHODS = new Set([
-  "sendMessage",
-  "sendPhoto",
-  "sendAnimation",
-  "sendVideo",
-  "sendDocument",
-  "sendSticker",
-  "sendChatAction",
-  "editMessageText",
-  "editMessageCaption",
-  "editMessageReplyMarkup",
-  "editMessageMedia",
-  "deleteMessage",
-  "pinChatMessage",
-  "unpinChatMessage",
-  "sendDice",
-  "sendPoll",
-]);
-
-bot.api.config.use(async (prev, method, payload, signal) => {
-  // Throttle per-chat for chat-targeted methods, except for the owner's DM
-  // (DMs with the owner are low-volume and shouldn't be throttled).
-  if (CHAT_TARGETED_METHODS.has(method)) {
-    const chatId = (payload as { chat_id?: number | string }).chat_id;
-    if (typeof chatId === "number" && chatId < 0) {
-      // Negative chat IDs = groups/supergroups (where rate limits bite)
-      await chatApiThrottle(chatId);
-    }
-  }
-  return prev(method, payload, signal);
+const bot = new Bot(BOT_TOKEN, {
+  client: { apiRoot: getTelegramApiRoot(), timeoutSeconds: TELEGRAM_API_TIMEOUT_SECONDS },
 });
+const telegramHealth = createTelegramHealth();
 
 // Metrics transformer: count every API call + capture latency + classify errors.
 // Sits below auto-retry so each retry attempt is counted (truth in numbers).
@@ -233,6 +180,7 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   try {
     const result = await prev(method, payload, signal);
     metrics.recordApiCall(method, Date.now() - startedAt);
+    if (!result.ok) metrics.recordApiError(method, result.error_code);
     return result;
   } catch (err: unknown) {
     metrics.recordApiCall(method, Date.now() - startedAt);
@@ -246,12 +194,46 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   }
 });
 
-// Sequentialize updates per chat to prevent race conditions,
-// but allow different chats to be processed concurrently
-bot.use(sequentialize((ctx) => {
-  const chatId = ctx.chat?.id;
-  return chatId ? [String(chatId)] : undefined;
-}));
+// grammY applies the last transformer first. Each retry passes through
+// group pacing again and records the actual Telegram response in metrics.
+const groupThrottle = createGroupThrottle();
+scheduleInterval(groupThrottle.prune, 5 * 60_000);
+bot.api.config.use(groupThrottle.transform);
+bot.api.config.use(telegramRetry());
+bot.api.config.use(async (prev, method, payload, signal) => {
+  const result = await prev(method, payload, signal);
+  if (method === "getUpdates" && result.ok) telegramHealth.pollSucceeded();
+  return result;
+});
+
+// Wizard state belongs to a user, including when a group command opens a DM.
+// Serialize both keys so a delayed group start cannot overwrite newer DM state.
+bot.use(sequentialize(workflowUpdateKeys));
+
+// Foreign bot commands stop here before rate limiting, metrics, group tracking,
+// routing, or cleanup. ctx.me is the identity returned by Telegram getMe.
+bot.use(filterAndCleanRaffleCommands);
+// --- Callback query safety net ---
+// Ensures every callback query gets answered even if the handler throws.
+// Telegram penalizes bots that leave callback queries unanswered.
+bot.on("callback_query:data", async (ctx, next) => {
+  try {
+    await next();
+  } catch (err) {
+    // Silently ignore stale callbacks from before restart
+    const errMsg = String((err as Record<string, unknown>)?.description ?? err);
+    if (!errMsg.includes("query is too old")) {
+      console.error("Callback query handler error:", err);
+    }
+    try {
+      await ctx.answerCallbackQuery({ text: "⚠️ Something went wrong. Please try again.", show_alert: true });
+    } catch {
+      // answerCallbackQuery itself failed (e.g. query too old) — nothing more we can do
+    }
+  }
+});
+
+bot.use(workflowMiddleware);
 
 // --- Per-user command rate limiting (P1 abuse protection) ---
 // Drops commands from users who exceed RATE_LIMIT_MAX per RATE_LIMIT_WINDOW_MS.
@@ -268,9 +250,12 @@ interface RateLimitEntry {
 const userCommandCounts = new Map<number, RateLimitEntry>();
 
 bot.use(async (ctx, next) => {
-  // Only rate-limit text commands
-  const text = ctx.message?.text;
-  if (!text || !text.startsWith("/")) return next();
+  // Only rate-limit commands explicitly registered by this bot.
+  const classification = classifyTelegramCommand(
+    ctx.message?.text,
+    ctx.me.username
+  );
+  if (classification.kind !== "raffle_command") return next();
 
   const userId = ctx.from?.id;
   if (!userId) return next();
@@ -309,15 +294,13 @@ bot.use(async (ctx, next) => {
     return; // drop the command
   }
 
-  // Count the command for metrics (strip leading / and any @botusername)
-  const cmdMatch = text.match(/^\/([a-zA-Z0-9_]+)/);
-  if (cmdMatch) metrics.recordCommand(cmdMatch[1]);
+  metrics.recordCommand(classification.command.name);
 
   return next();
 });
 
 // Periodically clean up old rate-limit entries to prevent memory growth
-setInterval(() => {
+scheduleInterval(() => {
   const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS * 5;
   for (const [userId, entry] of userCommandCounts) {
     if (entry.windowStart < cutoff && entry.blockedUntil < Date.now()) {
@@ -326,7 +309,7 @@ setInterval(() => {
   }
 }, 5 * 60_000);
 
-// --- Auto-track groups + auto-delete command messages ---
+// --- Auto-track groups ---
 bot.use(async (ctx, next) => {
   const isGroup =
     ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
@@ -347,15 +330,6 @@ bot.use(async (ctx, next) => {
     // service message. A normal /setraffletopic command discovers the initial
     // name from its nested topic-creation service message.
     rememberForumTopicFromMessage(chatId, ctx.message);
-  }
-
-  const isCommand = ctx.message?.text?.startsWith("/");
-  if (isGroup && isCommand) {
-    try {
-      await ctx.deleteMessage();
-    } catch {
-      // Bot may not have delete permission
-    }
   }
 
   await next();
@@ -415,12 +389,15 @@ const PRIVATE_ADMIN_ACTIONS: Record<string, string> = {
 
 bot.use(async (ctx, next) => {
   if (!ctx.chat || ctx.chat.type === "private" || !ctx.from) return next();
-  const text = ctx.message?.text || "";
-  const match = text.match(/^\/([a-z]+)(?:@\w+)?(?:\s|$)/i);
-  const action = match ? PRIVATE_ADMIN_ACTIONS[match[1].toLowerCase()] : undefined;
+  const classification = classifyTelegramCommand(
+    ctx.message?.text,
+    ctx.me.username
+  );
+  const action = classification.kind === "raffle_command"
+    ? PRIVATE_ADMIN_ACTIONS[classification.command.name]
+    : undefined;
   if (!action) return next();
 
-  try { await ctx.deleteMessage(); } catch {}
   if (action === "create") {
     await startWizard(ctx);
     return;
@@ -449,57 +426,44 @@ bot.use(async (ctx, next) => {
   }
 });
 
-// --- Register commands ---
-bot.command("start", handleStart);
-bot.command("help", handleHelp);
-bot.command("manage", handleManage);
-bot.command("newraffle", handleNewRaffle);
-bot.command("setraffletopic", handleSetRaffleTopic);
-bot.command("raffles", handleListRaffles);
-bot.command("draw", handleDraw);
-bot.command("cancelraffle", handleCancelRaffle);
-bot.command("myentries", handleMyEntries);
-bot.command("rafflehistory", handleRaffleHistory);
-bot.command("exportentries", handleExportEntries);
-bot.command("rerun", handleRerun);
-bot.command("savetemplate", handleSaveTemplate);
-bot.command("templates", handleTemplates);
-bot.command("deletetemplate", handleDeleteTemplate);
-bot.command("usetemplate", handleUseTemplate);
-bot.command("recurring", handleRecurring);
-bot.command("editraffle", handleEditRaffle);
-bot.command("language", handleLanguage);
-bot.command("timezone", handleTimezone);
-bot.command("stats", handleStats);
-bot.command("health", handleHealth);
-bot.command("metrics", handleMetrics);
-bot.command("active", handleActive);
-bot.command("referralstats", handleReferralStats);
-bot.command("groupstats", handleGroupStats);
-bot.command("defaults", handleDefaults);
-bot.command("setupcheck", handleSetupCheck);
-bot.command("referrals", handleReferrals);
-bot.command("bugreport", handleBugReport);
+// --- Register commands from the same explicit registry used for cleanup ---
+type CommandHandler = (ctx: Context) => Promise<void>;
+const RAFFLE_COMMAND_HANDLERS = {
+  start: handleStart,
+  help: handleHelp,
+  manage: handleManage,
+  newraffle: handleNewRaffle,
+  setraffletopic: handleSetRaffleTopic,
+  raffles: handleListRaffles,
+  draw: handleDraw,
+  cancelraffle: handleCancelRaffle,
+  myentries: handleMyEntries,
+  rafflehistory: handleRaffleHistory,
+  exportentries: handleExportEntries,
+  rerun: handleRerun,
+  savetemplate: handleSaveTemplate,
+  templates: handleTemplates,
+  deletetemplate: handleDeleteTemplate,
+  usetemplate: handleUseTemplate,
+  recurring: handleRecurring,
+  editraffle: handleEditRaffle,
+  language: handleLanguage,
+  timezone: handleTimezone,
+  stats: handleStats,
+  health: handleHealth,
+  metrics: handleMetrics,
+  active: handleActive,
+  referralstats: handleReferralStats,
+  groupstats: handleGroupStats,
+  defaults: handleDefaults,
+  setupcheck: handleSetupCheck,
+  referrals: handleReferrals,
+  bugreport: handleBugReport,
+} satisfies Record<RaffleCommandName, CommandHandler>;
 
-// --- Callback query safety net ---
-// Ensures every callback query gets answered even if the handler throws.
-// Telegram penalizes bots that leave callback queries unanswered.
-bot.on("callback_query:data", async (ctx, next) => {
-  try {
-    await next();
-  } catch (err) {
-    // Silently ignore stale callbacks from before restart
-    const errMsg = String((err as Record<string, unknown>)?.description ?? err);
-    if (!errMsg.includes("query is too old")) {
-      console.error("Callback query handler error:", err);
-    }
-    try {
-      await ctx.answerCallbackQuery({ text: "⚠️ Something went wrong. Please try again.", show_alert: true });
-    } catch {
-      // answerCallbackQuery itself failed (e.g. query too old) — nothing more we can do
-    }
-  }
-});
+for (const command of RAFFLE_COMMAND_NAMES) {
+  bot.command(command, RAFFLE_COMMAND_HANDLERS[command]);
+}
 
 // --- Register callback queries ---
 bot.callbackQuery(/^enter_\d+$/, handleEnterCallback);
@@ -592,73 +556,8 @@ bot.on("message", async (ctx, next) => {
   }
 });
 
-// --- Handle text messages (for wizard responses in DMs) ---
-bot.on("message:text", async (ctx) => {
-  if (!ctx.from) return;
-  // Skip commands — they're handled above
-  if (ctx.message.text.startsWith("/")) return;
-
-  // Only process wizard messages in private chat (DMs)
-  if (ctx.chat.type !== "private") return;
-
-  // Check if user has an active edit wizard first
-  const editState = getActiveEditWizard(ctx.from.id);
-  if (editState && editState.editingField) {
-    await handleEditTextMessage(ctx);
-    return;
-  }
-
-  // Check if user has an active bug report
-  const bugState = getActiveBugReport(ctx.from.id);
-  if (bugState) {
-    await handleBugReportMessage(ctx);
-    return;
-  }
-
-  // Check if user has an active template wizard
-  const tmplState = getActiveTemplateWizard(ctx.from.id);
-  if (tmplState) {
-    await handleTemplateWizardMessage(ctx);
-    return;
-  }
-
-  // Check if user has an active creation wizard
-  const state = getActiveWizard(ctx.from.id);
-  if (!state) return;
-
-  await handleWizardMessage(ctx);
-});
-
-// --- Handle photo messages (for wizard image upload or bug report in DMs) ---
-bot.on("message:photo", async (ctx) => {
-  if (!ctx.from) return;
-  if (ctx.chat.type !== "private") return;
-
-  // Bug report screenshot
-  const bugState = getActiveBugReport(ctx.from.id);
-  if (bugState) {
-    await handleBugReportPhoto(ctx);
-    return;
-  }
-
-  const editState = getActiveEditWizard(ctx.from.id);
-  if (editState) {
-    await handleEditPhotoMessage(ctx);
-    return;
-  }
-
-  const templateState = getActiveTemplateWizard(ctx.from.id);
-  if (templateState) {
-    await handleTemplateWizardPhoto(ctx);
-    return;
-  }
-
-  // Raffle wizard image
-  const state = getActiveWizard(ctx.from.id);
-  if (!state) return;
-
-  await handleWizardPhoto(ctx);
-});
+// One input workflow per user, including a clear response to unsupported input.
+bot.on("message", handleWorkflowMessage);
 
 // --- Interval re-entry guard (P1 reliability) ---
 // Wraps an async function so that if a previous invocation is still running,
@@ -711,7 +610,7 @@ function makeNonOverlapping(
 
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const BACKUP_DIR = "/data/backups";
+const BACKUP_DIR = getBackupDirectory(DB_PATH);
 const BACKUP_RETENTION = 48; // Keep last 48 hourly backups (2 days)
 
 async function backupDatabase(): Promise<void> {
@@ -784,17 +683,19 @@ function walCheckpoint(): void {
 }
 
 // --- Owner notification helper ---
-async function notifyOwner(message: string): Promise<void> {
+async function notifyOwner(message: string): Promise<boolean> {
   const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
-  if (ownerId === 0) return;
+  if (ownerId === 0) return false;
   try {
     await bot.api.sendMessage(ownerId, message, {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
     });
     metrics.recordOwnerAlert();
+    return true;
   } catch (err) {
     console.error("Failed to DM owner:", err);
+    return false;
   }
 }
 
@@ -834,7 +735,9 @@ const EXPIRY_CHECK_INTERVAL = 10_000; // 10 seconds - check more frequently for 
 const ANNOUNCEMENT_GIVE_UP_HOURS = 24; // Mark as failed after retrying for this long
 const STUCK_ALERT_MINUTES = 15; // Alert owner after a raffle has been stuck this long
 
-async function processExpiredRaffle(raffle: Raffle): Promise<void> {
+async function processExpiredRaffle(candidate: Raffle): Promise<void> {
+  const raffle = db.getRaffleById(candidate.id);
+  if (raffle?.status !== "open" || !raffle.ends_at || Date.parse(raffle.ends_at + "Z") > Date.now()) return;
   console.log(`Auto-drawing expired raffle: ${raffle.id} - ${raffle.title}`);
 
   // Mark as drawn IMMEDIATELY to prevent double-processing
@@ -842,11 +745,9 @@ async function processExpiredRaffle(raffle: Raffle): Promise<void> {
 
   // Clean up in-memory tracking maps for this raffle
   lastRefreshTime.delete(raffle.id);
-  raffleIsPhoto.delete(raffle.id);
-  lastRenderedCaption.delete(raffle.id);
   endingSoonSent.delete(raffle.id);
   // Revoke referral links via job queue — survives bot restarts
-  enqueue("revoke_referrals", { raffleId: raffle.id });
+  enqueueOnce("revoke_referrals", { raffleId: raffle.id });
 
   const entryCount = db.getEntryCount(raffle.id);
   const lang = db.getChatLanguage(raffle.chat_id);
@@ -865,15 +766,13 @@ async function processExpiredRaffle(raffle: Raffle): Promise<void> {
     } catch (err) {
       const errCode = (err as { error_code?: number }).error_code;
       if (errCode === 403) {
-        db.markRaffleAnnounced(raffle.id);
-        console.log(`Initial announce: bot kicked from ${raffle.chat_id}, marking raffle ${raffle.id} announced`);
+        db.markAnnounceFailed(raffle.id);
+        console.log(`Initial announce: bot kicked from ${raffle.chat_id}, recording raffle ${raffle.id} delivery failure`);
       } else {
         console.error(`Failed to announce empty raffle ${raffle.id}:`, err);
       }
     }
   } else {
-    const entries = db.getEntriesForRaffle(raffle.id);
-    const entryNames = entries.map((e) => e.user_display_name);
     const winners = db.selectWinners(raffle.id);
 
     // Only show countdown if raffle expired recently (within 2 minutes) and animation is enabled
@@ -881,7 +780,7 @@ async function processExpiredRaffle(raffle: Raffle): Promise<void> {
     const staleness = Date.now() - expiredAt.getTime();
     const isRecent = staleness < 2 * 60 * 1000;
 
-    if (isRecent && entryNames.length >= 1 && raffle.show_animation) {
+    if (isRecent && raffle.show_animation) {
       await sendWheelSpin(bot.api, raffle.chat_id, raffle.thread_id);
     }
 
@@ -894,15 +793,15 @@ async function processExpiredRaffle(raffle: Raffle): Promise<void> {
     } catch (err) {
       const errCode = (err as { error_code?: number }).error_code;
       if (errCode === 403) {
-        db.markRaffleAnnounced(raffle.id);
-        console.log(`Initial announce: bot kicked from ${raffle.chat_id}, marking raffle ${raffle.id} announced`);
+        db.markAnnounceFailed(raffle.id);
+        console.log(`Initial announce: bot kicked from ${raffle.chat_id}, recording raffle ${raffle.id} delivery failure`);
       } else {
         console.error(`Failed to announce winners for raffle ${raffle.id} — will retry:`, err);
       }
     }
 
     // DM winners and creator via job queue — survives bot restarts
-    enqueue("notify_winners", { raffleId: raffle.id });
+    enqueueOnce("notify_winners", { raffleId: raffle.id });
   }
 
   // Update the original raffle post with "closed" banner
@@ -928,35 +827,11 @@ async function processExpiredRaffle(raffle: Raffle): Promise<void> {
           });
         }
 
-        // Try to swap the banner to "closed"
-        const closedBannerFileId = await getBannerFileId(bot.api, raffle.chat_id, "closed");
-        if (closedBannerFileId) {
-          try {
-            await bot.api.editMessageMedia(
-              raffle.chat_id,
-              raffle.message_id,
-              {
-                type: "photo",
-                media: closedBannerFileId,
-                caption: text,
-                parse_mode: "HTML",
-              }
-            );
-          } catch (err) {
-            console.error(`Failed to swap banner to closed:`, err);
-            // Fallback to just caption update
-            await bot.api.editMessageCaption(
-              raffle.chat_id,
-              raffle.message_id,
-              { caption: text, parse_mode: "HTML" }
-            );
-          }
-        } else {
-          await bot.api.editMessageCaption(
-            raffle.chat_id,
-            raffle.message_id,
-            { caption: text, parse_mode: "HTML" }
-          );
+        await finishOpenPostEdits(raffle.id);
+        try {
+          await editClosedBanner(bot.api, raffle.chat_id, raffle.message_id, text);
+        } catch {
+          await bot.api.editMessageCaption(raffle.chat_id, raffle.message_id, { caption: text, parse_mode: "HTML" });
         }
       }
     } catch {
@@ -984,13 +859,15 @@ async function retryUnannouncedRaffles(): Promise<void> {
   // Alert owner once when raffles cross the "stuck" threshold
   const stuck = db.getStuckUnnotifiedRaffles(STUCK_ALERT_MINUTES);
   if (stuck.length > 0) {
-    await notifyOwner(
+    const ownerNotified = await notifyOwner(
       `🟡 <b>${stuck.length} raffle${stuck.length !== 1 ? "s" : ""} stuck unannounced &gt;${STUCK_ALERT_MINUTES} min</b>\n\n` +
         stuck.slice(0, 10).map((r) => `• <code>${r.id}</code> — ${escapeHtml(r.title)} (chat <code>${r.chat_id}</code>, ${r.announce_attempts} attempts)`).join("\n") +
         (stuck.length > 10 ? `\n…and ${stuck.length - 10} more` : "") +
         `\n\nRetries will continue. Use /health to check status.`
     );
-    for (const r of stuck) db.markOwnerAlerted(r.id);
+    if (ownerNotified) {
+      for (const r of stuck) db.markOwnerAlerted(r.id);
+    }
   }
 
   const unannounced = db.getUnannouncedDrawnRaffles();
@@ -1003,7 +880,10 @@ async function retryUnannouncedRaffles(): Promise<void> {
   });
 
   for (const raffle of unannounced) {
-    const winners = db.getWinnersForRaffle(raffle.id);
+    if (isAnnouncingDraw(raffle.id)) continue;
+    const current = db.getRaffleById(raffle.id);
+    if (!current || current.announced || current.announce_failed) continue;
+    let winners = db.getWinnersForRaffle(raffle.id);
     const entryCount = db.getEntryCount(raffle.id);
     const lang = db.getChatLanguage(raffle.chat_id);
 
@@ -1025,24 +905,33 @@ async function retryUnannouncedRaffles(): Promise<void> {
         const errCode = (err as { error_code?: number }).error_code;
         if (errCode === 403) {
           // Bot was kicked/blocked — stop retrying
-          db.markRaffleAnnounced(raffle.id);
+          db.markAnnounceFailed(raffle.id);
           console.log(`Retry: giving up on raffle ${raffle.id} — bot no longer in chat (403)`);
         } else {
           console.error(`Retry: still can't announce empty raffle ${raffle.id} (attempt ${raffle.announce_attempts + 1}):`, err);
         }
       }
-    } else if (winners.length > 0) {
+    } else {
+      // A crash can occur after the raffle is marked drawn but before winner
+      // rows are persisted. Repair that durable intermediate state here.
+      if (winners.length === 0) {
+        winners = db.ensureWinnersForRaffle(raffle.id);
+        if (winners.length === 0) {
+          console.error(`Retry: raffle ${raffle.id} has entries but winner recovery returned none`);
+          continue;
+        }
+      }
       try {
         await sendWinnerPost(bot.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
         db.markRaffleAnnounced(raffle.id);
         console.log(`Retry: announced winners for raffle ${raffle.id} - ${raffle.title}`);
         // Also try to DM winners via job queue
-        enqueue("notify_winners", { raffleId: raffle.id });
+        enqueueOnce("notify_winners", { raffleId: raffle.id });
       } catch (err: unknown) {
         const errCode = (err as { error_code?: number }).error_code;
         if (errCode === 403) {
           // Bot was kicked/blocked — stop retrying
-          db.markRaffleAnnounced(raffle.id);
+          db.markAnnounceFailed(raffle.id);
           console.log(`Retry: giving up on raffle ${raffle.id} — bot no longer in chat (403)`);
         } else {
           console.error(`Retry: still can't announce raffle ${raffle.id} (attempt ${raffle.announce_attempts + 1}):`, err);
@@ -1079,56 +968,6 @@ const COUNTDOWN_REFRESH_INTERVAL = 60_000; // 1 minute
 const ENDING_SOON_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 const endingSoonSent = new Set<number>(); // raffle IDs that already got a reminder
 
-// Track which raffles are photo-based vs text-only to avoid wasted API calls
-const raffleIsPhoto = new Map<number, boolean>();
-
-// Per-raffle cache of the last rendered caption so we can skip API calls
-// when nothing actually changed (saves Telegram quota at high raffle counts).
-const lastRenderedCaption = new Map<number, string>();
-
-async function refreshRaffleMessage(raffle: Raffle): Promise<void> {
-  if (!raffle.message_id) return;
-
-  const count = db.getEntryCount(raffle.id);
-  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffle.id) : count;
-  const lang = db.getChatLanguage(raffle.chat_id);
-  const botUsername = bot.botInfo.username;
-
-  const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
-  const caption = formatRaffleMessage(raffle, count, lang);
-
-  // Skip if neither the caption nor the entry count has changed since last render.
-  // Telegram returns 400 "message is not modified" on no-op edits — wasted API call.
-  const cacheKey = `${caption}\x00${displayCount}`;
-  const cached = lastRenderedCaption.get(raffle.id);
-  if (cached === cacheKey) return;
-
-  const isPhoto = raffleIsPhoto.get(raffle.id);
-  // (The API transformer throttles per-chat automatically, no manual throttle needed)
-
-  if (isPhoto === false) {
-    // Known text-only — skip editMessageCaption entirely
-    try {
-      await bot.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
-      lastRenderedCaption.set(raffle.id, cacheKey);
-    } catch { /* unchanged or deleted */ }
-    return;
-  }
-
-  try {
-    await bot.api.editMessageCaption(raffle.chat_id, raffle.message_id, { caption, parse_mode: "HTML", reply_markup: keyboard });
-    raffleIsPhoto.set(raffle.id, true);
-    lastRenderedCaption.set(raffle.id, cacheKey);
-  } catch {
-    // Might be text-only — try editMessageText
-    try {
-      await bot.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
-      raffleIsPhoto.set(raffle.id, false);
-      lastRenderedCaption.set(raffle.id, cacheKey);
-    } catch { /* unchanged or deleted */ }
-  }
-}
-
 // Track last refresh time for each raffle (for smart refresh intervals)
 const lastRefreshTime = new Map<number, number>();
 
@@ -1148,6 +987,19 @@ async function refreshCountdowns(): Promise<void> {
   try {
     const raffles = db.getOpenRafflesWithEndTime();
     const now = Date.now();
+    const activeIds = new Set(raffles.map((raffle) => raffle.id));
+    for (const id of lastRefreshTime.keys()) {
+      if (!activeIds.has(id)) lastRefreshTime.delete(id);
+    }
+    pruneRenderedPosts(activeIds);
+    for (const id of endingSoonSent) {
+      if (!activeIds.has(id)) endingSoonSent.delete(id);
+    }
+    for (const [chatId, sentAt] of lastChatSendAt) {
+      if (!chatThrottleQueues.has(chatId) && now - sentAt > 60 * 60 * 1000) {
+        lastChatSendAt.delete(chatId);
+      }
+    }
     let refreshedCount = 0;
 
     // Collect tasks to run in parallel batches
@@ -1194,13 +1046,11 @@ async function refreshCountdowns(): Promise<void> {
         if (timeSinceLastRefresh >= refreshInterval) {
           lastRefreshTime.set(raffle.id, now);
           refreshedCount++;
-          refreshTasks.push(() => refreshRaffleMessage(raffle));
+          refreshTasks.push(() => refreshOpenRafflePost(bot.api, raffle.id, bot.botInfo.username));
         }
       } else {
         // Clean up tracking for ended raffles to prevent memory growth
         lastRefreshTime.delete(raffle.id);
-        raffleIsPhoto.delete(raffle.id);
-        lastRenderedCaption.delete(raffle.id);
         endingSoonSent.delete(raffle.id);
       }
     }
@@ -1227,7 +1077,7 @@ function purgeOldData(): void {
   try {
     const purged = db.purgeExpiredData(DATA_RETENTION_HOURS);
     if (purged > 0) {
-      console.log(`Data retention: purged ${purged} completed raffle(s)`);
+      console.log(`Data retention: purged ${purged} participant entr${purged === 1 ? "y" : "ies"}`);
     }
   } catch (err) {
     console.error("Error purging old data:", err);
@@ -1245,7 +1095,7 @@ async function checkRecurringTemplates(): Promise<void> {
 
       let endsAt: string | null = null;
       if (template.duration_minutes) {
-        const endDate = new Date(Date.now() + template.duration_minutes * 60 * 1000);
+        const endDate = new Date(Date.now() + ((template.starts_after_minutes || 0) + template.duration_minutes) * 60 * 1000);
         endsAt = endDate
           .toISOString()
           .replace("T", " ")
@@ -1390,7 +1240,7 @@ bot.on("inline_query", async (ctx) => {
         description: "Add me to a group first, then use /newraffle",
         input_message_content: {
           message_text:
-            `🎟 <b>${escapeHtml(query)}</b>\n\nTo create a raffle, add @${(await bot.api.getMe()).username} to your group and open the /newraffle setup wizard.`,
+            `🎟 <b>${escapeHtml(query)}</b>\n\nTo create a raffle, add @${ctx.me.username} to your group and open the /newraffle setup wizard.`,
           parse_mode: "HTML" as const,
         },
       });
@@ -1432,23 +1282,22 @@ bot.on("chat_member", async (ctx) => {
     const raffle = db.getRaffleById(ref.raffle_id);
     if (!raffle || raffle.status !== "open") continue;
 
-    // Check max referral cap
-    if (raffle.max_referral_entries > 0 && ref.bonus_entries >= raffle.max_referral_entries) {
-      continue; // Cap reached
-    }
-
-    // Award +1 bonus entry
-    db.incrementBonusEntries(ref.id);
+    const newBonus = db.awardReferralBonus(
+      ref.id,
+      raffle.id,
+      joinedUserId,
+      raffle.max_referral_entries
+    );
+    if (newBonus === null) continue;
 
     // Refresh the raffle post to show updated entry count
     try {
-      await refreshRaffleMessage(raffle);
+      await refreshOpenRafflePost(bot.api, raffle.id, bot.botInfo.username);
     } catch {
       // Non-critical — will refresh on next countdown cycle
     }
 
     // Notify the referrer via DM
-    const newBonus = ref.bonus_entries + 1;
     const joinerName = getUserDisplayName(
       update.new_chat_member.user.first_name,
       update.new_chat_member.user.last_name
@@ -1521,6 +1370,8 @@ async function notifyOwnerOfNewGroup(opts: {
 bot.on("my_chat_member", async (ctx) => {
   const update = ctx.myChatMember;
   if (!update) return;
+  // Blocking/unblocking a private DM also emits my_chat_member updates.
+  if (update.chat.type !== "group" && update.chat.type !== "supergroup") return;
 
   const oldStatus = update.old_chat_member.status;
   const newStatus = update.new_chat_member.status;
@@ -1598,6 +1449,15 @@ bot.on("my_chat_member", async (ctx) => {
   );
 
   // Build the welcome / feature overview message
+  const setupInstructions =
+    newStatus === "administrator"
+      ? `<b>🚀 Get started:</b> Open my private chat, choose Admin Center, then select ${escapeHtml(chatTitle)}. All setup and management stays out of the group chat.`
+      : `<b>⚠️ One setup step remains:</b> Promote me to a Telegram administrator in ${escapeHtml(chatTitle)}. As a regular member, I can't reliably verify which users are group admins, so this group won't appear in the Admin Center yet.\n\n` +
+        `<b>After promoting me:</b> Open my private chat, choose Admin Center, and tap Refresh My Groups.`;
+  const adminCenterButtonLabel =
+    newStatus === "administrator"
+      ? "Open Admin Center"
+      : "Open Admin Center After Promoting";
   const welcomeMsg =
     `🎟 <b>Thanks for adding Raffle Bot to ${escapeHtml(chatTitle)}!</b>\n\n` +
     `Here's everything I can do:\n\n` +
@@ -1610,7 +1470,7 @@ bot.on("my_chat_member", async (ctx) => {
     `<b>🏆 Drawing & Winners</b>\n` +
     `• Animated wheel spin before revealing winners\n` +
     `• Auto-draw when timer expires or max entries reached\n` +
-    `• Live countdown on raffle posts (updates every minute)\n` +
+    `• Live countdown on raffle posts\n` +
     `• 5-minute "ending soon" reminders\n` +
     `• Winners & creator notified via DM\n\n` +
     `<b>📋 Templates & Recurring</b>\n` +
@@ -1629,13 +1489,13 @@ bot.on("my_chat_member", async (ctx) => {
     `<b>🌐 Multi-Language</b>\n` +
     `• English, Español, Português, Русский, Français, Deutsch\n` +
     `• Change it privately from the Admin Center\n\n` +
-    `<b>🚀 Get started:</b> Open my private chat, choose Admin Center, then select ${escapeHtml(chatTitle)}. All setup and management stays out of the group chat.`;
+    setupInstructions;
 
   // Try to DM the person who added the bot
   try {
     await ctx.api.sendMessage(addedBy.id, welcomeMsg, {
       parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("Open Admin Center", "admin_groups"),
+      reply_markup: new InlineKeyboard().text(adminCenterButtonLabel, "admin_groups"),
     });
   } catch {
     // User hasn't started a DM with the bot — can't message them.
@@ -1744,24 +1604,30 @@ async function seedBotGroups(): Promise<void> {
 
 // --- Start bot ---
 async function main(): Promise<void> {
+  // Validate transport configuration before starting any listeners or workers.
+  const webhookConfig = getWebhookConfig();
+
   // Admin/stats HTTP endpoint for the control tower (mode-independent).
-  startAdminServer();
+  const adminServer = startAdminServer(() => telegramHealth.isHealthy());
 
-  // Group chats expose useful launch commands, while private navigation stays
-  // button-based. Admin scope overrides the shorter member command list.
-  await bot.api.deleteMyCommands();
-  await bot.api.deleteMyCommands({ scope: { type: "all_group_chats" } });
-  await bot.api.deleteMyCommands({ scope: { type: "all_chat_administrators" } });
-  await bot.api.deleteMyCommands({ scope: { type: "all_private_chats" } });
-  await bot.api.setMyCommands(GROUP_MEMBER_COMMANDS, {
-    scope: { type: "all_group_chats" },
-  });
-  await bot.api.setMyCommands(GROUP_ADMIN_COMMANDS, {
-    scope: { type: "all_chat_administrators" },
-  });
-
-  // Initialize bot info (needed for bot.botInfo.id before bot.start())
+  // Polling must not wait for nonessential command-menu maintenance.
   await bot.init();
+  async function syncCommandMenus(): Promise<void> {
+    // Group chats expose launch commands; private navigation stays button-based.
+    await bot.api.deleteMyCommands();
+    await bot.api.deleteMyCommands({ scope: { type: "all_group_chats" } });
+    await bot.api.deleteMyCommands({ scope: { type: "all_chat_administrators" } });
+    await bot.api.deleteMyCommands({ scope: { type: "all_private_chats" } });
+    await bot.api.setMyCommands(GROUP_MEMBER_COMMANDS, {
+      scope: { type: "all_group_chats" },
+    });
+    await bot.api.setMyCommands(GROUP_ADMIN_COMMANDS, {
+      scope: { type: "all_chat_administrators" },
+    });
+  }
+  void syncCommandMenus().catch((err) => {
+    logger.warn({ err }, "Command menu sync failed; bot remains available");
+  });
 
   // --- Register persistent-job handlers ---
   // These handlers close over the bot instance, so they have to register here
@@ -1788,41 +1654,46 @@ async function main(): Promise<void> {
   }
 
   // Start the job worker — polls for pending jobs every 5 seconds
-  setInterval(makeNonOverlapping(processJobs, "processJobs"), 5_000);
+  scheduleInterval(makeNonOverlapping(processJobs, "processJobs"), 5_000);
+  // Expire idle drafts even when their creator never sends another update.
+  scheduleInterval(
+    makeNonOverlapping(cleanupExpiredRaffleWizards, "cleanupExpiredRaffleWizards"),
+    30_000
+  );
   // Purge completed jobs older than 7 days once an hour
-  setInterval(() => purgeOldJobs(7), 60 * 60 * 1000);
+  scheduleInterval(() => purgeOldJobs(7), 60 * 60 * 1000);
   console.log("Job queue worker active: polling every 5s, retention 7 days");
 
   // Refresh tracked groups without delaying Telegram polling during startup.
-  void seedBotGroups().catch((err) => {
+  void trackBackground(seedBotGroups).catch((err) => {
     console.error("Background group refresh failed:", err);
   });
 
   // Start expiry checker (with re-entry guard)
-  setInterval(makeNonOverlapping(checkExpiredRaffles, "checkExpiredRaffles"), EXPIRY_CHECK_INTERVAL);
+  scheduleInterval(makeNonOverlapping(checkExpiredRaffles, "checkExpiredRaffles"), EXPIRY_CHECK_INTERVAL);
 
   // Start countdown refresh (with re-entry guard)
-  setInterval(makeNonOverlapping(refreshCountdowns, "refreshCountdowns"), COUNTDOWN_REFRESH_INTERVAL);
+  scheduleInterval(makeNonOverlapping(refreshCountdowns, "refreshCountdowns"), COUNTDOWN_REFRESH_INTERVAL);
   console.log("Countdown refresh active: every 60s");
 
   // Start automated backups + WAL checkpoints (with re-entry guard)
   walCheckpoint(); // Run once on startup to clean up any pending WAL
-  setInterval(makeNonOverlapping(walCheckpoint, "walCheckpoint"), WAL_CHECKPOINT_INTERVAL_MS);
+  scheduleInterval(makeNonOverlapping(walCheckpoint, "walCheckpoint"), WAL_CHECKPOINT_INTERVAL_MS);
   console.log(`WAL checkpoints active: every ${WAL_CHECKPOINT_INTERVAL_MS / 1000}s`);
 
   // External uptime heartbeat (configured via HEARTBEAT_URL env var)
-  startHeartbeat();
+  const heartbeat = startHeartbeat(() => telegramHealth.isHealthy());
 
-  backupDatabase(); // Run once on startup
-  setInterval(makeNonOverlapping(backupDatabase, "backupDatabase"), BACKUP_INTERVAL_MS);
+  void trackBackground(backupDatabase); // Run once on startup
+  scheduleInterval(makeNonOverlapping(backupDatabase, "backupDatabase"), BACKUP_INTERVAL_MS);
   console.log(`Automated backups active: every ${BACKUP_INTERVAL_MS / 60000}min, retention ${BACKUP_RETENTION} files`);
 
   // Start recurring template checker (with re-entry guard)
-  setInterval(makeNonOverlapping(checkRecurringTemplates, "checkRecurringTemplates"), RECURRING_CHECK_INTERVAL);
+  scheduleInterval(makeNonOverlapping(checkRecurringTemplates, "checkRecurringTemplates"), RECURRING_CHECK_INTERVAL);
 
   // Start data retention purge (with re-entry guard)
   purgeOldData();
-  setInterval(makeNonOverlapping(purgeOldData, "purgeOldData"), PURGE_CHECK_INTERVAL);
+  scheduleInterval(makeNonOverlapping(purgeOldData, "purgeOldData"), PURGE_CHECK_INTERVAL);
 
   // Weekly stats report to bot owner
   const WEEKLY_REPORT_INTERVAL = 60_000; // check every minute
@@ -1850,7 +1721,7 @@ async function main(): Promise<void> {
       console.error("Failed to send weekly report:", err);
     }
   }
-  setInterval(makeNonOverlapping(checkWeeklyReport, "checkWeeklyReport"), WEEKLY_REPORT_INTERVAL);
+  scheduleInterval(makeNonOverlapping(checkWeeklyReport, "checkWeeklyReport"), WEEKLY_REPORT_INTERVAL);
 
   // Daily new-raffle digest to bot owner
   const DAILY_DIGEST_INTERVAL = 60_000; // check every minute
@@ -1896,7 +1767,7 @@ async function main(): Promise<void> {
       console.error("Failed to send daily digest:", err);
     }
   }
-  setInterval(makeNonOverlapping(checkDailyDigest, "checkDailyDigest"), DAILY_DIGEST_INTERVAL);
+  scheduleInterval(makeNonOverlapping(checkDailyDigest, "checkDailyDigest"), DAILY_DIGEST_INTERVAL);
 
   console.log("Raffle Bot is running! Press Ctrl+C to stop.");
 
@@ -1908,11 +1779,41 @@ async function main(): Promise<void> {
     "chat_member",
   ] as const;
 
-  const webhookUrl = process.env.WEBHOOK_URL;
-  const webhookSecret = process.env.WEBHOOK_SECRET || "";
-  const webhookPort = parseInt(process.env.WEBHOOK_PORT || "3001", 10);
+  let shuttingDown = false;
+  const shutdown = async (stopTransport: () => Promise<void>): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    telegramHealth.stopped();
+    logger.info({}, "Shutdown signal received");
+    for (const timer of backgroundIntervals) clearInterval(timer);
+    heartbeat.stop();
 
-  if (webhookUrl) {
+    const timeout = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10_000);
+      timer.unref();
+    });
+    try {
+      const settleBackground = Promise.allSettled([...backgroundTasks]).then(() => {});
+      await Promise.race([
+        Promise.all([stopTransport(), settleBackground]).then(() => {}),
+        timeout,
+      ]);
+    } catch (err) {
+      logger.error({ err }, "Transport shutdown failed");
+    }
+
+    adminServer.close();
+    adminServer.closeAllConnections?.();
+    try {
+      walCheckpoint();
+      db.getDb().close();
+    } catch (err) {
+      logger.error({ err }, "Database shutdown failed");
+    }
+    process.exit(0);
+  };
+
+  if (webhookConfig) {
     // --- Webhook mode ---
     // Telegram pushes updates to our public URL instead of us polling.
     // Lower latency, less bandwidth, scales further. Requires:
@@ -1921,19 +1822,22 @@ async function main(): Promise<void> {
     //   - WEBHOOK_PORT: container port to listen on (default 3001)
     //   - The container must expose this port AND a tunnel/proxy must
     //     route the public URL to it.
-    logger.info({ url_host: new URL(webhookUrl).host, port: webhookPort }, "Starting in webhook mode");
+    logger.info(
+      { url_host: new URL(webhookConfig.url).host, port: webhookConfig.port },
+      "Starting in webhook mode"
+    );
 
     // Delete any existing polling-mode state, then register our endpoint
     await bot.api.deleteWebhook({ drop_pending_updates: false });
-    await bot.api.setWebhook(webhookUrl, {
-      secret_token: webhookSecret || undefined,
+    await bot.api.setWebhook(webhookConfig.url, {
+      secret_token: webhookConfig.secret,
       allowed_updates: [...allowedUpdates],
       drop_pending_updates: false,
     });
     logger.info({}, "Webhook registered with Telegram");
 
     const handleUpdate = webhookCallback(bot, "http", {
-      secretToken: webhookSecret || undefined,
+      secretToken: webhookConfig.secret,
     });
 
     const server = http.createServer(async (req, res) => {
@@ -1950,34 +1854,44 @@ async function main(): Promise<void> {
       }
     });
 
-    server.listen(webhookPort, () => {
-      logger.info({ port: webhookPort }, "Webhook HTTP server listening");
+    server.listen(webhookConfig.port, () => {
+      telegramHealth.webhook();
+      logger.info({ port: webhookConfig.port }, "Webhook HTTP server listening");
     });
 
-    const stopWebhook = async () => {
-      logger.info({}, "Shutdown signal received, deleting webhook");
+    const stopWebhook = async (): Promise<void> => {
       try {
         await bot.api.deleteWebhook({ drop_pending_updates: false });
       } catch {}
-      server.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     };
-    process.once("SIGINT", stopWebhook);
-    process.once("SIGTERM", stopWebhook);
+    process.once("SIGINT", () => { void shutdown(stopWebhook); });
+    process.once("SIGTERM", () => { void shutdown(stopWebhook); });
   } else {
     // --- Polling mode (default) ---
     // grammY runner handles concurrent update processing.
     // sequentialize middleware ensures same-chat ordering; different chats run concurrently.
+    telegramHealth.polling();
     const runner = run(bot, {
       runner: {
+        ...POLLING_OPTIONS,
         fetch: {
           allowed_updates: [...allowedUpdates],
         },
       },
     });
 
-    const stopRunner = () => runner.isRunning() && runner.stop();
-    process.once("SIGINT", stopRunner);
-    process.once("SIGTERM", stopRunner);
+    void runner.task()?.catch((err) => {
+      telegramHealth.stopped();
+      logger.error({ err }, "Polling stopped; exiting so the container can recover");
+      process.exit(1);
+    });
+
+    const stopRunner = async (): Promise<void> => {
+      if (runner.isRunning()) await runner.stop();
+    };
+    process.once("SIGINT", () => { void shutdown(stopRunner); });
+    process.once("SIGTERM", () => { void shutdown(stopRunner); });
   }
 }
 

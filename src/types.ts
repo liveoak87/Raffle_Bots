@@ -51,6 +51,8 @@ export interface Raffle {
   revoke_referral_links: number;
   created_at: string;
   drawn_at: string | null;
+  /** When the raffle left the open state (drawn or cancelled) */
+  closed_at: string | null;
   /** Whether the winner announcement was successfully posted (0 = no, 1 = yes) */
   announced: number;
   /** How many times we've tried to send the winner announcement */
@@ -181,6 +183,8 @@ export interface ReferralLink {
   user_display_name: string;
   chat_id: number;
   invite_link: string;
+  /** 1 when the invite requires approval so GroupKeeper can enforce backup membership. */
+  groupkeeper_routed: number;
   bonus_entries: number;
   created_at: string;
 }

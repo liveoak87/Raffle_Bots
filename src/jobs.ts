@@ -67,6 +67,28 @@ export function enqueue(
   return id;
 }
 
+/**
+ * Enqueue a stable payload only if no matching job already exists. This makes
+ * raffle-scoped side effects idempotent across announcement recovery paths.
+ */
+export function enqueueOnce(
+  type: string,
+  payload: unknown,
+  options: { runAfter?: Date; maxAttempts?: number } = {}
+): number {
+  const encodedPayload = JSON.stringify(payload);
+  const tx = db.getDb().transaction(() => {
+    const existing = db.getDb()
+      .prepare(
+        "SELECT id FROM jobs WHERE type = ? AND payload = ? AND status != 'failed' ORDER BY id ASC LIMIT 1"
+      )
+      .get(type, encodedPayload) as { id: number } | undefined;
+    if (existing) return existing.id;
+    return enqueue(type, payload, options);
+  });
+  return tx();
+}
+
 /** Mark a job as running and bump its attempt count. Returns the locked row. */
 function claimNext(): Job | null {
   const dbi = db.getDb();

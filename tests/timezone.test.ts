@@ -111,6 +111,16 @@ describe("buildUtcDateFromLocal", () => {
     expect(buildUtcDateFromLocal("2026-06-15", "14:60", "UTC")).toBeNull();
   });
 
+  it("rejects impossible calendar dates", () => {
+    expect(buildUtcDateFromLocal("2026-02-31", "14:00", "UTC")).toBeNull();
+  });
+
+  it("rejects wall times skipped by a DST transition", () => {
+    expect(
+      buildUtcDateFromLocal("2026-03-08", "02:30", "America/New_York")
+    ).toBeNull();
+  });
+
   it("accepts single-digit hour", () => {
     const result = buildUtcDateFromLocal("2026-06-15", "9:00", "UTC");
     expect(result).not.toBeNull();

@@ -1,5 +1,6 @@
 import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
+import path from "path";
 import type { Raffle, RaffleWinner } from "./types";
 import { parsePrizes } from "./types";
 import { getEntryCount, getTotalEntryCount, getChatTimezone } from "./database";
@@ -19,6 +20,12 @@ export function getUserDisplayName(
   lastName?: string
 ): string {
   return lastName ? `${firstName} ${lastName}` : firstName;
+}
+
+function raffleTime(date: Date, timezone: string): string {
+  const unix = Math.floor(date.getTime() / 1000);
+  const wall = escapeHtml(formatInTimezone(date, timezone));
+  return `<tg-time unix="${unix}" format="r">⏳</tg-time> <i>(${wall})</i>`;
 }
 
 export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: string = "en"): string {
@@ -58,15 +65,13 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
 
   if (raffle.ends_at) {
     const endsDate = new Date(raffle.ends_at + "Z");
-    const wall = formatInTimezone(endsDate, tz);
-    msg += `⏰ <b>${t(lang, "raffle.ends")}:</b> ${formatCountdown(endsDate)} <i>(${escapeHtml(wall)})</i>\n`;
+    msg += `⏰ <b>${t(lang, "raffle.ends")}:</b> ${raffleTime(endsDate, tz)}\n`;
   }
 
   if (raffle.starts_at) {
     const startsDate = new Date(raffle.starts_at + "Z");
     if (startsDate > new Date()) {
-      const wall = formatInTimezone(startsDate, tz);
-      msg += `🕐 <b>${t(lang, "raffle.opens")}:</b> ${formatCountdown(startsDate).replace(" remaining", "")} <i>(${escapeHtml(wall)})</i>\n`;
+      msg += `🕐 <b>${t(lang, "raffle.opens")}:</b> ${raffleTime(startsDate, tz)}\n`;
     }
   }
 
@@ -82,7 +87,7 @@ export function formatRaffleMessage(raffle: Raffle, entryCount?: number, lang: s
   const reqs: string[] = [];
   if (raffle.require_username) reqs.push("username required");
   if (raffle.required_chat_id) {
-    reqs.push(`member of ${raffle.required_chat_title || "required group"}`);
+    reqs.push(`member of ${escapeHtml(raffle.required_chat_title || "required group")}`);
   }
   if (raffle.min_account_age_days > 0) reqs.push(`account ${raffle.min_account_age_days}d+ old`);
   if (raffle.winner_cooldown > 0) reqs.push(`recent winners excluded`);
@@ -184,14 +189,17 @@ export function parseEndTime(input: string): Date | null {
   if (relativeMatch) {
     const amount = parseInt(relativeMatch[1], 10);
     const unit = relativeMatch[2].toLowerCase();
+    if (!Number.isSafeInteger(amount) || amount <= 0) return null;
 
-    if (unit.startsWith("m")) {
-      return new Date(now.getTime() + amount * 60 * 1000);
-    } else if (unit.startsWith("h")) {
-      return new Date(now.getTime() + amount * 60 * 60 * 1000);
-    } else if (unit.startsWith("d")) {
-      return new Date(now.getTime() + amount * 24 * 60 * 60 * 1000);
-    }
+    const unitMs = unit.startsWith("m")
+      ? 60 * 1000
+      : unit.startsWith("h")
+        ? 60 * 60 * 1000
+        : 24 * 60 * 60 * 1000;
+    const timestamp = now.getTime() + amount * unitMs;
+    if (!Number.isSafeInteger(timestamp)) return null;
+    const result = new Date(timestamp);
+    return Number.isFinite(result.getTime()) ? result : null;
   }
 
   // Try absolute datetime
@@ -201,6 +209,20 @@ export function parseEndTime(input: string): Date | null {
   }
 
   return null;
+}
+
+/**
+ * Quote a value for CSV and neutralize spreadsheet formula prefixes.
+ * Telegram names are user-controlled, so an export must be safe to open.
+ */
+export function escapeCsvCell(value: unknown): string {
+  let text = String(value ?? "");
+  if (/^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+export function getBackupDirectory(databasePath: string): string {
+  return path.join(path.dirname(path.resolve(databasePath)), "backups");
 }
 
 export function formatCountdown(target: Date): string {
@@ -281,4 +303,3 @@ export function buildMessageLink(chatId: number, messageId: number | null): stri
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-

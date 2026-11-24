@@ -1,4 +1,7 @@
 import path from "path";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import type { Api } from "grammy";
 import { InputFile, InlineKeyboard } from "grammy";
 import { getCachedBannerFileId, setCachedBannerFileId } from "./database";
 
@@ -14,147 +17,68 @@ function getAssetPath(filename: string): string {
   return path.join(process.cwd(), "assets", filename);
 }
 
-/**
- * Send a branded banner image to a chat.
- * Always sends the branded banner (never overridden by custom images).
- * Returns the message_id of the sent photo, or null on failure.
- * Failures are non-fatal — the raffle still posts as text.
- */
-export async function sendBanner(
-  api: {
-    sendPhoto: (
-      chatId: number,
-      photo: string | InputFile,
-      opts?: Record<string, unknown>
-    ) => Promise<{
-      message_id: number;
-      photo?: Array<{ file_id: string }>;
-    }>;
-  },
-  chatId: number,
-  bannerType: BannerType
-): Promise<number | null> {
-  // 1. Try cached Telegram file_id (fast, no re-upload)
-  const cachedFileId = getCachedBannerFileId(bannerType);
-  if (cachedFileId) {
+// Telegram file IDs belong to one bot. Version each entry by asset contents so
+// a restart reuses the ID and replacing a banner uploads the new artwork.
+const assetHashes = new Map<BannerType, string>();
+
+async function withBanner<T extends true | { message_id: number; photo?: Array<{ file_id: string }> }>(
+  type: BannerType, post: (source: string | InputFile) => Promise<T>
+): Promise<T> {
+  const file = getAssetPath(BANNER_FILES[type]);
+  let hash = assetHashes.get(type);
+  if (!hash) {
+    hash = createHash("sha256").update(readFileSync(file)).digest("hex");
+    assetHashes.set(type, hash);
+  }
+  const botId = process.env.BOT_TOKEN?.split(":")[0] ?? "offline";
+  const key = `${botId}:${type}:${hash}`;
+  const cached = getCachedBannerFileId(key);
+  if (cached) {
     try {
-      const msg = await api.sendPhoto(chatId, cachedFileId);
-      return msg.message_id;
-    } catch {
-      // Cache may be stale (e.g., bot token changed) — fall through to file upload
+      return await post(cached);
+    } catch (error) {
+      const err = error as { error_code?: number; description?: string };
+      if (err?.error_code !== 400 || !/wrong (?:remote )?file identifier|file_id_invalid|file_reference_expired/i.test(err.description ?? "")) throw error;
     }
   }
-
-  // 2. Upload from local file and cache the resulting file_id
-  const filePath = getAssetPath(BANNER_FILES[bannerType]);
-  try {
-    const msg = await api.sendPhoto(chatId, new InputFile(filePath));
-    // Cache the file_id for future sends
-    if (msg.photo && msg.photo.length > 0) {
-      const largestPhoto = msg.photo[msg.photo.length - 1];
-      setCachedBannerFileId(bannerType, largestPhoto.file_id);
+  const message = await post(new InputFile(file));
+  const fileId = message !== true && message.photo?.at(-1)?.file_id;
+  if (fileId) {
+    try {
+      setCachedBannerFileId(key, fileId);
+    } catch (error) {
+      console.error("Could not cache accepted Telegram banner", error);
     }
-    return msg.message_id;
-  } catch (err) {
-    console.error(
-      `Failed to send ${bannerType} banner to chat ${chatId}:`,
-      err
-    );
-    return null;
   }
+  return message;
 }
 
-/**
- * Get the banner file_id as a string (for editMessageMedia).
- * Returns null if not cached and unable to upload.
- */
-export async function getBannerFileId(
-  api: {
-    sendPhoto: (
-      chatId: number,
-      photo: string | InputFile,
-      opts?: Record<string, unknown>
-    ) => Promise<{
-      message_id: number;
-      photo?: Array<{ file_id: string }>;
-    }>;
-    deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
-  },
-  chatId: number,
-  bannerType: BannerType
-): Promise<string | null> {
-  // Try cached file_id first
-  const cachedFileId = getCachedBannerFileId(bannerType);
-  if (cachedFileId) {
-    return cachedFileId;
-  }
-
-  // Need to upload to get a file_id — send and delete a temporary message
-  const filePath = getAssetPath(BANNER_FILES[bannerType]);
-  try {
-    const msg = await api.sendPhoto(chatId, new InputFile(filePath));
-    if (msg.photo && msg.photo.length > 0) {
-      const largestPhoto = msg.photo[msg.photo.length - 1];
-      setCachedBannerFileId(bannerType, largestPhoto.file_id);
-      try {
-        await api.deleteMessage(chatId, msg.message_id);
-      } catch {}
-      return largestPhoto.file_id;
-    }
-  } catch (err) {
-    console.error(`Failed to get banner file_id for ${bannerType}:`, err);
-  }
-
-  return null;
-}
-
-/**
- * Get the banner file_id (cached) or InputFile for a banner type.
- * Used internally for sending raffle posts with embedded banners.
- */
-export async function getBannerSource(
-  api: {
-    sendPhoto: (
-      chatId: number,
-      photo: string | InputFile,
-      opts?: Record<string, unknown>
-    ) => Promise<{
-      message_id: number;
-      photo?: Array<{ file_id: string }>;
-    }>;
-    deleteMessage: (chatId: number, messageId: number) => Promise<unknown>;
-  },
-  chatId: number,
-  bannerType: BannerType
-): Promise<string | InputFile> {
-  // Try cached file_id first
-  const cachedFileId = getCachedBannerFileId(bannerType);
-  if (cachedFileId) {
-    return cachedFileId;
-  }
-
-  // Need to upload to get a file_id — send and delete a temporary message
-  const filePath = getAssetPath(BANNER_FILES[bannerType]);
-  try {
-    const msg = await api.sendPhoto(chatId, new InputFile(filePath));
-    // Cache the file_id
-    if (msg.photo && msg.photo.length > 0) {
-      const largestPhoto = msg.photo[msg.photo.length - 1];
-      setCachedBannerFileId(bannerType, largestPhoto.file_id);
-      // Delete the temporary message
-      try {
-        await api.deleteMessage(chatId, msg.message_id);
-      } catch {}
-      return largestPhoto.file_id;
-    }
-  } catch {}
-
-  // Fallback to InputFile
-  return new InputFile(filePath);
+export async function editClosedBanner(api: Pick<Api, "editMessageMedia">, chatId: number, messageId: number, caption: string) {
+  await withBanner("closed", media => api.editMessageMedia(chatId, messageId, {
+    type: "photo", media, caption, parse_mode: "HTML",
+  }));
 }
 
 // Telegram photo caption limit
 const MAX_CAPTION_LENGTH = 1024;
+const MAX_MESSAGE_LENGTH = 3900;
+
+/** Split only at line boundaries so generated HTML entities/tags stay intact. */
+function splitWinnerText(text: string): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (current && candidate.length > MAX_MESSAGE_LENGTH) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.length > 0 ? chunks : [""];
+}
 
 /**
  * Detect Telegram errors that indicate the target forum topic is closed.
@@ -202,50 +126,41 @@ export async function sendRafflePost(
   threadId?: number | null
 ): Promise<number | null> {
   const threadOpts = threadId ? { message_thread_id: threadId } : {};
+  const sentMessageIds: number[] = [];
   try {
     // 1. Send custom image first (above the raffle) if provided
     if (customImageFileId) {
       try {
-        await api.sendPhoto(chatId, customImageFileId, threadOpts);
+        const customImage = await api.sendPhoto(chatId, customImageFileId, threadOpts);
+        sentMessageIds.push(customImage.message_id);
       } catch (err) {
         console.error(`Failed to send custom image to chat ${chatId}:`, err);
         // Non-fatal — continue with raffle post
       }
     }
 
-    // 2. Get the banner source (file_id or InputFile)
-    const bannerSource = await getBannerSource(api, chatId, bannerType);
-
-    // 3. Check caption length — if too long, send banner then text separately
     if (caption.length > MAX_CAPTION_LENGTH) {
-      // Send banner without caption
-      await api.sendPhoto(chatId, bannerSource, threadOpts);
-      // Send text message with buttons
+      const banner = await withBanner(bannerType, source => api.sendPhoto(chatId, source, threadOpts));
+      sentMessageIds.push(banner.message_id);
       const msg = await api.sendMessage(chatId, caption, {
-        parse_mode: "HTML",
-        reply_markup: keyboard,
-        ...threadOpts,
+        parse_mode: "HTML", reply_markup: keyboard, ...threadOpts,
       });
       return msg.message_id;
     }
 
-    // 4. Send the raffle as a photo with caption and buttons
-    const msg = await api.sendPhoto(chatId, bannerSource, {
-      caption,
-      parse_mode: "HTML",
-      reply_markup: keyboard,
-      ...threadOpts,
-    });
-
-    // Cache the file_id if we uploaded a new one
-    if (msg.photo && msg.photo.length > 0) {
-      const largestPhoto = msg.photo[msg.photo.length - 1];
-      setCachedBannerFileId(bannerType, largestPhoto.file_id);
-    }
-
+    const msg = await withBanner(bannerType, source => api.sendPhoto(chatId, source, {
+      caption, parse_mode: "HTML", reply_markup: keyboard, ...threadOpts,
+    }));
     return msg.message_id;
   } catch (err) {
     console.error(`Failed to send raffle post to chat ${chatId}:`, err);
+    // Roll back any custom image or split banner already posted so callers
+    // can safely delete the unposted raffle row without leaving orphan media.
+    for (const messageId of sentMessageIds.reverse()) {
+      try {
+        await api.deleteMessage(chatId, messageId);
+      } catch {}
+    }
     return null;
   }
 }
@@ -362,105 +277,29 @@ export async function sendWinnerPost(
   winnerText: string,
   threadId?: number | null
 ): Promise<void> {
-  const MAX_CAPTION_LENGTH = 1024;
-  let activeThreadId: number | null | undefined = threadId;
-  const threadOpts = () =>
-    activeThreadId ? { message_thread_id: activeThreadId } : {};
-
-  // Get or upload the "drawn" banner
-  let fileId = getCachedBannerFileId("drawn");
-
-  if (!fileId) {
-    // Upload to get file_id
-    const filePath = getAssetPath(BANNER_FILES["drawn"]);
+  let activeThread = threadId;
+  async function inTopic(send: (options: { message_thread_id?: number }) => Promise<unknown>) {
     try {
-      const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts());
-      if (msg.photo && msg.photo.length > 0) {
-        fileId = msg.photo[msg.photo.length - 1].file_id;
-        setCachedBannerFileId("drawn", fileId);
-        // Delete the temp message
-        try {
-          await api.deleteMessage(chatId, msg.message_id);
-        } catch {}
-      }
-    } catch (err) {
-      if (isTopicClosedError(err) && activeThreadId) {
-        // Forum topic was closed — fall back to General by clearing threadId
-        // for all subsequent attempts in this winner post.
-        console.warn(
-          `Topic ${activeThreadId} closed in chat ${chatId}; posting winners to General.`
-        );
-        activeThreadId = null;
-        // Retry banner upload to General
-        try {
-          const msg = await api.sendPhoto(chatId, new InputFile(filePath), threadOpts());
-          if (msg.photo && msg.photo.length > 0) {
-            fileId = msg.photo[msg.photo.length - 1].file_id;
-            setCachedBannerFileId("drawn", fileId);
-            try {
-              await api.deleteMessage(chatId, msg.message_id);
-            } catch {}
-          }
-        } catch (retryErr) {
-          console.error("Failed to upload drawn banner (General fallback):", retryErr);
-        }
-      } else {
-        console.error("Failed to upload drawn banner:", err);
-      }
+      await send(activeThread ? { message_thread_id: activeThread } : {});
+    } catch (error) {
+      if (!activeThread || !isTopicClosedError(error)) throw error;
+      activeThread = null;
+      await send({});
     }
   }
 
-  // If we have a file_id and caption fits, send as photo with caption
-  if (fileId && winnerText.length <= MAX_CAPTION_LENGTH) {
+  if (winnerText.length <= MAX_CAPTION_LENGTH) {
     try {
-      await api.sendPhoto(chatId, fileId, {
-        caption: winnerText,
-        parse_mode: "HTML",
-        ...threadOpts(),
-      });
+      await inTopic(opts => withBanner("drawn", source => api.sendPhoto(chatId, source, {
+        caption: winnerText, parse_mode: "HTML", ...opts,
+      })));
       return;
-    } catch (err) {
-      if (isTopicClosedError(err) && activeThreadId) {
-        console.warn(
-          `Topic ${activeThreadId} closed in chat ${chatId}; posting winners to General.`
-        );
-        activeThreadId = null;
-        try {
-          await api.sendPhoto(chatId, fileId, {
-            caption: winnerText,
-            parse_mode: "HTML",
-            ...threadOpts(),
-          });
-          return;
-        } catch (retryErr) {
-          console.error("Failed to send winner post with banner (General fallback):", retryErr);
-        }
-      } else {
-        console.error("Failed to send winner post with banner:", err);
-      }
+    } catch (error) {
+      console.error("Failed to send winner banner, using text", error);
     }
   }
 
-  // Fallback: just send text
-  try {
-    await api.sendMessage(chatId, winnerText, { parse_mode: "HTML", ...threadOpts() });
-  } catch (err) {
-    if (isTopicClosedError(err) && activeThreadId) {
-      console.warn(
-        `Topic ${activeThreadId} closed in chat ${chatId}; posting winner text to General.`
-      );
-      activeThreadId = null;
-      try {
-        await api.sendMessage(chatId, winnerText, {
-          parse_mode: "HTML",
-          ...threadOpts(),
-        });
-        return;
-      } catch (retryErr) {
-        console.error("Failed to send winner text (General fallback):", retryErr);
-      }
-    } else {
-      console.error("Failed to send winner text:", err);
-    }
+  for (const chunk of splitWinnerText(winnerText)) {
+    await inTopic(opts => api.sendMessage(chatId, chunk, { parse_mode: "HTML", ...opts }));
   }
 }

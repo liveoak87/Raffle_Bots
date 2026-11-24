@@ -231,6 +231,14 @@ ssh unraid-cf "docker logs raffle-bot --tail 200 | jq -c 'select(.level == \"err
 
 ---
 
+## Bot API handoffs
+
+Production polls through the private `raffle-telegram-api` container on Unraid. Both containers are configured to restart automatically, and the API server keeps its state in the `raffle-telegram-api-state` Docker volume. Follow [the production deployment steps](DEPLOY.md#deploy-to-production-stable) to preserve that endpoint when rebuilding the raffle bot.
+
+Use `/health` and the external heartbeat to detect stale polling. If the private API container has failed, check its logs and Docker state and recover that service with its existing volume. A health check failure alone cannot tell you whether the problem is the API container, the raffle bot, or Telegram upstream.
+
+Switching API servers is a session handoff. Stop the active bot process and coordinate logout from its current API server before starting a poller on the other one. A production-token request to the standby can open a second session. When the hosted API accepts `logOut`, Telegram enforces a ten-minute wait before returning to that API. If logout times out, Telegram does not guarantee that all updates will reach a second server. A planned switch should confirm the handoff before proceeding and then verify fresh polling and a real user action. See [Telegram's migration guidance](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server).
+
 ## Optional: Switch to Webhook Mode
 
 By default the bot uses **long-polling** (asks Telegram for updates every ~1s).

@@ -118,6 +118,31 @@ describe("database optimization helpers", () => {
     expect(recent[1].bonus_entries).toBe(0);
   });
 
+  it("persists the one-way GroupKeeper route for referral links", () => {
+    const raffle = db.createRaffle(raffleInput({ referral_enabled: 1 }));
+    const referral = db.createReferralLink(
+      raffle.id,
+      3,
+      "Three",
+      raffle.chat_id,
+      "https://t.me/+gated",
+      true
+    );
+
+    expect(referral.groupkeeper_routed).toBe(1);
+
+    const direct = db.createReferralLink(
+      raffle.id,
+      4,
+      "Four",
+      raffle.chat_id,
+      "https://t.me/+direct"
+    );
+    expect(direct.groupkeeper_routed).toBe(0);
+    db.markReferralLinkGroupKeeperRouted(direct.id);
+    expect(db.getReferralLink(raffle.id, 4)?.groupkeeper_routed).toBe(1);
+  });
+
   it("selectWinners handles referral weighting without duplicate winners", () => {
     const raffle = db.createRaffle(
       raffleInput({ referral_enabled: 1, max_winners: 3 })
@@ -132,6 +157,52 @@ describe("database optimization helpers", () => {
     const winners = db.selectWinners(raffle.id);
     expect(winners).toHaveLength(3);
     expect(new Set(winners.map((w) => w.user_id)).size).toBe(3);
+  });
+
+  it("repairs a drawn raffle whose winner rows were not persisted", () => {
+    const raffle = db.createRaffle(raffleInput({ max_winners: 2 }));
+    db.addEntry(raffle.id, 1, "one", "One");
+    db.addEntry(raffle.id, 2, "two", "Two");
+    db.markRaffleDrawn(raffle.id);
+
+    expect(db.getWinnersForRaffle(raffle.id)).toEqual([]);
+    expect(db.ensureWinnersForRaffle(raffle.id)).toHaveLength(2);
+    expect(db.ensureWinnersForRaffle(raffle.id)).toHaveLength(2);
+    expect(db.getWinnersForRaffle(raffle.id)).toHaveLength(2);
+  });
+
+  it("awards a referral only once for a joined user, including rejoins", () => {
+    const raffle = db.createRaffle(
+      raffleInput({ referral_enabled: 1, max_referral_entries: 5 })
+    );
+    const referral = db.createReferralLink(
+      raffle.id,
+      1,
+      "Referrer",
+      raffle.chat_id,
+      "https://t.me/+one"
+    );
+
+    expect(db.awardReferralBonus(referral.id, raffle.id, 99, 5)).toBe(1);
+    expect(db.awardReferralBonus(referral.id, raffle.id, 99, 5)).toBeNull();
+    expect(db.getReferralLink(raffle.id, 1)?.bonus_entries).toBe(1);
+  });
+
+  it("enforces the referral cap atomically", () => {
+    const raffle = db.createRaffle(
+      raffleInput({ referral_enabled: 1, max_referral_entries: 1 })
+    );
+    const referral = db.createReferralLink(
+      raffle.id,
+      1,
+      "Referrer",
+      raffle.chat_id,
+      "https://t.me/+cap"
+    );
+
+    expect(db.awardReferralBonus(referral.id, raffle.id, 98, 1)).toBe(1);
+    expect(db.awardReferralBonus(referral.id, raffle.id, 99, 1)).toBeNull();
+    expect(db.getReferralLink(raffle.id, 1)?.bonus_entries).toBe(1);
   });
 
   it("remembers and removes verified admin groups per user", () => {
@@ -155,6 +226,13 @@ describe("database optimization helpers", () => {
     db.clearUserAdminGroups(10);
     expect(db.getUserAdminGroups(10)).toEqual([]);
     expect(db.getUserAdminGroups(20)).toHaveLength(1);
+  });
+
+  it("cannot recreate private group records during a stale background refresh", () => {
+    db.upsertBotGroup(888, "", "member");
+    expect(db.getBotGroup(888)).toBeUndefined();
+    db.upsertBotGroup(-1001, "Real Group", "administrator");
+    expect(db.getActiveBotGroups().map(group => group.chat_id)).toEqual([-1001]);
   });
 
   it("filters remembered groups using owner-controlled access settings", () => {
@@ -192,5 +270,23 @@ describe("database optimization helpers", () => {
     const entries = db.getOpenRafflesEnteredByUser(50);
     expect(entries.map((raffle) => raffle.title).sort()).toEqual(["First", "Second"]);
     expect(db.getOpenRafflesEnteredByUser(99)).toEqual([]);
+  });
+
+  it("purges participant rows from completion time while retaining history", () => {
+    const raffle = db.createRaffle(raffleInput());
+    db.addEntry(raffle.id, 50, "person", "Person");
+    db.markRaffleDrawn(raffle.id);
+    db.selectWinners(raffle.id);
+
+    expect(db.purgeExpiredData(24)).toBe(0);
+    db.getDb().prepare(
+      "UPDATE raffles SET closed_at = datetime('now', '-25 hours') WHERE id = ?"
+    ).run(raffle.id);
+
+    expect(db.purgeExpiredData(24)).toBe(1);
+    expect(db.getEntriesForRaffle(raffle.id)).toEqual([]);
+    expect(db.getRaffleById(raffle.id)).toBeDefined();
+    expect(db.getWinnersForRaffle(raffle.id)).toHaveLength(1);
+    expect(db.purgeExpiredData(24)).toBe(0);
   });
 });

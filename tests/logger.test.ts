@@ -67,4 +67,14 @@ describe("logger", () => {
     expect(filteredSpy).not.toHaveBeenCalled();
     filteredSpy.mockRestore();
   });
+
+  it("falls back to info for an invalid configured level", async () => {
+    vi.resetModules();
+    process.env.LOG_LEVEL = "verbose";
+    const { logger: fallbackLogger } = await import("../src/logger");
+    const fallbackSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fallbackLogger.info({}, "still visible");
+    expect(fallbackSpy).toHaveBeenCalledTimes(1);
+    fallbackSpy.mockRestore();
+  });
 });

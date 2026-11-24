@@ -5,8 +5,18 @@ services:
     restart: unless-stopped
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      - BOT_OWNER_ID=${BOT_OWNER_ID:-}
+      - ACTIVE_RAFFLE_VIEWER_IDS=${ACTIVE_RAFFLE_VIEWER_IDS:-}
       - DATABASE_PATH=/data/raffle.db
       - DATA_RETENTION_HOURS=${DATA_RETENTION_HOURS:-24}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_PRETTY=${LOG_PRETTY:-0}
+      - HEARTBEAT_URL=${HEARTBEAT_URL:-}
+      - HEARTBEAT_INTERVAL_MS=${HEARTBEAT_INTERVAL_MS:-300000}
+      - TELEGRAM_API_ROOT=${TELEGRAM_API_ROOT:-}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      - WEBHOOK_PORT=${WEBHOOK_PORT:-3001}
       # Control-tower admin endpoint (shared key from .env). Reachable on the
       # Docker network at http://raffle-bot:8787 — point cloudflared ingress here.
       - ADMIN_KEY=${ADMIN_KEY:-}
@@ -15,5 +25,12 @@ services:
     # cloudflared reaches it at http://localhost:8788.
     ports:
       - "8788:8787"
+      - "${WEBHOOK_PORT:-3001}:${WEBHOOK_PORT:-3001}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     volumes:
       - ./data:/data

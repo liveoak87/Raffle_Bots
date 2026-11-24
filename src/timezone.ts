@@ -145,6 +145,17 @@ export function buildUtcDateFromLocal(
     return null;
   }
 
+  // Reject impossible calendar dates before timezone conversion normalizes
+  // them (for example, February 31st becoming March 3rd).
+  const calendarCheck = new Date(Date.UTC(year, month - 1, day));
+  if (
+    calendarCheck.getUTCFullYear() !== year ||
+    calendarCheck.getUTCMonth() !== month - 1 ||
+    calendarCheck.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
   // Trick: format a known UTC time in the target timezone, compute the
   // offset, then reverse-apply it. This handles DST correctly because we're
   // asking Intl what offset applies on the *target* day.
@@ -189,7 +200,20 @@ function findUtcForLocal(
       dm * 60_000;
     candidate = new Date(candidate.getTime() + offsetMs);
   }
-  return candidate;
+  // Non-existent DST wall times (for example 02:30 during spring-forward)
+  // never round-trip exactly and must not be silently shifted.
+  const finalWall = getWallClockParts(candidate, timezone);
+  if (
+    finalWall &&
+    finalWall.year === year &&
+    finalWall.month === month &&
+    finalWall.day === day &&
+    finalWall.hour === hour &&
+    finalWall.minute === minute
+  ) {
+    return candidate;
+  }
+  return null;
 }
 
 function getWallClockParts(

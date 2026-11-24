@@ -1,26 +1,36 @@
 /**
  * Tiny HTTP admin server for the consolidated control tower.
  * GET /admin/summary  (X-Admin-Key gated) → normalized BotSummary
- * GET /admin/health   → liveness (no auth)
+ * GET /health         → liveness (no auth, control-tower convention)
+ * GET /admin/health   → liveness (no auth, backwards compatible)
  *
  * Always-on regardless of webhook/polling mode. Raffle bot is free (no
  * subscriptions); exposed publicly via the Cloudflare tunnel.
  */
 import * as http from "http";
-import { getBotStats, getActiveBotGroups, getAdminBotGroups } from "./database";
+import {
+  getBotStats,
+  getActiveBotGroups,
+  getAdminBotGroups,
+  getAdminGroupSummaries,
+  getAnnouncementHealth,
+} from "./database";
+import { getJobStats } from "./jobs";
 import { logger } from "./logger";
 
-export function startAdminServer(): void {
-  const key = process.env.ADMIN_KEY || "";
-  const port = Number(process.env.ADMIN_PORT || 8787);
-
-  const server = http.createServer((req, res) => {
+export function createAdminServer(key: string, transportHealthy: () => boolean = () => true): http.Server {
+  return http.createServer((req, res) => {
+    res.setHeader("cache-control", "no-store");
     try {
       const url = new URL(req.url || "/", "http://localhost");
 
-      if (req.method === "GET" && url.pathname === "/admin/health") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+      if (
+        req.method === "GET" &&
+        (url.pathname === "/health" || url.pathname === "/admin/health")
+      ) {
+        const ok = transportHealthy();
+        res.writeHead(ok ? 200 : 503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok }));
         return;
       }
 
@@ -31,6 +41,8 @@ export function startAdminServer(): void {
           return;
         }
         const s = getBotStats();
+        const announcements = getAnnouncementHealth();
+        const jobs = getJobStats();
         const body = {
           bot: "raffle",
           display: "Ultimate Raffle",
@@ -45,11 +57,18 @@ export function startAdminServer(): void {
             "Active raffles": s.activeRaffles,
             "Entries": s.totalEntries,
             "Winners": s.totalWinners,
+            "Unannounced": announcements.totalUnannounced,
+            "Historical failed announcements": announcements.permanentlyFailed,
+            "Failed jobs": jobs.failed,
           },
-          errors_24h: 0,
+          // No durable error-event table exists, so do not report a false zero.
+          errors_24h: null,
           recent_errors: [],
           webhook: null,
-          healthy: true,
+          healthy:
+            transportHealthy() &&
+            announcements.stuckOver15min === 0 &&
+            jobs.failed === 0,
           generated_at: Math.floor(Date.now() / 1000),
         };
         res.writeHead(200, { "content-type": "application/json" });
@@ -57,13 +76,41 @@ export function startAdminServer(): void {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/admin/groups") {
+        if (!key || req.headers["x-admin-key"] !== key) {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "forbidden" }));
+          return;
+        }
+        const groups = getAdminGroupSummaries();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ count: groups.length, groups }));
+        return;
+      }
+
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
-    } catch (e: any) {
+    } catch (err) {
+      logger.error({ err }, "Admin request failed");
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: String(e?.message || e) }));
+      res.end(JSON.stringify({ error: "internal server error" }));
     }
   });
+}
+
+export function startAdminServer(transportHealthy: () => boolean = () => true): http.Server {
+  const key = process.env.ADMIN_KEY || "";
+  const rawPort = process.env.ADMIN_PORT || "8787";
+  if (!/^\d+$/.test(rawPort)) {
+    throw new Error("ADMIN_PORT must be an integer between 1 and 65535");
+  }
+  const port = Number(rawPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("ADMIN_PORT must be an integer between 1 and 65535");
+  }
+
+  const server = createAdminServer(key, transportHealthy);
 
   server.listen(port, () => logger.info({ port }, "Admin server listening"));
+  return server;
 }

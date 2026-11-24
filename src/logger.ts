@@ -21,7 +21,10 @@ const LEVEL_RANK: Record<LogLevel, number> = {
   error: 40,
 };
 
-const MIN_LEVEL: LogLevel = (process.env.LOG_LEVEL as LogLevel) || "info";
+const configuredLevel = process.env.LOG_LEVEL?.toLowerCase();
+const MIN_LEVEL: LogLevel = configuredLevel && configuredLevel in LEVEL_RANK
+  ? configuredLevel as LogLevel
+  : "info";
 const PRETTY = process.env.LOG_PRETTY === "1";
 
 function shouldLog(level: LogLevel): boolean {

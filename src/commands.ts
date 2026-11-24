@@ -1,3 +1,5 @@
+import { finishOpenPostEdits, refreshOpenRafflePost } from "./rafflePost";
+import { deliverOnce } from "./delivery";
 import * as fs from "fs";
 import * as path from "path";
 import { InlineKeyboard, InputFile } from "grammy";
@@ -5,7 +7,7 @@ import type { Context } from "grammy";
 import * as db from "./database";
 import { parsePrizes } from "./types";
 import { metrics, computeLatencyStats } from "./metrics";
-import { getJobStats } from "./jobs";
+import { enqueueOnce, getJobStats } from "./jobs";
 import {
   escapeHtml,
   getUserDisplayName,
@@ -15,6 +17,8 @@ import {
   replyPrivately,
   buildRaffleKeyboard,
   buildMessageLink,
+  escapeCsvCell,
+  getBackupDirectory,
 } from "./helpers";
 import {
   startWizard,
@@ -27,9 +31,10 @@ import {
   setActiveWizardDestination,
 } from "./wizard";
 import { t, getLanguageName, getAvailableLanguages } from "./i18n";
-import { sendWheelSpin, sendRafflePost, getBannerFileId, sendWinnerPost } from "./banners";
+import { sendWheelSpin, sendRafflePost, editClosedBanner, sendWinnerPost } from "./banners";
 import { getForumTopicName, resolveTemplateThreadId } from "./forumTopics";
 import { getGroupManagementAccess, isGroupOwner } from "./access";
+import { prepareWorkflowInput } from "./workflowSessions";
 import {
   decodeRerunDestination,
   encodeRerunDestination,
@@ -38,60 +43,38 @@ import {
   type RerunDestination,
 } from "./rerun";
 
-// --- Smart debounced post updates ---
-// Pattern: first entry refreshes the message immediately (so users see their
-// click registered), but subsequent entries within DEBOUNCE_MS are batched
-// into a single edit. After the window closes, the next entry starts a
-// fresh "immediate" cycle.
-//
-// This gives both perceived snappiness (instant feedback) AND protection
-// from API rate limits during entry bursts.
+// Refresh immediately, then send the latest count only if another entry or
+// leave arrived. Keep at most one edit in flight per raffle during slow sends.
 const DEBOUNCE_MS = 2_500;
 interface PendingUpdate {
-  timer: ReturnType<typeof setTimeout>;
-  ctx: Context;
-  lastEditAt: number;
+  nextContext?: Context;
+  timer?: ReturnType<typeof setTimeout>;
 }
 const pendingPostUpdates = new Map<number, PendingUpdate>();
 
 function debouncedUpdateRafflePost(ctx: Context, raffleId: number): void {
-  const now = Date.now();
   const existing = pendingPostUpdates.get(raffleId);
-
-  // First entry in a fresh window — edit immediately
-  if (!existing || now - existing.lastEditAt > DEBOUNCE_MS) {
-    if (existing) clearTimeout(existing.timer);
-    pendingPostUpdates.set(raffleId, {
-      timer: setTimeout(() => {}, 0), // placeholder, replaced below
-      ctx,
-      lastEditAt: now,
-    });
-    updateRafflePost(ctx, raffleId).catch((err) =>
-      console.error("Failed to update raffle post:", err)
-    );
-    // Schedule a "trailing edge" refresh in case more entries arrive during the window
-    const trailingTimer = setTimeout(() => {
-      const e = pendingPostUpdates.get(raffleId);
-      if (e) {
-        pendingPostUpdates.delete(raffleId);
-        updateRafflePost(ctx, raffleId).catch((err) =>
-          console.error("Failed to update raffle post (trailing):", err)
-        );
-      }
-    }, DEBOUNCE_MS);
-    pendingPostUpdates.get(raffleId)!.timer = trailingTimer;
+  if (existing) {
+    existing.nextContext = ctx;
     return;
   }
 
-  // Subsequent entry within the debounce window — refresh the trailing timer
-  clearTimeout(existing.timer);
-  existing.ctx = ctx;
-  existing.timer = setTimeout(() => {
-    pendingPostUpdates.delete(raffleId);
-    updateRafflePost(ctx, raffleId).catch((err) =>
-      console.error("Failed to update raffle post (trailing):", err)
-    );
-  }, DEBOUNCE_MS);
+  const pending: PendingUpdate = {};
+  pendingPostUpdates.set(raffleId, pending);
+  function refresh(context: Context) {
+    const started = Date.now();
+    pending.nextContext = undefined;
+    void refreshOpenRafflePost(context.api, raffleId, context.me.username)
+      .catch(error => console.error("Failed to update raffle post", error))
+      .then(() => {
+        if (pendingPostUpdates.get(raffleId) !== pending) return;
+        pending.timer = setTimeout(() => {
+          if (pending.nextContext) refresh(pending.nextContext);
+          else pendingPostUpdates.delete(raffleId);
+        }, Math.max(0, DEBOUNCE_MS - (Date.now() - started)));
+      });
+  }
+  refresh(ctx);
 }
 
 /**
@@ -305,6 +288,8 @@ export async function handleSetRaffleTopic(ctx: Context): Promise<void> {
   const groupTitle = ctx.chat.title || db.getBotGroup(chatId)?.title || "this group";
   const keyboard = new InlineKeyboard();
   if (wizardUpdate === "options") {
+    // Bind this authorized group-command continuation to the current DM setup.
+    prepareWorkflowInput(ctx);
     keyboard.text("✅ Continue Current Raffle", "wiz_opt_destination_back").row();
   }
   keyboard.text("⚙️ View Group Defaults", `admin_do_defaults_${chatId}`);
@@ -373,37 +358,65 @@ async function showOpenRafflesForChat(ctx: Context, chatId: number): Promise<voi
 }
 
 async function executeDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof db.getRaffleById>>): Promise<string> {
+  // An admin acknowledgement can overlap another admin's draw or the expiry worker.
+  if (db.getRaffleById(raffle.id)?.status !== "open") return "This raffle is no longer open.";
   const entryCount = db.getEntryCount(raffle.id);
   if (entryCount === 0) {
     db.markRaffleDrawn(raffle.id);
-    await revokeReferralInviteLinks(ctx.api, raffle.id);
+    enqueueOnce("revoke_referrals", { raffleId: raffle.id });
     await updateRafflePost(ctx, raffle.id);
     return `🎟 <b>${escapeHtml(raffle.title)}</b>\n\nNo entries were received. Raffle closed with no winners.`;
   }
 
-  const lang = db.getChatLanguage(raffle.chat_id);
-  const entries = db.getEntriesForRaffle(raffle.id);
-  const entryNames = entries.map((e) => e.user_display_name);
-  const winners = db.selectWinners(raffle.id);
+  const winners = db.getDb().transaction(() => persistDraw(raffle.id))();
+  return announceDraw(ctx, raffle, winners);
+}
 
-  // Countdown animation (if animation enabled and at least 1 entry)
-  if (entryNames.length >= 1 && raffle.show_animation) {
-    await sendWheelSpin(ctx.api, raffle.chat_id, raffle.thread_id);
+function persistDraw(raffleId: number) {
+  const winners = db.selectWinners(raffleId);
+  db.markRaffleDrawn(raffleId);
+  db.recordAnnounceAttempt(raffleId);
+  enqueueOnce("revoke_referrals", { raffleId });
+  enqueueOnce("notify_winners", { raffleId });
+  return winners;
+}
+
+const announcementsInFlight = new Set<number>();
+export function isAnnouncingDraw(raffleId: number): boolean {
+  return announcementsInFlight.has(raffleId);
+}
+
+async function announceDraw(ctx: Context, raffle: NonNullable<ReturnType<typeof db.getRaffleById>>, winners: ReturnType<typeof db.selectWinners>): Promise<string> {
+  announcementsInFlight.add(raffle.id);
+  try {
+    const lang = db.getChatLanguage(raffle.chat_id);
+    // Countdown animation (if animation enabled and at least 1 entry)
+    if (raffle.show_animation) {
+      await sendWheelSpin(ctx.api, raffle.chat_id, raffle.thread_id);
+    }
+
+    // Announce winners with embedded "WINNERS DRAWN" banner
+    let announcementPending = false;
+    try {
+      await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
+      db.markRaffleAnnounced(raffle.id);
+    } catch (err) {
+      if ((err as { error_code?: number }).error_code === 403) {
+        db.markAnnounceFailed(raffle.id);
+      } else {
+        announcementPending = true;
+        console.error(`Manual draw announcement failed for raffle ${raffle.id}; retry queued:`, err);
+      }
+    }
+
+    await updateRafflePost(ctx, raffle.id);
+
+    return announcementPending
+      ? `🏆 Winners drawn for <b>${escapeHtml(raffle.title)}</b>. The public announcement is queued for retry.`
+      : `🏆 Winners drawn for <b>${escapeHtml(raffle.title)}</b>.`;
+  } finally {
+    announcementsInFlight.delete(raffle.id);
   }
-
-  // Announce winners with embedded "WINNERS DRAWN" banner
-  await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
-
-  // Mark as drawn and announced after successful announcement
-  db.markRaffleDrawn(raffle.id);
-  db.markRaffleAnnounced(raffle.id);
-  await revokeReferralInviteLinks(ctx.api, raffle.id);
-
-  await updateRafflePost(ctx, raffle.id);
-
-  // DM winners and the creator
-  await notifyWinnersAndCreator(ctx.api, raffle, winners);
-  return `🏆 Winners drawn for <b>${escapeHtml(raffle.title)}</b>.`;
 }
 
 async function isAdminOfChat(ctx: Context, chatId: number, userId: number): Promise<boolean> {
@@ -486,9 +499,8 @@ async function showAdminGroupPicker(
   action: AdminAction = "menu"
 ): Promise<void> {
   if (!ctx.from || ctx.chat?.type !== "private") {
-    const botInfo = await ctx.api.getMe();
     await ctx.reply("Open my private chat to manage your groups.", {
-      reply_markup: new InlineKeyboard().url("Open Admin Center", `https://t.me/${botInfo.username}?start=manage`),
+      reply_markup: new InlineKeyboard().url("Open Admin Center", `https://t.me/${ctx.me.username}?start=manage`),
     });
     return;
   }
@@ -512,7 +524,7 @@ async function showAdminGroupPicker(
 
   const text = groups.length > 0
     ? `<b>Select a group to manage</b>\n\nI found ${groups.length} group${groups.length === 1 ? "" : "s"} where you are an admin.`
-    : `<b>No admin groups found</b>\n\nMake sure this bot is in the group and can inspect members, then tap Refresh My Groups.`;
+    : `<b>No admin groups found</b>\n\nThe bot must be a Telegram administrator in the group—not just a member—before it can verify your admin access.\n\nPromote the bot in the group's settings, then tap Refresh My Groups.`;
   const options = { parse_mode: "HTML" as const, reply_markup: keyboard };
 
   if (statusMessage) {
@@ -1100,9 +1112,13 @@ async function sendEntriesExport(
   if (msg.length > 4000) {
     const csvLines = ["#,Display Name,Username,User ID,Entered At"];
     entries.forEach((e, i) => {
-      csvLines.push(
-        `${i + 1},"${e.user_display_name}","${e.user_name || ""}",${e.user_id},"${e.entered_at}"`
-      );
+      csvLines.push([
+        i + 1,
+        escapeCsvCell(e.user_display_name),
+        escapeCsvCell(e.user_name || ""),
+        e.user_id,
+        escapeCsvCell(e.entered_at),
+      ].join(","));
     });
     const buffer = Buffer.from(csvLines.join("\n"), "utf-8");
     await ctx.api.sendDocument(
@@ -1723,8 +1739,13 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
   // --- Back to template list ---
   const backMatch = data.match(/^tmpl_back_(-?\d+)$/);
   if (backMatch) {
+    const chatId = parseInt(backMatch[1], 10);
+    if (!(await isAdminOfChat(ctx, chatId, ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: "Only group admins can manage templates.", show_alert: true });
+      return;
+    }
     await ctx.answerCallbackQuery();
-    await buildTemplateHub(ctx, parseInt(backMatch[1], 10), true);
+    await buildTemplateHub(ctx, chatId, true);
     return;
   }
 
@@ -1810,7 +1831,7 @@ export async function handleTemplateCallback(ctx: Context): Promise<void> {
 
     let endsAt: string | null = null;
     if (tmpl.duration_minutes) {
-      const endDate = new Date(Date.now() + tmpl.duration_minutes * 60 * 1000);
+      const endDate = new Date(Date.now() + ((tmpl.starts_after_minutes || 0) + tmpl.duration_minutes) * 60 * 1000);
       endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
     }
     let startsAt: string | null = null;
@@ -2439,46 +2460,27 @@ export async function handleEnterCallback(ctx: Context): Promise<void> {
     }
   }
 
-  const result = db.addEntry(raffleId, userId, userName, displayName);
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  const entryLang = chatId ? db.getChatLanguage(chatId) : "en";
+  // Commit the last entry, winners, and recovery jobs together before
+  // contacting Telegram. A stale callback or restart cannot strand a full raffle.
+  const { result, winners } = db.getDb().transaction(() => {
+    const result = db.addEntry(raffleId, userId, userName, displayName);
+    return { result, winners: result.maxReached ? persistDraw(raffleId) : undefined };
+  }).immediate();
 
-  if (result.success) {
-    await ctx.answerCallbackQuery({ text: `🎟 ${t(entryLang, "entry.success")}` });
-    // Debounced — batches rapid entries into one message edit
-    debouncedUpdateRafflePost(ctx, raffleId);
+  if (result.success && raffle) {
+    const lang = db.getChatLanguage(raffle.chat_id);
+    const answer = ctx.answerCallbackQuery({ text: `🎟 ${t(lang, "entry.success")}` })
+      .catch(error => console.warn("Could not acknowledge accepted raffle entry", error));
 
-    // Referral link is now handled via the "Get Referral Link" button on the raffle post
-    // which deep-links to the bot DM where the link is generated on demand
-
-    // Auto-draw when max entries reached
-    if (result.maxReached) {
-      // Cancel pending debounce — auto-draw does a direct update
+    if (winners) {
       const pending = pendingPostUpdates.get(raffleId);
-      if (pending) { clearTimeout(pending.timer); pendingPostUpdates.delete(raffleId); }
-
-      const raffle = db.getRaffleById(raffleId);
-      if (raffle && raffle.status === "open") {
-        const lang = db.getChatLanguage(raffle.chat_id);
-        const entries = db.getEntriesForRaffle(raffleId);
-        const entryNames = entries.map((e) => e.user_display_name);
-        const winners = db.selectWinners(raffleId);
-
-        // Countdown animation (if animation enabled)
-        if (entryNames.length >= 1 && raffle.show_animation) {
-          await sendWheelSpin(ctx.api, raffle.chat_id, raffle.thread_id);
-        }
-
-        // Announce winners with embedded "WINNERS DRAWN" banner
-        await sendWinnerPost(ctx.api, raffle.chat_id, formatWinnersMessage(raffle, winners, lang), raffle.thread_id);
-
-        db.markRaffleDrawn(raffleId);
-        db.markRaffleAnnounced(raffleId);
-        await revokeReferralInviteLinks(ctx.api, raffleId);
-        await updateRafflePost(ctx, raffleId);
-        await notifyWinnersAndCreator(ctx.api, raffle, winners);
-      }
+      pendingPostUpdates.delete(raffleId);
+      clearTimeout(pending?.timer);
+      await announceDraw(ctx, raffle, winners);
+    } else {
+      debouncedUpdateRafflePost(ctx, raffleId);
     }
+    await answer;
   } else {
     await ctx.answerCallbackQuery({
       text: result.reason || "Could not enter.",
@@ -2507,9 +2509,8 @@ export async function handleLeaveCallback(ctx: Context): Promise<void> {
   const leaveLang = raffle ? db.getChatLanguage(raffle.chat_id) : "en";
 
   if (removed) {
-    await ctx.answerCallbackQuery({ text: t(leaveLang, "entry.left") });
-    // Debounced — batches rapid leaves into one message edit
     debouncedUpdateRafflePost(ctx, raffleId);
+    await ctx.answerCallbackQuery({ text: t(leaveLang, "entry.left") });
   } else {
     await ctx.answerCallbackQuery({
       text: t(leaveLang, "entry.not_in"),
@@ -2585,92 +2586,49 @@ export async function handleEntriesCallback(ctx: Context): Promise<void> {
 
 // --- Utility ---
 
-// Track which raffles are photo-based vs text-only to avoid wasted API calls
-const raffleIsPhotoMsg = new Map<number, boolean>();
-
 async function updateRafflePost(ctx: Context, raffleId: number): Promise<void> {
   const raffle = db.getRaffleById(raffleId);
   if (!raffle || !raffle.message_id) return;
 
+  if (raffle.status === "open") return refreshOpenRafflePost(ctx.api, raffleId, ctx.me.username);
+  await finishOpenPostEdits(raffleId);
   const count = db.getEntryCount(raffleId);
-  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
-
   const lang = db.getChatLanguage(raffle.chat_id);
-  const botUsername = ctx.me.username;
-
   try {
-    if (raffle.status === "open") {
-      const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
-      const caption = formatRaffleMessage(raffle, count, lang);
-      const isPhoto = raffleIsPhotoMsg.get(raffleId);
+    // Raffle is closed or drawn - remove entry buttons and swap banner to "closed"
+    let text = formatRaffleMessage(raffle, count, lang);
 
-      if (isPhoto === false) {
-        // Known text-only — skip editMessageCaption entirely
-        await ctx.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
-        return;
+    if (raffle.status === "drawn") {
+      const winners = db.getWinnersForRaffle(raffleId);
+      if (winners.length > 0) {
+        const winnerLabel = winners.length > 1
+          ? t(lang, "winner.label_plural")
+          : t(lang, "winner.label");
+        text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
+        winners.forEach((w) => {
+          const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
+          if (w.prize) {
+            text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
+          } else {
+            text += `  • ${mention}\n`;
+          }
+        });
       }
-
-      try {
-        await ctx.api.editMessageCaption(raffle.chat_id, raffle.message_id, { caption, parse_mode: "HTML", reply_markup: keyboard });
-        raffleIsPhotoMsg.set(raffleId, true);
-      } catch {
-        try {
-          await ctx.api.editMessageText(raffle.chat_id, raffle.message_id, caption, { parse_mode: "HTML", reply_markup: keyboard });
-          raffleIsPhotoMsg.set(raffleId, false);
-        } catch { /* unchanged or deleted */ }
-      }
-    } else {
-      // Raffle is closed or drawn - remove entry buttons and swap banner to "closed"
-      let text = formatRaffleMessage(raffle, count, lang);
-
-      if (raffle.status === "drawn") {
-        const winners = db.getWinnersForRaffle(raffleId);
-        if (winners.length > 0) {
-          const winnerLabel = winners.length > 1
-            ? t(lang, "winner.label_plural")
-            : t(lang, "winner.label");
-          text += `\n\n🏆 <b>${winnerLabel}:</b>\n`;
-          winners.forEach((w) => {
-            const mention = `<a href="tg://user?id=${w.user_id}">${escapeHtml(w.user_display_name)}</a>`;
-            if (w.prize) {
-              text += `  🎁 ${mention} — ${escapeHtml(w.prize)}\n`;
-            } else {
-              text += `  • ${mention}\n`;
-            }
-          });
-        }
-      }
-
-      // Try to swap the banner to "closed" using editMessageMedia
-      const closedBannerFileId = await getBannerFileId(ctx.api, raffle.chat_id, "closed");
-      if (closedBannerFileId) {
-        try {
-          await ctx.api.editMessageMedia(
-            raffle.chat_id,
-            raffle.message_id,
-            {
-              type: "photo",
-              media: closedBannerFileId,
-              caption: text,
-              parse_mode: "HTML",
-            }
-          );
-          return; // Success - exit early
-        } catch (err) {
-          console.error(`Failed to swap banner to closed:`, err);
-          // editMessageMedia failed, fall back to editMessageCaption
-        }
-      } else {
-        console.log(`No closed banner file_id available for chat ${raffle.chat_id}`);
-      }
-
-      // Fallback: just update the caption (banner stays as "open")
-      await ctx.api.editMessageCaption(
-        raffle.chat_id,
-        raffle.message_id,
-        { caption: text, parse_mode: "HTML" }
-      );
     }
+
+    try {
+      await editClosedBanner(ctx.api, raffle.chat_id, raffle.message_id, text);
+      return;
+    } catch {
+      // Telegram can reject the media edit independently of the caption.
+    }
+
+    // Fallback: just update the caption (banner stays as "open")
+    await ctx.api.editMessageCaption(
+      raffle.chat_id,
+      raffle.message_id,
+      { caption: text, parse_mode: "HTML" }
+    );
   } catch {
     // Message may have been deleted or too old to edit
   }
@@ -2697,9 +2655,11 @@ export async function revokeReferralInviteLinks(
   for (let i = 0; i < links.length; i += BATCH_SIZE) {
     const batch = links.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
-      batch.map((link) => api.revokeChatInviteLink(link.chat_id, link.invite_link))
+      batch.map((link) => deliverOnce(raffleId, "referral_revoke", String(link.id), () => api.revokeChatInviteLink(link.chat_id, link.invite_link)))
     );
     revoked += results.filter((r) => r.status === "fulfilled").length;
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed.length) throw new AggregateError(failed.map(r => r.reason), "Referral revocation failed; retry required");
   }
 
   if (revoked > 0) {
@@ -2777,10 +2737,10 @@ export async function notifyWinnersAndCreator(
       winnerMsg += groupLine;
       if (sponsorLine) winnerMsg += sponsorLine;
       winnerMsg += raffleLinkLine;
-      await api.sendMessage(w.user_id, winnerMsg, {
+      await deliverOnce(raffle.id, "winner_dm", String(w.user_id), () => api.sendMessage(w.user_id, winnerMsg, {
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-      });
+      }));
       return w.user_display_name;
     })
   );
@@ -2792,6 +2752,8 @@ export async function notifyWinnersAndCreator(
   if (failedDmWinners.length > 0) {
     console.log(`Could not DM winners: ${failedDmWinners.join(", ")}`);
   }
+
+  const retryErrors = dmResults.filter((r): r is PromiseRejectedResult => r.status === "rejected").map(r => r.reason);
 
   // DM the creator with full results
   try {
@@ -2812,10 +2774,14 @@ export async function notifyWinnersAndCreator(
     if (raffle.sponsor_name) {
       creatorMsg += `\n💎 Sponsor: ${escapeHtml(raffle.sponsor_name)}`;
     }
-    await api.sendMessage(raffle.creator_id, creatorMsg, { parse_mode: "HTML" });
-  } catch {
-    // Creator may not have started the bot
+    const chunks = chunkMessage(creatorMsg);
+    for (let i = 0; i < chunks.length; i++) {
+      await deliverOnce(raffle.id, "creator_dm", `${raffle.creator_id}:${i}`, () => api.sendMessage(raffle.creator_id, chunks[i], { parse_mode: "HTML" }));
+    }
+  } catch (err) {
+    retryErrors.push(err);
   }
+  if (retryErrors.length) throw new AggregateError(retryErrors, "Winner notifications require retry");
 }
 
 // Build stats message — shared by /stats command and weekly auto-report
@@ -2996,7 +2962,9 @@ export async function handleHealth(ctx: Context): Promise<void> {
   msg += `  Failed: ${jobs.failed === 0 ? "0 ✅" : `${jobs.failed} ⚠️`}\n\n`;
 
   // Backup status
-  const BACKUP_DIR = "/data/backups";
+  const BACKUP_DIR = getBackupDirectory(
+    process.env.DATABASE_PATH || "./raffle.db"
+  );
   msg += `<b>💾 Backups</b>\n`;
   try {
     if (fs.existsSync(BACKUP_DIR)) {
@@ -3143,10 +3111,17 @@ export async function handleMetrics(ctx: Context): Promise<void> {
   }
 }
 
-// /active — List all active raffles across all groups (hidden, not in BotFather menu)
+// /active — List all active raffles across all groups for the owner or approved viewers in DMs.
 export async function handleActive(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  const ownerId = parseInt(process.env.BOT_OWNER_ID || "0", 10);
+  if (userId !== ownerId) {
+    if (ctx.chat?.type !== "private") return;
+    const viewerIds = process.env.ACTIVE_RAFFLE_VIEWER_IDS?.split(",") ?? [];
+    if (!viewerIds.some((id) => id.trim() === String(userId))) return;
+  }
 
   const groups = db.getActiveRafflesByGroup();
 
@@ -3159,15 +3134,9 @@ export async function handleActive(ctx: Context): Promise<void> {
   const sections: string[] = [];
 
   for (const group of groups) {
-    let groupTitle = `Chat ${group.chat_id}`;
-    try {
-      const chat = await ctx.api.getChat(group.chat_id);
-      if ("title" in chat && chat.title) {
-        groupTitle = chat.title;
-      }
-    } catch {
-      // Can't resolve name — use chat ID
-    }
+    // Group names are maintained by incoming activity and the background refresh.
+    // A status command should not block on one Telegram request per group.
+    const groupTitle = db.getBotGroup(group.chat_id)?.title || `Chat ${group.chat_id}`;
 
     let section = `<b>📍 ${escapeHtml(groupTitle)}</b>\n`;
 
@@ -3812,10 +3781,9 @@ export async function handleBugReport(ctx: Context): Promise<void> {
       }, 5000);
     }
   } else {
-    const botInfo = await ctx.api.getMe();
     const kb = new InlineKeyboard().url(
       "Start a DM with me",
-      `https://t.me/${botInfo.username}?start=help`
+      `https://t.me/${ctx.me.username}?start=help`
     );
     await ctx.reply(
       `I need to collect your bug report in a DM.\n\nTap below to start a conversation with me, then try /bugreport again.`,

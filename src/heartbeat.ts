@@ -19,10 +19,10 @@ import { logger } from "./logger";
 const log = logger.child({ component: "heartbeat" });
 
 const HEARTBEAT_URL = process.env.HEARTBEAT_URL || "";
-const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.HEARTBEAT_INTERVAL_MS || String(5 * 60 * 1000),
-  10
-);
+const configuredInterval = Number(process.env.HEARTBEAT_INTERVAL_MS || 5 * 60 * 1000);
+const HEARTBEAT_INTERVAL_MS = Number.isInteger(configuredInterval) && configuredInterval >= 1_000
+  ? configuredInterval
+  : 5 * 60 * 1000;
 
 let lastPingOk = true;
 
@@ -56,17 +56,21 @@ export async function sendHeartbeat(): Promise<void> {
   }
 }
 
-export function startHeartbeat(): { intervalMs: number; configured: boolean } {
+export function startHeartbeat(isHealthy: () => boolean = () => true): {
+  intervalMs: number;
+  configured: boolean;
+  stop: () => void;
+} {
   if (!HEARTBEAT_URL) {
     log.info({}, "Heartbeat disabled (HEARTBEAT_URL not set)");
-    return { intervalMs: HEARTBEAT_INTERVAL_MS, configured: false };
+    return { intervalMs: HEARTBEAT_INTERVAL_MS, configured: false, stop: () => {} };
   }
 
   // Send one immediately on startup so the monitor sees we're alive
-  sendHeartbeat().catch(() => {});
+  if (isHealthy()) sendHeartbeat().catch(() => {});
 
-  setInterval(() => {
-    sendHeartbeat().catch(() => {});
+  const timer = setInterval(() => {
+    if (isHealthy()) sendHeartbeat().catch(() => {});
   }, HEARTBEAT_INTERVAL_MS);
 
   log.info(
@@ -83,5 +87,9 @@ export function startHeartbeat(): { intervalMs: number; configured: boolean } {
     "Heartbeat enabled"
   );
 
-  return { intervalMs: HEARTBEAT_INTERVAL_MS, configured: true };
+  return {
+    intervalMs: HEARTBEAT_INTERVAL_MS,
+    configured: true,
+    stop: () => clearInterval(timer),
+  };
 }

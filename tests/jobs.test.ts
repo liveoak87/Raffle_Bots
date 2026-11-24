@@ -22,6 +22,13 @@ describe("job queue", () => {
     expect(stats.pending).toBe(1);
   });
 
+  it("enqueueOnce deduplicates stable raffle-scoped jobs", () => {
+    const first = jobs.enqueueOnce("notify_winners", { raffleId: 42 });
+    const second = jobs.enqueueOnce("notify_winners", { raffleId: 42 });
+    expect(second).toBe(first);
+    expect(jobs.getJobStats().pending).toBe(1);
+  });
+
   it("processJobs runs registered handler and marks done", async () => {
     let invoked = false;
     jobs.registerHandler("test_type", async (payload) => {

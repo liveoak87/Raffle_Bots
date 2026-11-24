@@ -1,3 +1,5 @@
+import { refreshOpenRafflePost } from "./rafflePost";
+import { scheduleError } from "./schedule";
 import { InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
 import * as db from "./database";
@@ -15,6 +17,16 @@ import { getForumTopicName } from "./forumTopics";
 import { sendCustomImage, sendRafflePost } from "./banners";
 import { formatInTimezone } from "./timezone";
 import { canManageGroup } from "./access";
+import { hasGroupKeeperAdministrator } from "./groupkeeper";
+import { RaffleSetupMessages } from "./raffleSetupMessages";
+import { logger } from "./logger";
+import { beginWorkflow, checkpointWorkflowState, endWorkflow, expireWorkflows, getWorkflow, getWorkflowState, prepareWorkflowInput, workflowHint } from "./workflowSessions";
+
+const MAX_TITLE_LENGTH = 128;
+const MAX_PRIZE_TEXT_LENGTH = 1_200;
+const MAX_DESCRIPTION_LENGTH = 800;
+const MAX_SPONSOR_LENGTH = 128;
+const MAX_TEMPLATE_NAME_LENGTH = 64;
 
 interface WizardState {
   step:
@@ -79,31 +91,44 @@ interface WizardState {
   maxReferralEntries?: number;
   revokeReferralLinks?: boolean;
   createdAt: number;
+  setupMessages: RaffleSetupMessages;
 }
 
-const wizards = new Map<number, WizardState>();
-const WIZARD_TIMEOUT = 30 * 60 * 1000;
-
-function cleanStaleWizards(): void {
-  const now = Date.now();
-  for (const [key, state] of wizards) {
-    if (now - state.createdAt > WIZARD_TIMEOUT) {
-      wizards.delete(key);
-    }
-  }
-}
+export const cleanupExpiredRaffleWizards = expireWorkflows;
 
 export function getActiveWizard(userId: number): WizardState | undefined {
-  cleanStaleWizards();
-  const state = wizards.get(userId);
-  if (state) {
-    state.createdAt = Date.now();
-  }
-  return state;
+  return getWorkflowState<WizardState>(userId, "raffle");
 }
 
-export function cancelWizard(userId: number): void {
-  wizards.delete(userId);
+export async function cancelWizard(userId: number): Promise<void> {
+  const state = getActiveWizard(userId);
+  if (state) await retireRaffleWizard(state);
+}
+
+async function retireRaffleWizard(state: WizardState): Promise<void> {
+  await endWorkflow(state.userId, "finished", state);
+}
+
+async function replyToRaffleWizard(
+  ctx: Context,
+  state: WizardState,
+  ...args: Parameters<Context["reply"]>
+): Promise<Awaited<ReturnType<Context["reply"]>>> {
+  const message = await ctx.reply(...args);
+  await state.setupMessages.track(message);
+  return message;
+}
+
+async function beginRaffleWizard(
+  state: WizardState,
+  api: Context["api"],
+  sendPrompt: () => Promise<unknown>
+): Promise<void> {
+  await beginWorkflow("raffle", state, api, sendPrompt, {
+    cleanup: () => state.setupMessages.cleanup(),
+    track: message => state.setupMessages.track(message),
+    recover: ctx => sendOptionsScreen(ctx, state),
+  });
 }
 
 function applyGroupDefaults(state: WizardState, includeDefaultThread = false): WizardState {
@@ -160,33 +185,32 @@ export async function startWizard(ctx: Context): Promise<void> {
   }
 
   try {
-    const dmMsg = await ctx.api.sendMessage(
+    const state = applyGroupDefaults({
+      step: "title",
+      targetChatId: groupChatId,
+      targetThreadId: commandThreadId,
+      targetThreadName: commandThreadName,
+      targetChatTitle: groupTitle,
+      dmChatId: userId,
+      userId,
+      createdAt: Date.now(),
+      setupMessages: new RaffleSetupMessages(ctx.api, userId),
+    }, false);
+    await beginRaffleWizard(state, ctx.api, () => ctx.api.sendMessage(
       userId,
       `📝 <b>Create a Raffle</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
         `📍 Destination: <b>${escapeHtml(commandThreadName || (commandThreadId ? "This topic" : "General"))}</b>\n\n` +
         `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
         `<i>Just type it and send. Or /cancel to stop.</i>`,
       { parse_mode: "HTML" }
-    );
-
-    wizards.set(userId, applyGroupDefaults({
-      step: "title",
-      targetChatId: groupChatId,
-      targetThreadId: commandThreadId,
-      targetThreadName: commandThreadName,
-      targetChatTitle: groupTitle,
-      dmChatId: dmMsg.chat.id,
-      userId,
-      createdAt: Date.now(),
-    }, false));
+    ));
   } catch {
-    const botInfo = await ctx.api.getMe();
     const destinationToken = ctx.message?.message_thread_id
       ? `_t${ctx.message.message_thread_id}`
       : "_g";
     const keyboard = new InlineKeyboard().url(
       "Start a DM with me",
-      `https://t.me/${botInfo.username}?start=newraffle_${groupChatId}${destinationToken}`
+      `https://t.me/${ctx.me.username}?start=newraffle_${groupChatId}${destinationToken}`
     );
 
     const fallback = await ctx.reply(
@@ -235,19 +259,19 @@ export async function startRaffleWizardForGroup(
     dmChatId: ctx.chat.id,
     userId: ctx.from.id,
     createdAt: Date.now(),
+    setupMessages: new RaffleSetupMessages(ctx.api, ctx.chat.id),
   }, targetThreadId === undefined);
-  wizards.set(ctx.from.id, state);
   const defaultLabel = targetThreadId === undefined && state.targetThreadId
     ? " (group default)"
     : "";
 
-  await ctx.reply(
+  await beginRaffleWizard(state, ctx.api, () => ctx.reply(
     `📝 <b>Create a Raffle</b> for <b>${escapeHtml(resolvedTitle)}</b>\n\n` +
       `📍 Destination: <b>${escapeHtml(formatWizardDestination(state))}${defaultLabel}</b>\n\n` +
       `Step 1 of 4: What's the <b>title</b> of your raffle?\n\n` +
       `<i>Just type it and send. Or /cancel to stop.</i>`,
     { parse_mode: "HTML" }
-  );
+  ));
   return true;
 }
 
@@ -286,23 +310,60 @@ export async function handleStartDeepLink(
       return true;
     }
 
-    // Get or create the referral link
+    // Get or create the referral link. If GroupKeeper is an administrator in
+    // this group, the referral must create a join request so GroupKeeper can
+    // require backup membership before the user enters the main group.
     let refLink = db.getReferralLink(raffleId, userId);
+    let routeThroughGroupKeeper = refLink?.groupkeeper_routed === 1;
+    try {
+      routeThroughGroupKeeper =
+        routeThroughGroupKeeper ||
+        await hasGroupKeeperAdministrator(ctx.api, raffle.chat_id);
+    } catch {
+      // Never hand out a known direct-entry link when we cannot verify whether
+      // GroupKeeper currently protects the group.
+      if (!routeThroughGroupKeeper) {
+        await ctx.reply(
+          "I couldn't verify the group's backup protection right now. Please try again in a moment."
+        );
+        return true;
+      }
+    }
+
     if (!refLink) {
       try {
         const invite = await ctx.api.createChatInviteLink(raffle.chat_id, {
           name: `ref_${raffleId}_${userId}`,
-          creates_join_request: false,
+          creates_join_request: routeThroughGroupKeeper,
         });
         refLink = db.createReferralLink(
           raffleId,
           userId,
           displayName,
           raffle.chat_id,
-          invite.invite_link
+          invite.invite_link,
+          routeThroughGroupKeeper
         );
       } catch {
         await ctx.reply("Failed to create your referral link. The bot may need admin permissions in the group.");
+        return true;
+      }
+    } else if (routeThroughGroupKeeper && refLink.groupkeeper_routed !== 1) {
+      try {
+        await ctx.api.editChatInviteLink(
+          raffle.chat_id,
+          refLink.invite_link,
+          {
+            name: `ref_${raffleId}_${userId}`,
+            creates_join_request: true,
+          }
+        );
+        db.markReferralLinkGroupKeeperRouted(refLink.id);
+        refLink = { ...refLink, groupkeeper_routed: 1 };
+      } catch {
+        await ctx.reply(
+          "I couldn't route your existing referral link through the backup-group check. Please try again in a moment."
+        );
         return true;
       }
     }
@@ -341,21 +402,7 @@ export async function handleStartDeepLink(
       }
     } catch {}
 
-    templateWizards.set(userId, {
-      step: "name",
-      targetChatId: groupChatId,
-      targetChatTitle: groupTitle,
-      dmChatId: ctx.chat!.id,
-      userId,
-      createdAt: Date.now(),
-    });
-
-    await ctx.reply(
-      `📋 <b>Create a Template</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
-        `Step 1 of 5: What's the <b>template name</b>?\n\n` +
-        `<i>This is a short name to recall it later (e.g. "Weekly" or "Daily Prize").\nType /cancel to stop.</i>`,
-      { parse_mode: "HTML" }
-    );
+    await startTemplateWizard(ctx.api, userId, groupChatId, groupTitle);
 
     return true;
   }
@@ -385,20 +432,7 @@ export async function handleStartDeepLink(
       return true;
     }
 
-    // Set up the edit wizard state and reply right here in the DM
-    editWizards.set(userId, {
-      raffleId,
-      chatId: groupChatId,
-      dmChatId: ctx.chat!.id,
-      userId,
-      editingField: null,
-      createdAt: Date.now(),
-    });
-
-    await ctx.reply(buildEditScreenText(raffle), {
-      parse_mode: "HTML",
-      reply_markup: buildEditScreenKeyboard(raffle),
-    });
+    await startEditWizard(ctx, raffleId, groupChatId);
     return true;
   }
 
@@ -427,6 +461,7 @@ export function setActiveWizardDestination(
   if (!state || state.targetChatId !== groupChatId) return null;
   state.targetThreadId = threadId;
   state.targetThreadName = threadName;
+  checkpointWorkflowState(userId);
   return state.step.startsWith("options") ? "options" : "active";
 }
 
@@ -440,7 +475,7 @@ export async function handleWizardMessage(ctx: Context): Promise<boolean> {
   const text = ctx.message.text.trim();
 
   if (text.toLowerCase() === "/cancel") {
-    cancelWizard(ctx.from.id);
+    await retireRaffleWizard(state);
     await ctx.reply("Raffle creation cancelled.");
     return true;
   }
@@ -493,7 +528,7 @@ export async function handleWizardPhoto(ctx: Context): Promise<boolean> {
   state.imageFileId = largest.file_id;
   state.step = "options";
 
-  await ctx.reply(`✅ Image added!`);
+  await replyToRaffleWizard(ctx, state, `✅ Image added!`);
   await sendOptionsScreen(ctx, state);
   return true;
 }
@@ -503,10 +538,14 @@ async function handleTitleStep(
   state: WizardState,
   text: string
 ): Promise<boolean> {
+  if (text.length > MAX_TITLE_LENGTH) {
+    await replyToRaffleWizard(ctx, state, `Keep the raffle title to ${MAX_TITLE_LENGTH} characters or fewer.`);
+    return true;
+  }
   state.title = text;
   state.step = "prize";
 
-  await ctx.reply(
+  await replyToRaffleWizard(ctx, state,
     `✅ Title: <b>${escapeHtml(text)}</b>\n\n` +
       `Step 2 of 4: What's the <b>prize</b>?\n\n` +
       `Send one prize, or <b>multiple prizes separated by commas</b> for different winner positions.\n\n` +
@@ -523,13 +562,21 @@ async function handlePrizeStep(
   state: WizardState,
   text: string
 ): Promise<boolean> {
+  if (text.length > MAX_PRIZE_TEXT_LENGTH) {
+    await replyToRaffleWizard(ctx, state, `Keep the combined prize text to ${MAX_PRIZE_TEXT_LENGTH} characters or fewer.`);
+    return true;
+  }
   const prizes = text
     .split(",")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
 
   if (prizes.length === 0) {
-    await ctx.reply("Please enter at least one prize.");
+    await replyToRaffleWizard(ctx, state, "Please enter at least one prize.");
+    return true;
+  }
+  if (prizes.length > 50) {
+    await replyToRaffleWizard(ctx, state, "A raffle can have at most 50 prizes/winners.");
     return true;
   }
 
@@ -574,7 +621,7 @@ async function handlePrizeStep(
     .row()
     .text("✏️ Custom (1-50)", "wiz_winners_custom");
 
-  await ctx.reply(
+  await replyToRaffleWizard(ctx, state,
     `✅ Prizes:\n${prizeDisplay}\n\n` +
       `Step 3 of 4: How many <b>winners</b>?`,
     { parse_mode: "HTML", reply_markup: keyboard }
@@ -593,7 +640,10 @@ export async function handleWinnersCallback(ctx: Context): Promise<void> {
   }
 
   const num = parseInt(data.replace("wiz_winners_", ""), 10);
-  if (isNaN(num) || num < 1) return;
+  if (isNaN(num) || num < 1 || num > 50) {
+    await ctx.answerCallbackQuery({ text: "Choose between 1 and 50 winners.", show_alert: true });
+    return;
+  }
 
   state.maxWinners = num;
   state.step = "time";
@@ -643,7 +693,7 @@ export async function handleWinnersCustomCallback(ctx: Context): Promise<void> {
 
   // Send a fresh message — more reliable than editing across all message types
   try {
-    await ctx.reply(promptText, { parse_mode: "HTML" });
+    await replyToRaffleWizard(ctx, state, promptText, { parse_mode: "HTML" });
   } catch (err) {
     console.error("Failed to send custom winners prompt:", err);
   }
@@ -656,7 +706,7 @@ async function handleCustomWinnersStep(
 ): Promise<boolean> {
   const num = parseInt(text, 10);
   if (isNaN(num) || num < 1 || num > 50) {
-    await ctx.reply("Please enter a number between <b>1</b> and <b>50</b>.", { parse_mode: "HTML" });
+    await replyToRaffleWizard(ctx, state, "Please enter a number between <b>1</b> and <b>50</b>.", { parse_mode: "HTML" });
     return true;
   }
 
@@ -680,7 +730,7 @@ async function handleCustomWinnersStep(
     .row()
     .text("No time limit", "wiz_time_none");
 
-  await ctx.reply(
+  await replyToRaffleWizard(ctx, state,
     `✅ Winners: <b>${num}</b>\n\n` +
       `Step 4 of 4: Set a <b>time limit</b>?\n\n` +
       `The raffle will auto-draw when time runs out.`,
@@ -755,7 +805,7 @@ async function handleCustomTimeStep(
 ): Promise<boolean> {
   const parsed = parseEndTime(text);
   if (!parsed) {
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `Could not parse "<code>${escapeHtml(text)}</code>".\n\n` +
         `Use formats like: <code>45m</code>, <code>3h</code>, <code>2d</code>`,
       { parse_mode: "HTML" }
@@ -924,7 +974,7 @@ async function sendOptionsScreen(
   state: WizardState
 ): Promise<void> {
   state.step = "options";
-  await ctx.reply(buildOptionsText(state), {
+  await replyToRaffleWizard(ctx, state, buildOptionsText(state), {
     parse_mode: "HTML",
     reply_markup: buildOptionsKeyboard(state),
   });
@@ -1008,7 +1058,7 @@ export async function handleCalendarPickerCallback(ctx: Context): Promise<void> 
     const { resolveTimezone } = await import("./timezone");
     const resolved = resolveTimezone(tzMatch[1]);
     if (!resolved) {
-      await ctx.reply(`Unknown timezone: ${tzMatch[1]}`);
+      await replyToRaffleWizard(ctx, state, `Unknown timezone: ${tzMatch[1]}`);
       return;
     }
     state.scheduledTimezone = resolved;
@@ -1053,11 +1103,11 @@ export async function handleCalendarPickerCallback(ctx: Context): Promise<void> 
     const timeStr = `${String(state.scheduledHour).padStart(2, "0")}:${minMatch[1]}`;
     const utc = buildUtcDateFromLocal(state.scheduledDate, timeStr, tz);
     if (!utc) {
-      await ctx.reply(`Could not compute start time for ${state.scheduledDate} ${timeStr} in ${tz}.`);
+      await replyToRaffleWizard(ctx, state, `Could not compute start time for ${state.scheduledDate} ${timeStr} in ${tz}.`);
       return;
     }
     if (utc.getTime() <= Date.now()) {
-      await ctx.reply(
+      await replyToRaffleWizard(ctx, state,
         `That time has already passed in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
         { parse_mode: "HTML" }
       );
@@ -1107,7 +1157,7 @@ export async function handleSchedPickerCallback(ctx: Context): Promise<void> {
 
   if (data === "wiz_sched_custom_time") {
     if (!state.scheduledDate) {
-      await ctx.reply("Date wasn't selected. Try /newraffle again.");
+      await replyToRaffleWizard(ctx, state, "Date wasn't selected. Try /newraffle again.");
       return;
     }
     state.step = "options_scheduled_custom_time";
@@ -1131,18 +1181,18 @@ export async function handleSchedPickerCallback(ctx: Context): Promise<void> {
   const timeMatch = data.match(/^wiz_sched_time:(\d{2}:\d{2})$/);
   if (timeMatch) {
     if (!state.scheduledDate) {
-      await ctx.reply("Date wasn't selected. Try /newraffle again.");
+      await replyToRaffleWizard(ctx, state, "Date wasn't selected. Try /newraffle again.");
       return;
     }
     const { buildUtcDateFromLocal } = await import("./timezone");
     const tz = db.getChatTimezone(state.targetChatId);
     const utc = buildUtcDateFromLocal(state.scheduledDate, timeMatch[1], tz);
     if (!utc) {
-      await ctx.reply(`Could not compute start time for ${state.scheduledDate} ${timeMatch[1]} in ${tz}.`);
+      await replyToRaffleWizard(ctx, state, `Could not compute start time for ${state.scheduledDate} ${timeMatch[1]} in ${tz}.`);
       return;
     }
     if (utc.getTime() <= Date.now()) {
-      await ctx.reply(
+      await replyToRaffleWizard(ctx, state,
         `That time has already passed in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
         { parse_mode: "HTML" }
       );
@@ -1408,7 +1458,7 @@ async function handleOptionsImageText(
   }
 
   // User typed text but we need a photo
-  await ctx.reply(
+  await replyToRaffleWizard(ctx, state,
     `Please send a <b>photo</b>, or type <code>skip</code> to continue without an image.`,
     { parse_mode: "HTML" }
   );
@@ -1423,6 +1473,10 @@ async function handleOptionsDescriptionText(
   if (text.toLowerCase() === "skip") {
     state.description = "";
   } else {
+    if (text.length > MAX_DESCRIPTION_LENGTH) {
+      await replyToRaffleWizard(ctx, state, `Keep the description to ${MAX_DESCRIPTION_LENGTH} characters or fewer.`);
+      return true;
+    }
     state.description = text;
   }
   await sendOptionsScreen(ctx, state);
@@ -1461,7 +1515,7 @@ async function handleOptionsMaxEntriesText(
 
   const max = parseInt(text, 10);
   if (isNaN(max) || max < 1 || max > 1_000_000) {
-    await ctx.reply("Enter a positive number, or type <code>none</code>.", { parse_mode: "HTML" });
+    await replyToRaffleWizard(ctx, state, "Enter a positive number, or type <code>none</code>.", { parse_mode: "HTML" });
     return true;
   }
 
@@ -1478,6 +1532,10 @@ async function handleOptionsSponsorText(
   if (text.toLowerCase() === "skip") {
     state.sponsorName = null;
   } else {
+    if (text.length > MAX_SPONSOR_LENGTH) {
+      await replyToRaffleWizard(ctx, state, `Keep the sponsor name to ${MAX_SPONSOR_LENGTH} characters or fewer.`);
+      return true;
+    }
     state.sponsorName = text;
   }
   await sendOptionsScreen(ctx, state);
@@ -1506,7 +1564,7 @@ async function handleCustomScheduledDateText(
     return true;
   }
 
-  await ctx.reply(
+  await replyToRaffleWizard(ctx, state,
     `Couldn't parse "<code>${escapeHtml(text)}</code>" as a date.\n\n` +
       `Type the date in <code>YYYY-MM-DD</code> format (e.g., <code>2026-12-31</code>).\n` +
       `<i>Group timezone: ${escapeHtml(tz)}</i>`,
@@ -1558,7 +1616,7 @@ async function handleCustomScheduledTimeText(
   }
 
   if (hh === null || mm === null || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `Couldn't parse "<code>${escapeHtml(text)}</code>" as a time.\n\n` +
         `Use 24h <code>HH:MM</code> (e.g. <code>18:30</code>) or 12h <code>H:MM AM/PM</code> (e.g. <code>6:30 PM</code>).\n` +
         `<i>Group timezone: ${escapeHtml(tz)}</i>`,
@@ -1570,7 +1628,7 @@ async function handleCustomScheduledTimeText(
   const timeStr = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
   const utc = buildUtcDateFromLocal(state.scheduledDate, timeStr, tz);
   if (!utc) {
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `Could not compute start time for ${escapeHtml(state.scheduledDate)} ${escapeHtml(timeStr)} in ${escapeHtml(tz)}.`,
       { parse_mode: "HTML" }
     );
@@ -1578,7 +1636,7 @@ async function handleCustomScheduledTimeText(
   }
 
   if (utc.getTime() <= Date.now()) {
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `That time is in the past in <code>${escapeHtml(tz)}</code>. Pick a future time.`,
       { parse_mode: "HTML" }
     );
@@ -1678,7 +1736,7 @@ async function sendScheduledCalendar(
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
   } catch {
-    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+    await replyToRaffleWizard(ctx, state, body, { parse_mode: "HTML", reply_markup: kb });
   }
 }
 
@@ -1709,7 +1767,7 @@ async function sendScheduledHourPicker(ctx: Context, state: WizardState): Promis
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
   } catch {
-    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+    await replyToRaffleWizard(ctx, state, body, { parse_mode: "HTML", reply_markup: kb });
   }
 }
 
@@ -1740,7 +1798,7 @@ async function sendScheduledMinutePicker(ctx: Context, state: WizardState): Prom
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
   } catch {
-    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+    await replyToRaffleWizard(ctx, state, body, { parse_mode: "HTML", reply_markup: kb });
   }
 }
 
@@ -1784,7 +1842,7 @@ async function sendScheduledTimezonePicker(ctx: Context, state: WizardState): Pr
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
   } catch {
-    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+    await replyToRaffleWizard(ctx, state, body, { parse_mode: "HTML", reply_markup: kb });
   }
 }
 
@@ -1842,7 +1900,7 @@ async function sendStandaloneTimezonePicker(ctx: Context, state: WizardState): P
   try {
     await ctx.editMessageText(body, { parse_mode: "HTML", reply_markup: kb });
   } catch {
-    await ctx.reply(body, { parse_mode: "HTML", reply_markup: kb });
+    await replyToRaffleWizard(ctx, state, body, { parse_mode: "HTML", reply_markup: kb });
   }
 }
 
@@ -1870,7 +1928,7 @@ export async function handleStandaloneTzCallback(ctx: Context): Promise<void> {
   const { resolveTimezone } = await import("./timezone");
   const resolved = resolveTimezone(m[1]);
   if (!resolved) {
-    await ctx.reply(`Unknown timezone: ${m[1]}`);
+    await replyToRaffleWizard(ctx, state, `Unknown timezone: ${m[1]}`);
     return;
   }
 
@@ -1897,7 +1955,7 @@ async function handleOptionsMinAgeText(
 
   const days = parseInt(text, 10);
   if (isNaN(days) || days < 0 || days > 3650) {
-    await ctx.reply("Enter a number between 0 and 3650 (10 years max).");
+    await replyToRaffleWizard(ctx, state, "Enter a number between 0 and 3650 (10 years max).");
     return true;
   }
 
@@ -1919,7 +1977,7 @@ async function handleOptionsCooldownText(
 
   const count = parseInt(text, 10);
   if (isNaN(count) || count < 0 || count > 100) {
-    await ctx.reply("Enter a number between 0 and 100.");
+    await replyToRaffleWizard(ctx, state, "Enter a number between 0 and 100.");
     return true;
   }
 
@@ -1952,16 +2010,20 @@ async function handleOptionsRequiredGroupText(
     const chatId = chat.id;
     const title = "title" in chat && chat.title ? chat.title : String(chatRef);
 
-    // Validate the bot can check membership there.
-    await ctx.api.getChatMember(chatId, ctx.me.id);
+    // Telegram only guarantees membership checks for other users when the
+    // bot is an administrator in the target chat.
+    const botMember = await ctx.api.getChatMember(chatId, ctx.me.id);
+    if (botMember.status !== "administrator") {
+      throw new Error("bot_not_administrator");
+    }
 
     state.requiredChatId = chatId;
     state.requiredChatTitle = title;
     await sendOptionsScreen(ctx, state);
   } catch {
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `I couldn't verify that chat.\n\n` +
-        `Make sure the bot is in the required group/channel and can check members, then send its <code>@username</code> or numeric chat ID again.\n\n` +
+        `Make sure the bot is an administrator in the required group/channel, then send its <code>@username</code> or numeric chat ID again.\n\n` +
         `<i>Type <code>skip</code> to disable this gate.</i>`,
       { parse_mode: "HTML" }
     );
@@ -1976,7 +2038,7 @@ async function handleOptionsReferralMaxText(
 ): Promise<boolean> {
   const num = parseInt(text, 10);
   if (isNaN(num) || num < 0) {
-    await ctx.reply("Enter a number (0 for unlimited, or a positive number for the cap).");
+    await replyToRaffleWizard(ctx, state, "Enter a number (0 for unlimited, or a positive number for the cap).");
     return true;
   }
 
@@ -1992,10 +2054,12 @@ async function createRaffleFromWizard(
   state: WizardState
 ): Promise<void> {
   if (!(await canManageGroup(ctx.api, state.targetChatId, state.userId))) {
-    cancelWizard(state.userId);
+    await retireRaffleWizard(state);
     await ctx.reply("Your access to manage raffles in this group has been removed.");
     return;
   }
+  const error = scheduleError(state.endsAt, state.startsAt);
+  if (error) { await replyToRaffleWizard(ctx, state, error); return; }
   const displayName = getUserDisplayName(
     ctx.from!.first_name,
     ctx.from!.last_name
@@ -2055,7 +2119,7 @@ async function createRaffleFromWizard(
   if (!msgId) {
     // Failed to post - delete the raffle from database and notify user
     db.deleteRaffle(raffle.id);
-    await ctx.reply(
+    await replyToRaffleWizard(ctx, state,
       `❌ Failed to post raffle to <b>${escapeHtml(state.targetChatTitle)}</b>.\n\n` +
         `This can happen if:\n` +
         `• The topic/thread is closed\n` +
@@ -2068,7 +2132,9 @@ async function createRaffleFromWizard(
   }
 
   db.updateRaffleMessageId(raffle.id, msgId);
-  cancelWizard(state.userId);
+  // Retire this exact draft before sending the durable completion message.
+  // Cleanup failures never roll back a successfully posted raffle.
+  const setupCleanup = retireRaffleWizard(state);
 
   // Auto-pin the raffle message if enabled
   if (raffle.auto_pin) {
@@ -2086,6 +2152,7 @@ async function createRaffleFromWizard(
       `${raffle.thread_id ? ` in ${escapeHtml(state.targetThreadName || "the selected topic")}` : " in General"}!`,
     { parse_mode: "HTML" }
   );
+  await setupCleanup;
 
 }
 
@@ -2115,28 +2182,24 @@ interface EditWizardState {
   createdAt: number;
 }
 
-const editWizards = new Map<number, EditWizardState>();
-
-function cleanStaleEditWizards(): void {
-  const now = Date.now();
-  for (const [key, state] of editWizards) {
-    if (now - state.createdAt > WIZARD_TIMEOUT) {
-      editWizards.delete(key);
-    }
-  }
-}
-
 export function getActiveEditWizard(userId: number): EditWizardState | undefined {
-  cleanStaleEditWizards();
-  const state = editWizards.get(userId);
-  if (state) {
-    state.createdAt = Date.now();
-  }
-  return state;
+  return getWorkflowState<EditWizardState>(userId, "edit");
 }
 
 export function cancelEditWizard(userId: number): void {
-  editWizards.delete(userId);
+  const state = getActiveEditWizard(userId);
+  if (state) void endWorkflow(userId, "finished", state);
+}
+
+async function recoverEditWizard(ctx: Context, state: EditWizardState): Promise<void> {
+  const raffle = db.getRaffleById(state.raffleId);
+  if (!raffle || raffle.status !== "open" || !(await canManageGroup(ctx.api, state.chatId, state.userId))) {
+    cancelEditWizard(state.userId);
+    await ctx.reply("This raffle is no longer editable.");
+    return;
+  }
+  state.editingField = null;
+  await ctx.reply(buildEditScreenText(raffle), { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) });
 }
 
 export async function startEditWizard(
@@ -2147,27 +2210,30 @@ export async function startEditWizard(
   const userId = ctx.from!.id;
 
   const raffle = db.getRaffleById(raffleId);
-  if (!raffle) return;
+  if (!raffle || raffle.chat_id !== chatId || raffle.status !== "open") {
+    await replyPrivately(ctx, "This raffle is no longer editable.");
+    return;
+  }
+  if (!(await canManageGroup(ctx.api, chatId, userId))) {
+    await replyPrivately(ctx, "You do not have permission to edit raffles in this group.");
+    return;
+  }
 
   try {
     const state: EditWizardState = {
       raffleId,
       chatId,
-      dmChatId: 0,
+      dmChatId: userId,
       userId,
       editingField: null,
       createdAt: Date.now(),
     };
 
-    editWizards.set(userId, state);
-
-    const msg = await ctx.api.sendMessage(
+    await beginWorkflow("edit", state, ctx.api, () => ctx.api.sendMessage(
       userId,
       buildEditScreenText(raffle),
       { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
-    );
-
-    state.dmChatId = msg.chat.id;
+    ), { recover: recoveryCtx => recoverEditWizard(recoveryCtx, state) });
 
     if (ctx.chat?.type !== "private") {
       const notice = await ctx.reply(
@@ -2180,10 +2246,9 @@ export async function startEditWizard(
       }, 5000);
     }
   } catch {
-    const botInfo = await ctx.api.getMe();
     const keyboard = new InlineKeyboard().url(
       "Start a DM with me",
-      `https://t.me/${botInfo.username}?start=editraffle_${raffleId}_${chatId}`
+      `https://t.me/${ctx.me.username}?start=editraffle_${raffleId}_${chatId}`
     );
     const fallback = await ctx.reply(
       `I need to edit the raffle in a private message.\n\n` +
@@ -2224,7 +2289,7 @@ function buildEditScreenText(raffle: ReturnType<typeof db.getRaffleById>): strin
   }
 
   msg += `👁 <b>Hidden entries:</b> ${raffle.anonymous ? "On" : "Off"}\n`;
-  msg += `🖼 <b>Image:</b> ${raffle.image_file_id ? "Added" : "None"}\n`;
+  msg += `🖼 <b>Image for future reposts:</b> ${raffle.image_file_id ? "Added" : "None"}\n`;
   msg += `📌 <b>Auto-pin:</b> ${raffle.auto_pin ? "On" : "Off"}\n`;
   msg += `📛 <b>Require username:</b> ${raffle.require_username ? "On" : "Off"}\n`;
   msg += `🌐 <b>Timezone:</b> ${escapeHtml(raffle.display_timezone || db.getChatTimezone(raffle.chat_id))}\n`;
@@ -2245,7 +2310,7 @@ function buildEditScreenKeyboard(raffle: ReturnType<typeof db.getRaffleById>): I
 
   const kb = new InlineKeyboard();
   kb.text("📝 Rules", "edit_description");
-  kb.text("🖼 Image", "edit_image");
+  kb.text("🖼 Repost Image", "edit_image");
   kb.row();
   kb.text("✏️ Title", "edit_title");
   kb.text("🎁 Prize", "edit_prize");
@@ -2340,22 +2405,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     }
     await ctx.answerCallbackQuery();
 
-    // Create the edit wizard state
-    const editState: EditWizardState = {
-      raffleId,
-      chatId: raffle.chat_id,
-      dmChatId: ctx.chat!.id,
-      userId: ctx.from.id,
-      editingField: null,
-      createdAt: Date.now(),
-    };
-    editWizards.set(ctx.from.id, editState);
-
-    // Show the edit screen
-    await ctx.editMessageText(
-      buildEditScreenText(raffle),
-      { parse_mode: "HTML", reply_markup: buildEditScreenKeyboard(raffle) }
-    );
+    await startEditWizard(ctx, raffleId, raffle.chat_id);
     return;
   }
 
@@ -2405,7 +2455,8 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     state.editingField = "image";
     await ctx.editMessageText(
       `🖼 <b>Edit Image</b>\n\n` +
-        `Send a new photo, or type <code>none</code> to remove the current image.`,
+        `Send a new photo, or type <code>none</code> to remove it.\n\n` +
+        `<i>Telegram does not expose the separate custom-image message ID here, so this image is used on future reposts and re-runs; it cannot replace the already-posted image.</i>`,
       { parse_mode: "HTML" }
     );
     return;
@@ -2519,7 +2570,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
       return;
     }
     db.updateRaffleFields(state.raffleId, { display_timezone: resolved });
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
@@ -2568,12 +2619,15 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
         case "7d": ms = 7 * 24 * 60 * 60 * 1000; break;
         case "14d": ms = 14 * 24 * 60 * 60 * 1000; break;
       }
+      if (ms === 0) {
+        return;
+      }
       const endDate = new Date(Date.now() + ms);
       const endsAt = endDate.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
       db.updateRaffleFields(state.raffleId, { ends_at: endsAt });
     }
 
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
@@ -2599,9 +2653,9 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
 
   if (data.startsWith("edit_win_")) {
     const num = parseInt(data.replace("edit_win_", ""), 10);
-    if (!isNaN(num) && num >= 1) {
+    if (!isNaN(num) && num >= 1 && num <= 50) {
       db.updateRaffleFields(state.raffleId, { max_winners: num });
-      await updateRafflePostById(ctx, state.raffleId, state.chatId);
+      await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     }
     await refreshEditScreen(ctx, state);
     return;
@@ -2609,21 +2663,21 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
 
   if (data === "edit_anon") {
     db.updateRaffleFields(state.raffleId, { anonymous: raffle.anonymous ? 0 : 1 });
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
 
   if (data === "edit_requser") {
     db.updateRaffleFields(state.raffleId, { require_username: raffle.require_username ? 0 : 1 });
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
 
   if (data === "edit_animation") {
     db.updateRaffleFields(state.raffleId, { show_animation: raffle.show_animation ? 0 : 1 });
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
@@ -2635,7 +2689,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
         max_referral_entries: 0,
         revoke_referral_links: 0,
       });
-      await updateRafflePostById(ctx, state.raffleId, state.chatId);
+      await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
       await refreshEditScreen(ctx, state);
     } else {
       state.editingField = "referral_max";
@@ -2652,7 +2706,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     db.updateRaffleFields(state.raffleId, {
       revoke_referral_links: raffle.revoke_referral_links ? 0 : 1,
     });
-    await updateRafflePostById(ctx, state.raffleId, state.chatId);
+    await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
     await refreshEditScreen(ctx, state);
     return;
   }
@@ -2682,7 +2736,7 @@ export async function handleEditCallback(ctx: Context): Promise<void> {
     cancelEditWizard(ctx.from.id);
     const updatedRaffle = db.getRaffleById(state.raffleId);
     await ctx.editMessageText(
-      `✅ Done editing <b>${escapeHtml(updatedRaffle?.title || "raffle")}</b>. Changes are live!`,
+      `✅ Done editing <b>${escapeHtml(updatedRaffle?.title || "raffle")}</b>. Text and raffle settings are live; custom-image changes apply to future reposts and re-runs.`,
       { parse_mode: "HTML" }
     );
     return;
@@ -2719,19 +2773,35 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
 
   switch (state.editingField) {
     case "title":
+      if (text.length > MAX_TITLE_LENGTH) {
+        await ctx.reply(`Keep the raffle title to ${MAX_TITLE_LENGTH} characters or fewer.`);
+        return true;
+      }
       db.updateRaffleFields(state.raffleId, { title: text });
       break;
 
     case "description":
+      if (text.toLowerCase() !== "none" && text.length > MAX_DESCRIPTION_LENGTH) {
+        await ctx.reply(`Keep the description to ${MAX_DESCRIPTION_LENGTH} characters or fewer.`);
+        return true;
+      }
       db.updateRaffleFields(state.raffleId, {
         description: text.toLowerCase() === "none" ? "" : text,
       });
       break;
 
     case "prize": {
+      if (text.length > MAX_PRIZE_TEXT_LENGTH) {
+        await ctx.reply(`Keep the combined prize text to ${MAX_PRIZE_TEXT_LENGTH} characters or fewer.`);
+        return true;
+      }
       const prizes = text.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
       if (prizes.length === 0) {
         await ctx.reply("Please enter at least one prize.");
+        return true;
+      }
+      if (prizes.length > 50) {
+        await ctx.reply("A raffle can have at most 50 prizes/winners.");
         return true;
       }
       const updates: Record<string, unknown> = { prize: prizes[0] };
@@ -2758,6 +2828,8 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
         return true;
       }
       const endsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      const error = scheduleError(endsAt, raffle.starts_at);
+      if (error) { await ctx.reply(error); return true; }
       db.updateRaffleFields(state.raffleId, { ends_at: endsAt });
       break;
     }
@@ -2776,6 +2848,8 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
         return true;
       }
       const startsAt = parsed.toISOString().replace("T", " ").replace("Z", "").split(".")[0];
+      const error = scheduleError(raffle.ends_at, startsAt);
+      if (error) { await ctx.reply(error); return true; }
       db.updateRaffleFields(state.raffleId, { starts_at: startsAt });
       break;
     }
@@ -2798,6 +2872,10 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
       if (text.toLowerCase() === "none") {
         db.updateRaffleFields(state.raffleId, { sponsor_name: null });
       } else {
+        if (text.length > MAX_SPONSOR_LENGTH) {
+          await ctx.reply(`Keep the sponsor name to ${MAX_SPONSOR_LENGTH} characters or fewer.`);
+          return true;
+        }
         db.updateRaffleFields(state.raffleId, { sponsor_name: text });
       }
       break;
@@ -2847,14 +2925,17 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
           : `@${target}`;
       try {
         const chat = await ctx.api.getChat(chatRef);
-        await ctx.api.getChatMember(chat.id, ctx.me.id);
+        const botMember = await ctx.api.getChatMember(chat.id, ctx.me.id);
+        if (botMember.status !== "administrator") {
+          throw new Error("bot_not_administrator");
+        }
         db.updateRaffleFields(state.raffleId, {
           required_chat_id: chat.id,
           required_chat_title: "title" in chat && chat.title ? chat.title : String(chatRef),
         });
       } catch {
         await ctx.reply(
-          `I couldn't verify that chat. Make sure the bot is there and can check members, then try again.`,
+          `I couldn't verify that chat. Make sure the bot is an administrator there, then try again.`,
           { parse_mode: "HTML" }
         );
         return true;
@@ -2877,7 +2958,7 @@ export async function handleEditTextMessage(ctx: Context): Promise<boolean> {
   }
 
   // Update the live raffle post
-  await updateRafflePostById(ctx, state.raffleId, state.chatId);
+  await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
 
   // Show updated edit screen
   state.editingField = null;
@@ -2913,7 +2994,7 @@ export async function handleEditPhotoMessage(ctx: Context): Promise<boolean> {
   const photos = ctx.message.photo;
   const largest = photos[photos.length - 1];
   db.updateRaffleFields(state.raffleId, { image_file_id: largest.file_id });
-  await updateRafflePostById(ctx, state.raffleId, state.chatId);
+  await refreshOpenRafflePost(ctx.api, state.raffleId, ctx.me.username);
 
   state.editingField = null;
   const updatedRaffle = db.getRaffleById(state.raffleId);
@@ -2924,31 +3005,6 @@ export async function handleEditPhotoMessage(ctx: Context): Promise<boolean> {
     );
   }
   return true;
-}
-
-async function updateRafflePostById(
-  ctx: Context,
-  raffleId: number,
-  chatId: number
-): Promise<void> {
-  const raffle = db.getRaffleById(raffleId);
-  if (!raffle || !raffle.message_id) return;
-
-  const count = db.getEntryCount(raffleId);
-  const displayCount = raffle.referral_enabled ? db.getTotalEntryCount(raffleId) : count;
-  const lang = db.getChatLanguage(chatId);
-  const botUsername = ctx.me.username;
-
-  const keyboard = buildRaffleKeyboard(raffle, displayCount, lang, botUsername);
-
-  try {
-    await ctx.api.editMessageText(
-      chatId,
-      raffle.message_id,
-      formatRaffleMessage(raffle, count, lang),
-      { parse_mode: "HTML", reply_markup: keyboard }
-    );
-  } catch {}
 }
 
 // ===================================================================
@@ -3004,64 +3060,35 @@ interface TemplateWizardState {
   createdAt: number;
 }
 
-const templateWizards = new Map<number, TemplateWizardState>();
-
-function cleanStaleTemplateWizards(): void {
-  const now = Date.now();
-  for (const [key, state] of templateWizards) {
-    if (now - state.createdAt > WIZARD_TIMEOUT) {
-      templateWizards.delete(key);
-    }
-  }
-}
-
-export function getActiveTemplateWizard(
-  userId: number
-): TemplateWizardState | undefined {
-  cleanStaleTemplateWizards();
-  const state = templateWizards.get(userId);
-  if (state) {
-    state.createdAt = Date.now();
-  }
-  return state;
+export function getActiveTemplateWizard(userId: number): TemplateWizardState | undefined {
+  return getWorkflowState<TemplateWizardState>(userId, "template");
 }
 
 export function cancelTemplateWizard(userId: number): void {
-  templateWizards.delete(userId);
+  const state = getActiveTemplateWizard(userId);
+  if (state) void endWorkflow(userId, "finished", state);
 }
 
-/** Start the template creation wizard via DM */
+/** Start the template creation wizard via DM. */
 export async function startTemplateWizard(
-  api: {
-    sendMessage: (
-      chatId: number,
-      text: string,
-      opts?: Record<string, unknown>
-    ) => Promise<{ chat: { id: number }; message_id: number }>;
-    getMe: () => Promise<{ username?: string }>;
-  },
-  userId: number,
-  groupChatId: number,
-  groupTitle: string
+  api: Context["api"], userId: number, groupChatId: number, groupTitle: string
 ): Promise<boolean> {
+  if (!(await canManageGroup(api, groupChatId, userId))) {
+    await api.sendMessage(userId, "You do not have permission to manage templates in this group.");
+    return false;
+  }
+  const state: TemplateWizardState = {
+    step: "name", targetChatId: groupChatId, targetChatTitle: groupTitle,
+    dmChatId: userId, userId, createdAt: Date.now(),
+  };
   try {
-    const dmMsg = await api.sendMessage(
+    await beginWorkflow("template", state, api, () => api.sendMessage(
       userId,
       `📋 <b>Create a Template</b> for <b>${escapeHtml(groupTitle)}</b>\n\n` +
         `Step 1 of 5: What's the <b>template name</b>?\n\n` +
         `<i>This is a short name to recall it later (e.g. "Weekly" or "Daily Prize").\nType /cancel to stop.</i>`,
       { parse_mode: "HTML" }
-    );
-
-    templateWizards.set(userId, {
-      step: "name",
-      targetChatId: groupChatId,
-      targetChatTitle: groupTitle,
-      dmChatId: dmMsg.chat.id,
-      userId,
-      createdAt: Date.now(),
-    });
-
+    ), { recover: ctx => sendTmplOptionsScreen(ctx, state) });
     return true;
   } catch {
     return false;
@@ -3143,6 +3170,10 @@ async function handleTmplNameStep(
   state: TemplateWizardState,
   text: string
 ): Promise<boolean> {
+  if (text.length > MAX_TEMPLATE_NAME_LENGTH) {
+    await ctx.reply(`Keep the template name to ${MAX_TEMPLATE_NAME_LENGTH} characters or fewer.`);
+    return true;
+  }
   // Check if name already exists
   const existing = db.getTemplateByName(state.targetChatId, text);
   if (existing) {
@@ -3170,6 +3201,10 @@ async function handleTmplTitleStep(
   state: TemplateWizardState,
   text: string
 ): Promise<boolean> {
+  if (text.length > MAX_TITLE_LENGTH) {
+    await ctx.reply(`Keep the raffle title to ${MAX_TITLE_LENGTH} characters or fewer.`);
+    return true;
+  }
   state.title = text;
   state.step = "prize";
 
@@ -3190,6 +3225,10 @@ async function handleTmplPrizeStep(
   state: TemplateWizardState,
   text: string
 ): Promise<boolean> {
+  if (text.length > MAX_PRIZE_TEXT_LENGTH) {
+    await ctx.reply(`Keep the combined prize text to ${MAX_PRIZE_TEXT_LENGTH} characters or fewer.`);
+    return true;
+  }
   const prizes = text
     .split(",")
     .map((p) => p.trim())
@@ -3197,6 +3236,10 @@ async function handleTmplPrizeStep(
 
   if (prizes.length === 0) {
     await ctx.reply("Please enter at least one prize.");
+    return true;
+  }
+  if (prizes.length > 50) {
+    await ctx.reply("A template can have at most 50 prizes/winners.");
     return true;
   }
 
@@ -3261,7 +3304,10 @@ export async function handleTmplWinnersCallback(ctx: Context): Promise<void> {
   }
 
   const num = parseInt(data.replace("twiz_winners_", ""), 10);
-  if (isNaN(num) || num < 1) return;
+  if (isNaN(num) || num < 1 || num > 50) {
+    await ctx.answerCallbackQuery({ text: "Choose between 1 and 50 winners.", show_alert: true });
+    return;
+  }
 
   state.maxWinners = num;
   state.step = "time";
@@ -3750,6 +3796,10 @@ async function handleTmplSponsorText(
   if (text.toLowerCase() === "skip") {
     state.sponsorName = null;
   } else {
+    if (text.length > MAX_SPONSOR_LENGTH) {
+      await ctx.reply(`Keep the sponsor name to ${MAX_SPONSOR_LENGTH} characters or fewer.`);
+      return true;
+    }
     state.sponsorName = text;
   }
   await sendTmplOptionsScreen(ctx, state);
@@ -3761,6 +3811,10 @@ async function handleTmplDescriptionText(
   state: TemplateWizardState,
   text: string
 ): Promise<boolean> {
+  if (text.toLowerCase() !== "skip" && text.length > MAX_DESCRIPTION_LENGTH) {
+    await ctx.reply(`Keep the description to ${MAX_DESCRIPTION_LENGTH} characters or fewer.`);
+    return true;
+  }
   state.description = text.toLowerCase() === "skip" ? "" : text;
   await sendTmplOptionsScreen(ctx, state);
   return true;
@@ -3888,13 +3942,16 @@ async function handleTmplRequiredGroupText(
       : `@${target}`;
   try {
     const chat = await ctx.api.getChat(chatRef);
-    await ctx.api.getChatMember(chat.id, ctx.me.id);
+    const botMember = await ctx.api.getChatMember(chat.id, ctx.me.id);
+    if (botMember.status !== "administrator") {
+      throw new Error("bot_not_administrator");
+    }
     state.requiredChatId = chat.id;
     state.requiredChatTitle = "title" in chat && chat.title ? chat.title : String(chatRef);
     await sendTmplOptionsScreen(ctx, state);
   } catch {
     await ctx.reply(
-      `I couldn't verify that chat. Make sure the bot is there and can check members, then try again.\n\n` +
+      `I couldn't verify that chat. Make sure the bot is an administrator there, then try again.\n\n` +
         `<i>Type <code>skip</code> to disable.</i>`,
       { parse_mode: "HTML" }
     );
@@ -4023,20 +4080,13 @@ interface BugReportState {
   createdAt: number;
 }
 
-const bugReports = new Map<number, BugReportState>();
-
 export function getActiveBugReport(userId: number): BugReportState | null {
-  const state = bugReports.get(userId);
-  if (!state) return null;
-  if (Date.now() - state.createdAt > WIZARD_TIMEOUT) {
-    bugReports.delete(userId);
-    return null;
-  }
-  return state;
+  return getWorkflowState<BugReportState>(userId, "bug") ?? null;
 }
 
 function cancelBugReport(userId: number): void {
-  bugReports.delete(userId);
+  const state = getActiveBugReport(userId);
+  if (state) void endWorkflow(userId, "finished", state);
 }
 
 export async function startBugReport(
@@ -4049,23 +4099,17 @@ export async function startBugReport(
     ? `@${ctx.from!.username}`
     : getUserDisplayName(ctx.from!.first_name, ctx.from!.last_name);
 
+  const state: BugReportState = {
+    step: "description", userId, userName, fromChatId, fromChatTitle, createdAt: Date.now(),
+  };
   try {
-    await ctx.api.sendMessage(
+    await beginWorkflow("bug", state, ctx.api, () => ctx.api.sendMessage(
       userId,
       `🐛 <b>Bug Report</b>\n\n` +
         `Describe the issue you encountered:\n\n` +
         `<i>Be as specific as possible — what were you doing, what happened, what did you expect?\nType /cancel to stop.</i>`,
       { parse_mode: "HTML" }
-    );
-
-    bugReports.set(userId, {
-      step: "description",
-      userId,
-      userName,
-      fromChatId,
-      fromChatTitle,
-      createdAt: Date.now(),
-    });
+    ));
 
     return true;
   } catch {
@@ -4148,31 +4192,68 @@ async function sendBugReportToOwner(
     return;
   }
 
-  const reportText =
+  const reportHeader =
     `🐛 <b>Bug Report</b>\n\n` +
     `<b>From:</b> ${escapeHtml(state.userName)} (ID: <code>${state.userId}</code>)\n` +
     `<b>Group:</b> ${escapeHtml(state.fromChatTitle)} (<code>${state.fromChatId}</code>)\n\n` +
-    `<b>Description:</b>\n${escapeHtml(state.description || "(no description)")}`;
+    `<b>Description:</b>`;
+  const description = state.description || "(no description)";
+  const descriptionChunks = description.match(/[\s\S]{1,4000}/g) || ["(no description)"];
 
   try {
+    await ctx.api.sendMessage(ownerId, reportHeader, { parse_mode: "HTML" });
+    for (const chunk of descriptionChunks) {
+      await ctx.api.sendMessage(ownerId, chunk);
+    }
     if (photoFileId) {
       await ctx.api.sendPhoto(ownerId, photoFileId, {
-        caption: reportText,
-        parse_mode: "HTML",
-      });
-    } else {
-      await ctx.api.sendMessage(ownerId, reportText, {
-        parse_mode: "HTML",
+        caption: "Bug report screenshot",
       });
     }
 
-    await ctx.reply(
-      `✅ Bug report sent! Thank you for the feedback.`
-    );
-  } catch (err) {
-    console.error(`Failed to send bug report to owner (${ownerId}):`, err);
-    await ctx.reply("Failed to send bug report. Please try again later.");
+  } catch {
+    logger.warn({ user_id: state.userId, group_id: state.fromChatId }, "Bug report delivery failed");
+    await ctx.reply("Failed to send the report. Send a screenshot or use the button below to retry without one.", {
+      reply_markup: new InlineKeyboard().text("Retry without screenshot", "bugreport_skip"),
+    });
+    return;
   }
-
+  // Delivery succeeded. A failed acknowledgement must not leave a submit-able
+  // session that would resend the report when its old button is tapped again.
   cancelBugReport(state.userId);
+  await ctx.reply("✅ Bug report sent! Thank you for the feedback.");
+}
+
+/** Each DM belongs to exactly one workflow; unsupported input never falls through. */
+export async function handleWorkflowMessage(ctx: Context): Promise<void> {
+  if (!ctx.from || ctx.chat?.type !== "private" || ctx.message?.text?.startsWith("/")) return;
+  const session = getWorkflow(ctx.from.id);
+  if (!session) {
+    await workflowHint(ctx, "There is no active setup. Send /start to open the menu and begin again.");
+    return;
+  }
+  prepareWorkflowInput(ctx);
+  let handled = false;
+  if (ctx.message?.text) {
+    switch (session.kind) {
+      case "raffle": handled = await handleWizardMessage(ctx); break;
+      case "edit": handled = await handleEditTextMessage(ctx); break;
+      case "template": handled = await handleTemplateWizardMessage(ctx); break;
+      case "bug": handled = await handleBugReportMessage(ctx); break;
+    }
+  } else if (ctx.message?.photo) {
+    switch (session.kind) {
+      case "raffle": handled = await handleWizardPhoto(ctx); break;
+      case "edit": handled = await handleEditPhotoMessage(ctx); break;
+      case "template": handled = await handleTemplateWizardPhoto(ctx); break;
+      case "bug": handled = await handleBugReportPhoto(ctx); break;
+    }
+  }
+  if (!handled) {
+    const state = session.state as { step?: string; editingField?: string | null };
+    const needsPhoto = state.step === "options_image" || state.editingField === "image" || (session.kind === "bug" && state.step === "screenshot");
+    await workflowHint(ctx, needsPhoto
+      ? "Send a photo or use the skip/remove option in the latest setup message. Send /cancel to stop."
+      : "Follow the latest setup prompt: reply with text when requested, or use its buttons. Send /cancel to stop.");
+  }
 }

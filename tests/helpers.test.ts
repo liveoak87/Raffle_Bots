@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { escapeHtml, parseEndTime, formatCountdown } from "../src/helpers";
+import {
+  escapeHtml,
+  escapeCsvCell,
+  parseEndTime,
+  formatCountdown,
+  getBackupDirectory,
+} from "../src/helpers";
 
 describe("escapeHtml", () => {
   it("escapes <, >, and &", () => {
@@ -64,9 +70,29 @@ describe("parseEndTime", () => {
     expect(parseEndTime("30x")).toBeNull();
   });
 
+  it("rejects zero and overflowing relative durations", () => {
+    expect(parseEndTime("0m")).toBeNull();
+    expect(parseEndTime("999999999999999999999999d")).toBeNull();
+  });
+
   it("rejects times in the past", () => {
     // Yesterday — should be rejected because raffles can't end in the past
     expect(parseEndTime("2020-01-01")).toBeNull();
+  });
+});
+
+describe("escapeCsvCell", () => {
+  it("escapes quotes and neutralizes spreadsheet formulas", () => {
+    expect(escapeCsvCell('A "quoted" name')).toBe('"A ""quoted"" name"');
+    expect(escapeCsvCell("=HYPERLINK(\"https://evil.test\")")).toBe(
+      '"\'=HYPERLINK(""https://evil.test"")"'
+    );
+  });
+});
+
+describe("getBackupDirectory", () => {
+  it("places backups beside the configured database", () => {
+    expect(getBackupDirectory("/data/raffle.db")).toBe("/data/backups");
   });
 });
 

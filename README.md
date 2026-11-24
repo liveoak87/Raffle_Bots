@@ -19,6 +19,26 @@ A Telegram bot for running raffles and giveaways in group chats. Features inline
 - **Raffle history** to review past raffles and winners
 - **Admin-only controls** - only group admins can create, draw, and cancel raffles
 
+Raffle setup messages in the bot's private chat are removed after a raffle is
+successfully posted or a new draft replaces the old one. Idle drafts expire after
+30 minutes; a sweep removes their setup messages within the next 30 seconds.
+The admin menu, your replies, the posted raffle, and its completion confirmation
+are preserved. Failed posting attempts keep their setup controls for retrying.
+If Telegram refuses deletion, the bot attempts to remove the old buttons instead.
+Setup tracking is in memory, so cleanup applies to messages tracked during the
+current bot run; it cannot recover setup message IDs from before an update or restart.
+
+Only one input workflow is active per user: raffle creation, editing, template
+creation, or a bug report. Starting another workflow replaces the previous one
+after access checks and successful delivery of the opening prompt. In private
+chat, `/cancel` stops the active setup; it never cancels a published raffle.
+Main Menu, Change Group, `/start` without a deep link, and `/manage` exit the setup.
+Viewing history preserves it. All workflows expire after 30 minutes without input
+to that workflow; looking up state or pressing an old button does not extend it.
+Buttons belong to the specific session and prompt that displayed them. After a
+delivery interruption, follow the restored prompt before continuing; the bot
+does not consume further input while that prompt still cannot be delivered.
+
 ## Setup
 
 ### 1. Create a Bot
@@ -92,7 +112,7 @@ npm start
 4. Start creating raffles!
 
 **Why does the bot need admin permissions?**
-- It edits the raffle post in real time as participants enter and leave, updating the entry count and countdown timer.
+- The bot batches entry-count edits as participants enter and leave. Telegram displays the countdown locally using date-time entities (Bot API 9.5 or newer).
 - When the membership gate feature is used, the bot needs to verify whether a user is a member of a specific group before allowing them to enter.
 
 ## Commands
@@ -205,11 +225,11 @@ This copies all entries from raffle #5 into a new raffle that's ready to draw.
 By default the bot keeps all raffle data forever. If you don't want participant data sitting on your server, set `DATA_RETENTION_HOURS` in your `.env` file:
 
 ```env
-# Delete all completed raffle data after 24 hours
+# Delete participant entries from completed raffles after 24 hours
 DATA_RETENTION_HOURS=24
 ```
 
-Once a raffle is **drawn** or **cancelled**, the clock starts. After the configured number of hours, the raffle and all its entries, usernames, user IDs, and winner records are permanently deleted from the database.
+Once a raffle is **drawn** or **cancelled**, the clock starts. After the configured number of hours, participant entry rows (including participant usernames and IDs) are permanently deleted. The raffle record and winner records remain available for history and winner-cooldown features.
 
 | Value | Meaning |
 |-------|---------|
@@ -218,7 +238,7 @@ Once a raffle is **drawn** or **cancelled**, the clock starts. After the configu
 | `72` | Delete 3 days after completion |
 | `168` | Delete 1 week after completion |
 
-The purge runs once at startup and then every hour. Open raffles are never touched — only drawn or cancelled ones.
+The purge runs once at startup and then every hour. Open raffles are never touched; only participant rows belonging to drawn or cancelled raffles are removed.
 
 ## How It Works
 

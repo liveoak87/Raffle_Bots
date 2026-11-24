@@ -1,3 +1,4 @@
+import { scheduleError } from "./schedule";
 import Database from "better-sqlite3";
 import { randomInt } from "crypto";
 import type {
@@ -41,7 +42,8 @@ export function initDatabase(dbPath: string): Database.Database {
       anonymous INTEGER NOT NULL DEFAULT 0,
       image_file_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      drawn_at TEXT
+      drawn_at TEXT,
+      closed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS raffle_entries (
@@ -121,10 +123,22 @@ export function initDatabase(dbPath: string): Database.Database {
       user_display_name TEXT NOT NULL,
       chat_id INTEGER NOT NULL,
       invite_link TEXT NOT NULL,
+      groupkeeper_routed INTEGER NOT NULL DEFAULT 0,
       bonus_entries INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
       UNIQUE(raffle_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS referral_attributions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raffle_id INTEGER NOT NULL,
+      referral_id INTEGER NOT NULL,
+      joined_user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
+      FOREIGN KEY (referral_id) REFERENCES referral_links(id) ON DELETE CASCADE,
+      UNIQUE(raffle_id, joined_user_id)
     );
 
     CREATE TABLE IF NOT EXISTS bot_groups (
@@ -198,6 +212,7 @@ export function initDatabase(dbPath: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_templates_recurring_due ON raffle_templates(recurring_active, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
+    CREATE INDEX IF NOT EXISTS idx_referral_attributions_referral ON referral_attributions(referral_id);
     CREATE INDEX IF NOT EXISTS idx_user_admin_groups_user ON user_admin_groups(user_id);
   `);
 
@@ -336,6 +351,11 @@ function migrateDatabase(): void {
     getDb().exec("ALTER TABLE raffles ADD COLUMN display_timezone TEXT DEFAULT NULL");
   }
 
+  if (!raffleColumns.includes("closed_at")) {
+    getDb().exec("ALTER TABLE raffles ADD COLUMN closed_at TEXT DEFAULT NULL");
+    getDb().exec("UPDATE raffles SET closed_at = drawn_at WHERE status = 'drawn'");
+  }
+
   // Add current template/default columns to existing databases.
   try {
     const templateColumns = tableInfo("raffle_templates").map((c) => c.name);
@@ -426,6 +446,7 @@ function migrateDatabase(): void {
       user_display_name TEXT NOT NULL,
       chat_id INTEGER NOT NULL,
       invite_link TEXT NOT NULL,
+      groupkeeper_routed INTEGER NOT NULL DEFAULT 0,
       bonus_entries INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
@@ -433,7 +454,26 @@ function migrateDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_referral_links_invite ON referral_links(invite_link);
     CREATE INDEX IF NOT EXISTS idx_referral_links_raffle ON referral_links(raffle_id);
+
+    CREATE TABLE IF NOT EXISTS referral_attributions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raffle_id INTEGER NOT NULL,
+      referral_id INTEGER NOT NULL,
+      joined_user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raffle_id) REFERENCES raffles(id) ON DELETE CASCADE,
+      FOREIGN KEY (referral_id) REFERENCES referral_links(id) ON DELETE CASCADE,
+      UNIQUE(raffle_id, joined_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_referral_attributions_referral ON referral_attributions(referral_id);
   `);
+
+  const referralLinkColumns = tableInfo("referral_links").map((c) => c.name);
+  if (!referralLinkColumns.includes("groupkeeper_routed")) {
+    getDb().exec(
+      "ALTER TABLE referral_links ADD COLUMN groupkeeper_routed INTEGER NOT NULL DEFAULT 0"
+    );
+  }
 
   getDb().exec(`
     CREATE INDEX IF NOT EXISTS idx_raffle_entries_recent ON raffle_entries(raffle_id, entered_at DESC, id DESC);
@@ -441,6 +481,14 @@ function migrateDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_raffles_announcement_retry
       ON raffles(status, announced, announce_failed, owner_alerted, drawn_at);
     CREATE INDEX IF NOT EXISTS idx_raffles_created_at ON raffles(created_at);
+    CREATE TABLE IF NOT EXISTS delivery_receipts (
+      raffle_id INTEGER NOT NULL REFERENCES raffles(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      target TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('sent','unreachable')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (raffle_id,kind,target)
+    );
   `);
 }
 
@@ -454,6 +502,8 @@ export function getDb(): Database.Database {
 // --- Raffle CRUD ---
 
 export function createRaffle(input: CreateRaffleInput): Raffle {
+  const error = scheduleError(input.ends_at, input.starts_at);
+  if (error) throw new Error(error);
   const stmt = getDb().prepare(`
     INSERT INTO raffles (chat_id, thread_id, creator_id, creator_name, title, description, prize, prizes, max_entries, max_winners, ends_at, starts_at, display_timezone, required_chat_id, required_chat_title, sponsor_name, anonymous, image_file_id, auto_pin, min_account_age_days, require_username, winner_cooldown, show_animation, referral_enabled, max_referral_entries, revoke_referral_links)
     VALUES (@chat_id, @thread_id, @creator_id, @creator_name, @title, @description, @prize, @prizes, @max_entries, @max_winners, @ends_at, @starts_at, @display_timezone, @required_chat_id, @required_chat_title, @sponsor_name, @anonymous, @image_file_id, @auto_pin, @min_account_age_days, @require_username, @winner_cooldown, @show_animation, @referral_enabled, @max_referral_entries, @revoke_referral_links)
@@ -533,14 +583,14 @@ export function updateRaffleMessageId(
 
 export function closeRaffle(raffleId: number): void {
   getDb()
-    .prepare("UPDATE raffles SET status = 'closed' WHERE id = ?")
+    .prepare("UPDATE raffles SET status = 'closed', closed_at = datetime('now') WHERE id = ?")
     .run(raffleId);
 }
 
 export function markRaffleDrawn(raffleId: number): void {
   getDb()
     .prepare(
-      "UPDATE raffles SET status = 'drawn', drawn_at = datetime('now') WHERE id = ?"
+      "UPDATE raffles SET status = 'drawn', drawn_at = datetime('now'), closed_at = datetime('now') WHERE id = ?"
     )
     .run(raffleId);
 }
@@ -805,7 +855,9 @@ export function getTotalEntryCount(raffleId: number): number {
   if (!raffle || !raffle.referral_enabled) return baseCount;
   const bonusRow = getDb()
     .prepare(
-      "SELECT COALESCE(SUM(bonus_entries), 0) as total FROM referral_links WHERE raffle_id = ?"
+      `SELECT COALESCE(SUM(rl.bonus_entries), 0) as total FROM referral_links rl
+       JOIN raffle_entries e ON e.raffle_id = rl.raffle_id AND e.user_id = rl.user_id
+       WHERE rl.raffle_id = ?`
     )
     .get(raffleId) as { total: number };
   return baseCount + bonusRow.total;
@@ -858,20 +910,21 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
   const existing = getWinnersForRaffle(raffleId);
   if (existing.length > 0) return existing;
 
-  const entries = getEntriesForRaffle(raffleId);
-  if (entries.length === 0) return [];
-
-  const numWinners = Math.min(raffle.max_winners, entries.length);
-
   let selected: RaffleEntry[];
   if (raffle.referral_enabled) {
-    selected = selectWeightedWinners(
-      getEntriesWithBonusForRaffle(raffleId),
-      numWinners
-    );
+    const entries = getEntriesWithBonusForRaffle(raffleId);
+    selected = selectWeightedWinners(entries, Math.min(raffle.max_winners, entries.length));
   } else {
-    selected = cryptoShuffle(entries).slice(0, numWinners);
+    const entries = getEntriesForRaffle(raffleId);
+    const count = Math.min(raffle.max_winners, entries.length);
+    // Partial Fisher–Yates: only shuffle the positions we will award.
+    for (let i = 0; i < count; i++) {
+      const pick = randomInt(i, entries.length);
+      [entries[i], entries[pick]] = [entries[pick], entries[i]];
+    }
+    selected = entries.slice(0, count);
   }
+  if (!selected.length) return [];
 
   const insertStmt = getDb().prepare(`
     INSERT INTO raffle_winners (raffle_id, user_id, user_name, user_display_name, prize, position)
@@ -896,6 +949,12 @@ export function selectWinners(raffleId: number): RaffleWinner[] {
   insertAll();
 
   return getWinnersForRaffle(raffleId);
+}
+
+/** Return persisted winners, or repair a drawn raffle missing winner rows. */
+export function ensureWinnersForRaffle(raffleId: number): RaffleWinner[] {
+  const existing = getWinnersForRaffle(raffleId);
+  return existing.length > 0 ? existing : selectWinners(raffleId);
 }
 
 export function getWinnersForRaffle(raffleId: number): RaffleWinner[] {
@@ -1241,44 +1300,22 @@ export function getGroupStats(chatId: number): GroupStats {
  * Purge entry data for completed raffles older than `retentionHours`.
  * Keeps raffle records and winner records intact for history display.
  * Only deletes the raffle_entries rows (the bulk data).
- * Returns the number of raffles whose entries were purged.
+ * Returns the number of participant rows deleted.
  */
 export function purgeExpiredData(retentionHours: number): number {
-  // Find drawn raffles older than retention period
-  const drawnRaffles = getDb()
+  if (!Number.isFinite(retentionHours) || retentionHours <= 0) return 0;
+  const cutoff = `-${retentionHours} hours`;
+  const result = getDb()
     .prepare(
-      `SELECT id FROM raffles
-       WHERE status = 'drawn'
-         AND drawn_at IS NOT NULL
-         AND drawn_at <= datetime('now', ? || ' hours')`
+      `DELETE FROM raffle_entries
+       WHERE raffle_id IN (
+         SELECT id FROM raffles
+         WHERE status IN ('drawn', 'closed')
+           AND COALESCE(closed_at, drawn_at, created_at) <= datetime('now', ?)
+       )`
     )
-    .all(`-${retentionHours}`) as Array<{ id: number }>;
-
-  // Find closed (cancelled) raffles older than retention period
-  const closedRaffles = getDb()
-    .prepare(
-      `SELECT id FROM raffles
-       WHERE status = 'closed'
-         AND created_at <= datetime('now', ? || ' hours')`
-    )
-    .all(`-${retentionHours}`) as Array<{ id: number }>;
-
-  const raffleIds = [...drawnRaffles, ...closedRaffles].map((r) => r.id);
-  if (raffleIds.length === 0) return 0;
-
-  // Delete only entries for these raffles (keep raffle records and winners for history)
-  const deleteEntries = getDb().prepare(
-    `DELETE FROM raffle_entries WHERE raffle_id = ?`
-  );
-
-  const purgeAll = getDb().transaction(() => {
-    for (const id of raffleIds) {
-      deleteEntries.run(id);
-    }
-  });
-
-  purgeAll();
-  return raffleIds.length;
+    .run(cutoff);
+  return result.changes;
 }
 
 // --- Edit active raffle ---
@@ -1287,6 +1324,16 @@ export function updateRaffleFields(
   raffleId: number,
   fields: Record<string, unknown>
 ): boolean {
+  if ("ends_at" in fields || "starts_at" in fields) {
+    const current = getRaffleById(raffleId);
+    if (current) {
+      const error = scheduleError(
+        "ends_at" in fields ? fields.ends_at as string | null : current.ends_at,
+        "starts_at" in fields ? fields.starts_at as string | null : current.starts_at
+      );
+      if (error) throw new Error(error);
+    }
+  }
   const allowedFields = [
     "title",
     "description",
@@ -1532,6 +1579,8 @@ export interface BotGroup {
 }
 
 export function upsertBotGroup(chatId: number, title: string, botStatus: "member" | "administrator"): void {
+  // Private chats have positive IDs, including legacy rows seen by refresh jobs.
+  if (chatId >= 0) return;
   getDb()
     .prepare(
       `INSERT INTO bot_groups (chat_id, title, bot_status, updated_at)
@@ -1564,6 +1613,76 @@ export function getAdminBotGroups(): BotGroup[] {
   return getDb()
     .prepare("SELECT * FROM bot_groups WHERE bot_status = 'administrator' ORDER BY title COLLATE NOCASE")
     .all() as BotGroup[];
+}
+
+export interface AdminGroupSummary {
+  chat_id: number;
+  title: string;
+  bot_status: "member" | "administrator" | null;
+  timezone: string | null;
+  connected: boolean;
+  total_raffles: number;
+  active_raffles: number;
+  entries: number;
+  unique_participants: number;
+  winners: number;
+  raffles_7d: number;
+  entries_7d: number;
+  last_raffle_at: string | null;
+  updated_at: string | null;
+}
+
+/** One bounded aggregate query for the control tower's per-group directory. */
+export function getAdminGroupSummaries(): AdminGroupSummary[] {
+  return getDb()
+    .prepare(
+      `WITH group_ids AS (
+         SELECT chat_id FROM bot_groups
+         UNION SELECT chat_id FROM raffles
+         UNION SELECT chat_id FROM raffle_templates
+         UNION SELECT chat_id FROM group_defaults
+       ), raffle_stats AS (
+         SELECT chat_id,
+                COUNT(*) AS total_raffles,
+                COALESCE(SUM(status = 'open'), 0) AS active_raffles,
+                COALESCE(SUM(created_at >= datetime('now', '-7 days')), 0) AS raffles_7d,
+                MAX(created_at) AS last_raffle_at
+           FROM raffles
+          GROUP BY chat_id
+       ), entry_stats AS (
+         SELECT r.chat_id,
+                COUNT(e.id) AS entries,
+                COUNT(DISTINCT e.user_id) AS unique_participants,
+                COALESCE(SUM(e.entered_at >= datetime('now', '-7 days')), 0) AS entries_7d
+           FROM raffles r
+           LEFT JOIN raffle_entries e ON e.raffle_id = r.id
+          GROUP BY r.chat_id
+       ), winner_stats AS (
+         SELECT r.chat_id, COUNT(w.id) AS winners
+           FROM raffles r
+           LEFT JOIN raffle_winners w ON w.raffle_id = r.id
+          GROUP BY r.chat_id
+       )
+       SELECT ids.chat_id,
+              COALESCE(NULLIF(bg.title, ''), CAST(ids.chat_id AS TEXT)) AS title,
+              bg.bot_status, bg.timezone, bg.updated_at,
+              CASE WHEN bg.chat_id IS NULL THEN 0 ELSE 1 END AS connected,
+              COALESCE(rs.total_raffles, 0) AS total_raffles,
+              COALESCE(rs.active_raffles, 0) AS active_raffles,
+              COALESCE(es.entries, 0) AS entries,
+              COALESCE(es.unique_participants, 0) AS unique_participants,
+              COALESCE(ws.winners, 0) AS winners,
+              COALESCE(rs.raffles_7d, 0) AS raffles_7d,
+              COALESCE(es.entries_7d, 0) AS entries_7d,
+              rs.last_raffle_at
+         FROM group_ids ids
+         LEFT JOIN bot_groups bg ON bg.chat_id = ids.chat_id
+         LEFT JOIN raffle_stats rs ON rs.chat_id = ids.chat_id
+         LEFT JOIN entry_stats es ON es.chat_id = ids.chat_id
+         LEFT JOIN winner_stats ws ON ws.chat_id = ids.chat_id
+        ORDER BY title COLLATE NOCASE`
+    )
+    .all() as AdminGroupSummary[];
 }
 
 export type GroupAccessMode = "all_admins" | "owner_only" | "selected_admins";
@@ -1756,16 +1875,32 @@ export function createReferralLink(
   userId: number,
   displayName: string,
   chatId: number,
-  inviteLink: string
+  inviteLink: string,
+  groupKeeperRouted = false
 ): ReferralLink {
   const stmt = getDb().prepare(`
-    INSERT INTO referral_links (raffle_id, user_id, user_display_name, chat_id, invite_link)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO referral_links (
+      raffle_id, user_id, user_display_name, chat_id, invite_link, groupkeeper_routed
+    )
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
-  const result = stmt.run(raffleId, userId, displayName, chatId, inviteLink);
+  const result = stmt.run(
+    raffleId,
+    userId,
+    displayName,
+    chatId,
+    inviteLink,
+    groupKeeperRouted ? 1 : 0
+  );
   return getDb()
     .prepare("SELECT * FROM referral_links WHERE id = ?")
     .get(result.lastInsertRowid) as ReferralLink;
+}
+
+export function markReferralLinkGroupKeeperRouted(referralId: number): void {
+  getDb()
+    .prepare("UPDATE referral_links SET groupkeeper_routed = 1 WHERE id = ?")
+    .run(referralId);
 }
 
 export function getReferralLink(
@@ -1807,6 +1942,51 @@ export function incrementBonusEntries(referralId: number): void {
     .run(referralId);
 }
 
+/**
+ * Award one referral bonus at most once per joined user and raffle.
+ * The attribution insert and capped counter update are one transaction so
+ * duplicate chat_member deliveries or leave/rejoin cycles cannot inflate odds.
+ */
+export function awardReferralBonus(
+  referralId: number,
+  raffleId: number,
+  joinedUserId: number,
+  maxReferralEntries: number
+): number | null {
+  const award = getDb().transaction(() => {
+    const referral = getDb()
+      .prepare("SELECT id FROM referral_links WHERE id = ? AND raffle_id = ?")
+      .get(referralId, raffleId) as { id: number } | undefined;
+    if (!referral) return null;
+
+    const attribution = getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO referral_attributions
+           (raffle_id, referral_id, joined_user_id)
+         VALUES (?, ?, ?)`
+      )
+      .run(raffleId, referralId, joinedUserId);
+    if (attribution.changes === 0) return null;
+
+    const updated = getDb()
+      .prepare(
+        `UPDATE referral_links
+         SET bonus_entries = bonus_entries + 1
+         WHERE id = ? AND raffle_id = ?
+           AND (? <= 0 OR bonus_entries < ?)`
+      )
+      .run(referralId, raffleId, maxReferralEntries, maxReferralEntries);
+    if (updated.changes === 0) return null;
+
+    const row = getDb()
+      .prepare("SELECT bonus_entries FROM referral_links WHERE id = ?")
+      .get(referralId) as { bonus_entries: number };
+    return row.bonus_entries;
+  });
+
+  return award();
+}
+
 export function getBonusEntries(raffleId: number, userId: number): number {
   const row = getDb()
     .prepare("SELECT bonus_entries FROM referral_links WHERE raffle_id = ? AND user_id = ?")
@@ -1821,15 +2001,6 @@ export function getReferralLinksForRaffle(raffleId: number): ReferralLink[] {
 }
 
 // --- Utility ---
-
-function cryptoShuffle<T>(array: T[]): T[] {
-  const shuffled = [...array];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = randomInt(i + 1);
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-  return shuffled;
-}
 
 function selectWeightedWinners(
   entries: WeightedRaffleEntry[],
